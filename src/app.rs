@@ -1,5 +1,6 @@
 use crate::bevel::BevelGeom;
 use crate::chrome::{self, Icon};
+use crate::hypoid::{self, Member, Role};
 use crate::view3d;
 use crate::export::{self, place};
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
@@ -13,10 +14,20 @@ use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const FILE_EXT: &str = "gearcraft";
 
+
+/// A hypoid set's teeth, generated off the UI thread. The last good
+/// solids stay on show while a new spec is being generated.
+struct HypoidJob {
+    spec: hypoid::Spec,
+    rx: Option<mpsc::Receiver<Result<(Member, Member), String>>>,
+    members: Option<Arc<(Member, Member)>>,
+    error: Option<String>,
+}
 
 struct Cached {
     params: GearParams,
@@ -109,7 +120,7 @@ impl Workspace {
     fn of(params: &GearParams) -> Self {
         if params.is_pulley() {
             Workspace::Pulleys
-        } else if params.is_bevel() {
+        } else if params.is_bevel() || params.is_hypoid() {
             Workspace::Bevel
         } else {
             Workspace::Spur
@@ -134,6 +145,8 @@ pub struct GearCraftApp {
     dirty: bool,
     selected: Option<u64>,
     cache: HashMap<u64, Cached>,
+    /// Hypoid sets by ring gear id.
+    hypoid: HashMap<u64, HypoidJob>,
     view: View,
     fit_pending: bool,
     /// Keep re-fitting when the canvas resizes until the user pans or zooms.
@@ -175,6 +188,7 @@ impl GearCraftApp {
             path: None,
             dirty: false,
             cache: HashMap::new(),
+            hypoid: HashMap::new(),
             view: View { center: [0.0, 0.0], scale: 4.0 },
             fit_pending: true,
             auto_fit: true,
@@ -319,11 +333,20 @@ impl GearCraftApp {
         let only = if whole_train { None } else { self.selected };
         let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
         let bevels = export::bevels(&self.project, self.driver_angle, only, |g| self.shown(g));
-        if !bevels.is_empty() && ext != "step" {
+        // Teeth already generated for the current settings are reused.
+        let cached = |id: u64| self.hypoid.get(&id).filter(|j| j.rx.is_none()).and_then(|j| j.members.clone());
+        let hypoids = if ext == "step" {
+            export::hypoids(&self.project, self.driver_angle, only, |g| self.shown(g), cached)
+        } else {
+            Vec::new()
+        };
+        let solid_only = only.and_then(|id| self.project.get(id)).is_some_and(|g| g.params.is_hypoid());
+        if (!bevels.is_empty() || solid_only) && ext != "step" {
             self.flash("DXF and SVG are flat outlines: export bevel gears as STEP.");
             return;
         }
-        let Some(first) = shapes.first().map(|s| &s.name).or(bevels.first().map(|b| &b.name)) else {
+        let first = shapes.first().map(|s| &s.name).or(bevels.first().map(|b| &b.name)).or(hypoids.first().map(|h| &h.name));
+        let Some(first) = first else {
             self.flash("Nothing to export");
             return;
         };
@@ -341,7 +364,7 @@ impl GearCraftApp {
         if path.extension().is_none() {
             path.set_extension(ext);
         }
-        match export::write(&path, &shapes, &bevels, self.project.pitch_unit.is_inch()) {
+        match export::write(&path, &shapes, &bevels, &hypoids, self.project.pitch_unit.is_inch()) {
             Ok(()) => self.flash(format!("Exported {}", path.display())),
             Err(e) => self.flash(format!("Could not write {}: {e}", path.display())),
         }
@@ -391,7 +414,7 @@ impl GearCraftApp {
         // A meshing gear or belted pulley starts as a copy so the pair is
         // 1:1 until edited; a compound is usually a fraction of its wheel.
         let params = match link {
-            Link::Mesh | Link::Belt | Link::Bevel => pp.clone(),
+            Link::Mesh | Link::Belt | Link::Bevel | Link::Hypoid => pp.clone(),
             Link::Axle => match (pulley, pp.belt) {
                 (true, Some(b)) => GearParams { teeth: (pp.teeth / 2).max(b.min_teeth()), ..pp.clone() },
                 (true, None) => GearParams { bore: pp.bore, ..unit.starter_pulley(20) },
@@ -426,6 +449,17 @@ impl GearCraftApp {
         let pinion = self.project.add_root(unit.starter_bevel(20), x, 0.0);
         let wheel = self.project.add_child(pinion, unit.starter_bevel(40), Link::Bevel);
         self.selected = Some(wheel);
+    }
+
+    /// A car-style hypoid set: an 11-tooth pinion driving a 41-tooth ring
+    /// gear, its shaft 30 mm below the ring's centre.
+    fn add_hypoid_pair(&mut self) {
+        let x = self.clear_x();
+        let unit = self.project.pitch_unit;
+        let pinion = self.project.add_root(unit.starter_hypoid(Role::Pinion), x, 0.0);
+        let ring = self.project.add_child(pinion, unit.starter_hypoid(Role::Ring), Link::Hypoid);
+        self.project.normalize();
+        self.selected = Some(ring);
     }
 
     /// Where a new train can go, clear of the parts on show.
@@ -512,11 +546,12 @@ impl GearCraftApp {
         }
     }
 
-    fn refresh_cache(&mut self) {
+    fn refresh_cache(&mut self, ctx: &egui::Context) {
         let ids: Vec<u64> = self.project.gears.iter().map(|g| g.id).collect();
         self.cache.retain(|id, _| ids.contains(id));
+        self.refresh_hypoids(ctx);
         for g in &self.project.gears {
-            if self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
+            if g.params.is_hypoid() || self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
                 continue;
             }
             if let Some(geom) = BevelGeom::new(&g.params).filter(|_| g.params.is_buildable()) {
@@ -536,6 +571,83 @@ impl GearCraftApp {
                     self.cache.remove(&g.id);
                 }
             }
+        }
+    }
+
+    /// Start generating any hypoid set whose spec changed, and pick up
+    /// finished ones.
+    fn refresh_hypoids(&mut self, ctx: &egui::Context) {
+        let mut live = Vec::new();
+        for ring in &self.project.gears {
+            let Some(pinion) = ring.placement.parent().and_then(|p| self.project.get(p)) else { continue };
+            let Some(spec) = train::hypoid_spec(&pinion.params, &ring.params, &ring.placement) else { continue };
+            live.push(ring.id);
+            let job = self.hypoid.entry(ring.id).or_insert_with(|| HypoidJob {
+                spec: spec.clone(),
+                rx: None,
+                members: None,
+                error: None,
+            });
+            if job.spec != spec || (job.rx.is_none() && job.members.is_none() && job.error.is_none()) {
+                let (tx, rx) = mpsc::channel();
+                let (sp, ctx) = (spec.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let r = sp
+                        .design()
+                        .ok_or_else(|| "These settings have no hypoid solution.".to_string())
+                        .and_then(|d| Ok((d.pinion()?, d.ring()?)));
+                    let _ = tx.send(r);
+                    ctx.request_repaint();
+                });
+                job.spec = spec;
+                job.rx = Some(rx);
+            }
+            let done = job.rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            if let Some(r) = done {
+                job.rx = None;
+                match r {
+                    Ok(pair) => {
+                        job.members = Some(Arc::new(pair));
+                        job.error = None;
+                    }
+                    Err(e) => {
+                        job.members = None;
+                        job.error = Some(e);
+                    }
+                }
+                let empty = || FillMesh { verts: Vec::new(), tris: Vec::new() };
+                match &job.members {
+                    Some(pair) => {
+                        for (id, params, m) in [(pinion.id, &pinion.params, &pair.0), (ring.id, &ring.params, &pair.1)] {
+                            let solid = view3d::hypoid_solid(m);
+                            self.cache.insert(id, Cached { params: params.clone(), outline: Vec::new(), fill: empty(), solid });
+                        }
+                    }
+                    None => {
+                        self.cache.remove(&pinion.id);
+                        self.cache.remove(&ring.id);
+                    }
+                }
+            }
+        }
+        self.hypoid.retain(|id, _| live.contains(id));
+    }
+
+    /// Whether any hypoid set is still being generated.
+    fn hypoid_pending(&self) -> bool {
+        self.hypoid.values().any(|j| j.rx.is_some())
+    }
+
+    /// The hypoid set a gear belongs to: its ring gear's index.
+    fn hypoid_ring(&self, idx: usize) -> Option<usize> {
+        let g = &self.project.gears[idx];
+        match g.params.hypoid? {
+            Role::Ring => Some(idx),
+            Role::Pinion => self
+                .project
+                .gears
+                .iter()
+                .position(|r| matches!(r.placement, Placement::Hypoid { parent, .. } if parent == g.id)),
         }
     }
 
@@ -641,7 +753,7 @@ impl GearCraftApp {
                             self.drag = Some(Drag::Move(id, [w[0] - c[0], w[1] - c[1]]));
                         }
                         Placement::Mesh { .. } | Placement::Belt { .. } => self.drag = Some(Drag::Swing(id)),
-                        Placement::Axle { .. } | Placement::Bevel { .. } => {}
+                        Placement::Axle { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } => {}
                     }
                 }
             }
@@ -699,7 +811,7 @@ impl GearCraftApp {
         if self.show.grid {
             self.draw_grid(&painter, rect, &visuals);
         }
-        self.refresh_cache();
+        self.refresh_cache(ui.ctx());
         let collisions = self.visible_collisions(&solved);
         self.draw_gears(&painter, rect, &visuals, &solved, &collisions);
 
@@ -843,11 +955,17 @@ impl GearCraftApp {
         let mut lo = [f64::MAX; 3];
         let mut hi = [f64::MIN; 3];
         for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
-            let r = g.params.tip_radius().max(1.0);
-            let (z0, z1) = match BevelGeom::new(&g.params) {
+            let mut r = g.params.tip_radius().max(1.0);
+            let (mut z0, mut z1) = match BevelGeom::new(&g.params) {
                 Some(b) => (b.front_face().0, b.back(b.tip) * b.tip.cos()),
                 None => (0.0, g.params.face_width),
             };
+            // Hypoid teeth are only known once generated.
+            if let Some(c) = self.cache.get(&g.id).filter(|_| g.params.is_hypoid()) {
+                r = c.solid.verts.iter().map(|v| v[0].hypot(v[1])).fold(1.0, f64::max);
+                z0 = c.solid.verts.iter().map(|v| v[2]).fold(f64::MAX, f64::min);
+                z1 = c.solid.verts.iter().map(|v| v[2]).fold(f64::MIN, f64::max);
+            }
             for i in 0..8 {
                 let local = [if i & 1 == 0 { -r } else { r }, if i & 2 == 0 { -r } else { r }, if i & 4 == 0 { z0 } else { z1 }];
                 let p = s.frame.apply(local);
@@ -868,7 +986,7 @@ impl GearCraftApp {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         let solved = self.project.solve();
-        self.refresh_cache();
+        self.refresh_cache(ui.ctx());
         if rect.size() != self.canvas_size {
             self.canvas_size = rect.size();
             self.fit_pending |= self.auto_fit;
@@ -946,6 +1064,15 @@ impl GearCraftApp {
             painter.image(t.id(), rect, uv, Color32::WHITE);
         }
 
+        if self.hypoid_pending() {
+            painter.text(
+                rect.left_top() + Vec2::new(10.0, 8.0),
+                Align2::LEFT_TOP,
+                "⏳ Generating hypoid teeth…",
+                FontId::proportional(13.0),
+                visuals.weak_text_color(),
+            );
+        }
         if parts.is_empty() {
             painter.text(
                 rect.center(),
@@ -1177,6 +1304,9 @@ impl GearCraftApp {
                         if ui.button("New bevel pair").clicked() {
                             self.add_bevel_pair();
                         }
+                        if ui.button("New hypoid set").clicked() {
+                            self.add_hypoid_pair();
+                        }
                     }
                     Workspace::Pulleys => {
                         if ui.add_enabled(has_sel, egui::Button::new("Add belt drive").shortcut_text("B")).clicked() {
@@ -1278,6 +1408,12 @@ impl GearCraftApp {
                 if big(ui, Icon::Glyph("➕"), "New Pair", false, true).on_hover_text("A 20-tooth pinion and 40-tooth wheel at right angles").clicked() {
                     self.add_bevel_pair();
                 }
+                if big(ui, Icon::Bevel, "Hypoid Set", false, true)
+                    .on_hover_text("A spiral-toothed pinion and ring gear with offset shafts, like a car's final drive")
+                    .clicked()
+                {
+                    self.add_hypoid_pair();
+                }
             }),
             Workspace::Pulleys => chrome::group(ui, "Create", |ui| {
                 if big(ui, Icon::Pulley, "Belt Drive", false, true).on_hover_text("Add a pulley driven by a belt from the selected pulley (B)").clicked() {
@@ -1361,7 +1497,7 @@ impl GearCraftApp {
                     Placement::Mesh { .. } => ("⚙", "meshes"),
                     Placement::Axle { .. } => ("◎", "same axle"),
                     Placement::Belt { .. } => ("🔗", "belt"),
-                    Placement::Bevel { .. } => ("⚙", "meshes"),
+                    Placement::Bevel { .. } | Placement::Hypoid { .. } => ("⚙", "meshes"),
                 };
                 ui.horizontal(|ui| {
                     ui.add_space(s.depth.min(12) as f32 * 14.0);
@@ -1412,6 +1548,18 @@ impl GearCraftApp {
             })
             .collect();
         let s = solved[idx].clone();
+        let earlier_pinions: Vec<(u64, String)> = self.project.gears[..idx]
+            .iter()
+            .filter(|g| g.params.hypoid == Some(Role::Pinion))
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        let hypoid_ring = self.hypoid_ring(idx);
+        let hypoid_design = hypoid_ring.and_then(|r| solved[r].hypoid.clone());
+        let hypoid_cutter = hypoid_design.as_ref().map(|d| d.cutter.radius);
+        let hypoid_state = hypoid_ring.map(|r| {
+            let job = self.hypoid.get(&self.project.gears[r].id);
+            (job.is_some_and(|j| j.rx.is_some()), job.and_then(|j| j.error.clone()))
+        });
         let earlier_pulleys: Vec<(u64, String)> = self.project.gears[..idx]
             .iter()
             .filter(|g| g.params.is_pulley())
@@ -1487,6 +1635,35 @@ impl GearCraftApp {
                             .weak()
                             .small(),
                     );
+                });
+            } else if let Some(role) = g.params.hypoid {
+                section(ui, "Teeth", |ui| {
+                    egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Teeth");
+                        let range = if role == Role::Pinion { 5..=60 } else { 10..=200 };
+                        ui.add(egui::DragValue::new(&mut g.params.teeth).range(range).speed(0.2));
+                        ui.end_row();
+                        if role == Role::Ring {
+                            ui.label(if unit.is_inch() { "Diametral pitch (heel)" } else { "Module (heel)" });
+                            ui.horizontal(|ui| pitch_input(ui, &mut g.params.module, unit));
+                            ui.end_row();
+                            ui.label("Pressure angle");
+                            ui.horizontal(|ui| {
+                                for pa in [20.0, 22.5] {
+                                    ui.selectable_value(&mut g.params.pressure_angle, pa, format!("{pa}°"));
+                                }
+                                ui.add(egui::DragValue::new(&mut g.params.pressure_angle).range(12.0..=30.0).speed(0.1).suffix("°"));
+                            });
+                            ui.end_row();
+                            ui.label("Backlash");
+                            len_drag(ui, &mut g.params.backlash, unit, 0.0..=5.0, 0.002)
+                                .on_hover_text("Thinning of the ring gear's teeth, normal to them on the pitch cone.");
+                            ui.end_row();
+                        }
+                    });
+                    if role == Role::Pinion {
+                        ui.label(RichText::new("Tooth size, pressure angle and face width are set on the ring gear.").weak().small());
+                    }
                 });
             } else {
                 let locked = g.match_parent && matches!(g.placement, Placement::Mesh { .. } | Placement::Bevel { .. });
@@ -1584,29 +1761,34 @@ impl GearCraftApp {
                     ui.label("Bore Ø");
                     len_drag(ui, &mut g.params.bore, unit, 0.0..=10000.0, 0.1);
                     ui.end_row();
-                    ui.label("Face width");
-                    let r = len_drag(ui, &mut g.params.face_width, unit, 0.0..=10000.0, 0.1);
-                    if g.params.is_bevel() {
-                        r.on_hover_text("Along the cone, from the back (large) end towards the apex.");
+                    if g.params.hypoid != Some(Role::Pinion) {
+                        ui.label("Face width");
+                        let r = len_drag(ui, &mut g.params.face_width, unit, 0.0..=10000.0, 0.1);
+                        if g.params.is_bevel() || g.params.is_hypoid() {
+                            r.on_hover_text("Along the cone, from the back (large) end towards the apex.");
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
                 });
             });
 
             section(ui, "Placement", |ui| {
                 let kind = match g.placement {
                     Placement::Root { .. } => 0,
-                    Placement::Mesh { .. } | Placement::Bevel { .. } => 1,
+                    Placement::Mesh { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } => 1,
                     Placement::Axle { .. } => 2,
                     Placement::Belt { .. } => 3,
                 };
                 let is_pulley = g.params.is_pulley();
                 let is_bevel = g.params.is_bevel();
+                // A ring gear stays with its pinion; a pinion is fixed or on a shaft.
+                let is_ring = g.params.hypoid == Some(Role::Ring);
+                let is_pinion = g.params.hypoid == Some(Role::Pinion);
                 let mut new_kind = kind;
-                ui.horizontal_wrapped(|ui| {
+                if !is_ring { ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut new_kind, 0, "Fixed");
                     ui.add_enabled_ui(!earlier.is_empty(), |ui| {
-                        if !is_pulley || kind == 1 {
+                        if (!is_pulley || kind == 1) && !is_pinion {
                             ui.selectable_value(&mut new_kind, 1, "Meshes with");
                         }
                         ui.selectable_value(&mut new_kind, 2, "On axle of");
@@ -1616,11 +1798,11 @@ impl GearCraftApp {
                             ui.selectable_value(&mut new_kind, 3, "Belt to");
                         });
                     }
-                });
+                }); }
                 if new_kind != kind {
                     let parent = g.placement.parent().or(earlier.last().map(|e| e.0)).unwrap_or(0);
                     let angle = match g.placement {
-                        Placement::Mesh { angle, .. } | Placement::Bevel { angle, .. } => angle,
+                        Placement::Mesh { angle, .. } | Placement::Bevel { angle, .. } | Placement::Hypoid { angle, .. } => angle,
                         _ => 0.0,
                     };
                     g.placement = match new_kind {
@@ -1729,6 +1911,52 @@ impl GearCraftApp {
                             .on_hover_text("Which way round the partner's axis this gear's shaft leans.");
                         ui.end_row();
                     }
+                    Placement::Hypoid { parent, angle, offset, shaft_angle, spiral, reverse_hand, cutter_radius } => {
+                        ui.label("Pinion");
+                        parent_combo(ui, parent, &earlier_pinions);
+                        ui.end_row();
+                        ui.label("Shaft offset");
+                        len_drag(ui, offset, unit, -10000.0..=10000.0, 0.1).on_hover_text(
+                            "How far the pinion's shaft passes from the ring gear's axis. Positive puts a \
+                             car's pinion below the ring's centre; 0 makes a spiral bevel pair.",
+                        );
+                        ui.end_row();
+                        ui.label("Shaft angle");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(shaft_angle, 90.0, "90°");
+                            ui.add(egui::DragValue::new(shaft_angle).speed(0.5).range(30.0..=150.0).suffix("°"));
+                        })
+                        .response
+                        .on_hover_text("Angle between the shafts, seen along the offset.");
+                        ui.end_row();
+                        ui.label("Spiral angle");
+                        ui.add(egui::DragValue::new(spiral).speed(0.2).range(0.0..=60.0).suffix("°"))
+                            .on_hover_text("The pinion's mean spiral angle. Cars use about 45–50°.");
+                        ui.end_row();
+                        ui.label("Hand");
+                        ui.checkbox(reverse_hand, "Opposite hand").on_hover_text(
+                            "Swap the spiral hands from the usual ones for this offset (a left-hand \
+                             pinion with the pinion below centre).",
+                        );
+                        ui.end_row();
+                        ui.label("Cutter radius");
+                        let mut auto = *cutter_radius <= 0.0;
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut auto, "Auto").changed() {
+                                *cutter_radius = if auto { 0.0 } else { hypoid_cutter.unwrap_or(100.0) };
+                            }
+                            if !auto {
+                                len_drag(ui, cutter_radius, unit, 1.0..=2000.0, 0.5);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Radius of the face-mill cutter that cuts the ring gear's slots; it sets the tooth curve.");
+                        ui.end_row();
+                        ui.label("Direction");
+                        ui.add(egui::DragValue::new(angle).speed(0.5).range(-360.0..=360.0).suffix("°"))
+                            .on_hover_text("Turns the ring gear round the pinion's shaft.");
+                        ui.end_row();
+                    }
                     Placement::Axle { parent, phase } => {
                         ui.label("Shares axle with");
                         parent_combo(ui, parent, &earlier);
@@ -1738,7 +1966,7 @@ impl GearCraftApp {
                         ui.end_row();
                     }
                 });
-                egui::Grid::new("axial").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                if !is_ring { egui::Grid::new("axial").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label("Axial offset");
                     let hint = match g.placement {
                         Placement::Root { .. } => "Position of the back face along the axis.",
@@ -1747,10 +1975,10 @@ impl GearCraftApp {
                     };
                     len_drag(ui, &mut g.axial, unit, -10000.0..=10000.0, 0.1).on_hover_text(hint);
                     ui.end_row();
-                    if !g.params.is_bevel() {
+                    if !g.params.is_bevel() && !g.params.is_hypoid() {
                         value_row(ui, "Faces at", format!("{} … {}", len(s.z, unit), len(s.z + g.params.face_width, unit)));
                     }
-                });
+                }); }
             });
 
             let p = g.params.clone();
@@ -1760,8 +1988,53 @@ impl GearCraftApp {
             };
             let fmt = |v: f64| len(v, unit);
             let mut issues = p.issues(fmt);
+            match &hypoid_state {
+                Some((_, Some(e))) => issues.push(Issue { level: Level::Error, text: e.clone() }),
+                Some(_) if hypoid_design.is_none() => {
+                    issues.push(Issue { level: Level::Error, text: "These settings have no hypoid solution.".into() })
+                }
+                None if p.hypoid == Some(Role::Pinion) => issues.push(Issue {
+                    level: Level::Warning,
+                    text: "No ring gear: add one with Hypoid Set, or point a ring gear at this pinion.".into(),
+                }),
+                _ => {}
+            }
             section(ui, "Dimensions", |ui| {
                 if !p.is_buildable() {
+                    return;
+                }
+                if let Some(role) = p.hypoid {
+                    if hypoid_state.as_ref().is_some_and(|s| s.0) {
+                        ui.label(RichText::new("⏳ Generating teeth…").weak());
+                    }
+                    let Some(d) = &hypoid_design else { return };
+                    let deg = |a: f64| format!("{:.3}°", a.to_degrees());
+                    let hand = |left: bool| if left { "left hand" } else { "right hand" };
+                    egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        if role == Role::Ring {
+                            value_row(ui, "Pitch cone angle", deg(d.ring_pitch));
+                            value_row(ui, "Face cone angle", deg(d.ring_face_angle()));
+                            value_row(ui, "Root cone angle", deg(d.ring_root_angle()));
+                            value_row(ui, "Mean spiral angle", format!("{}, {}", deg(d.ring_spiral.abs()), hand(hypoid::ring_left_hand(d))));
+                            value_row(ui, "Pitch Ø (heel)", fmt(d.spec.module * d.spec.ring_teeth as f64));
+                            value_row(ui, "Mean pitch Ø", fmt(2.0 * d.ring_radius));
+                            value_row(ui, "Mean cone distance", fmt(d.ring_cone));
+                            value_row(ui, "Addendum / dedendum", format!("{} / {}", fmt(d.ring_addendum), fmt(d.ring_dedendum)));
+                        } else {
+                            value_row(ui, "Pitch cone angle", deg(d.pinion_pitch));
+                            value_row(ui, "Face cone angle", deg(d.pinion_face_angle()));
+                            value_row(ui, "Root cone angle", deg(d.pinion_root_angle()));
+                            value_row(ui, "Mean spiral angle", format!("{}, {}", deg(d.pinion_spiral.abs()), hand(hypoid::pinion_left_hand(d))));
+                            value_row(ui, "Mean pitch Ø", fmt(2.0 * d.pinion_radius));
+                            value_row(ui, "Mean cone distance", fmt(d.pinion_cone));
+                            value_row(ui, "Addendum / dedendum", format!("{} / {}", fmt(d.pinion_addendum), fmt(d.pinion_dedendum)));
+                        }
+                        value_row(ui, "Ratio", format!("{:.4} : 1", d.spec.ring_teeth as f64 / d.spec.pinion_teeth as f64));
+                        value_row(ui, "Shaft offset", fmt(d.spec.offset));
+                        value_row(ui, "Mean normal module", format!("{:.4} mm", d.mn));
+                        value_row(ui, "Whole depth", fmt(d.depth + d.clearance));
+                        value_row(ui, "Cutter radius", fmt(d.cutter.radius));
+                    });
                     return;
                 }
                 if let Some(b) = p.belt {
@@ -2329,6 +2602,23 @@ mod tests {
                 app.add_bevel_pair();
             }
             app.fit_pending = true;
+            harness.step();
+            harness.step();
+        }
+        if std::env::var("GEARCRAFT_SHOT_HYPOID").is_ok() {
+            let app = harness.state_mut();
+            app.switch_workspace(Workspace::Bevel);
+            if !app.project.gears.iter().any(|g| g.params.is_hypoid()) {
+                app.add_hypoid_pair();
+            }
+            app.three_d = true;
+            harness.step();
+            let start = Instant::now();
+            while harness.state().hypoid_pending() && start.elapsed() < Duration::from_secs(120) {
+                std::thread::sleep(Duration::from_millis(100));
+                harness.step();
+            }
+            harness.state_mut().fit_pending = true;
             harness.step();
             harness.step();
         }

@@ -12,7 +12,8 @@
 //! lie on the back and front cones, and the hub faces are planes.
 
 use crate::bevel::BevelGeom;
-use crate::export::{BevelPart, Shape};
+use crate::export::{BevelPart, HypoidPart, Shape};
+use crate::hypoid::Member;
 use crate::train::Frame3;
 use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fmt::Write;
@@ -462,12 +463,408 @@ fn bevel_solid(w: &mut Writer, g: &BevelGeom, name: &str) -> Option<usize> {
     Some(w.add(format!("MANIFOLD_SOLID_BREP('{}',#{shell})", text(name))))
 }
 
+// ---- hypoid gears -----------------------------------------------------------
+
+/// Averaged knots for cubic interpolation at `params` (clamped, Piegl &
+/// Tiller 9.8).
+fn interp_knots(params: &[f64]) -> Vec<f64> {
+    let n = params.len();
+    let mut k = vec![0.0; 4];
+    for j in 1..n - 3 {
+        k.push((params[j] + params[j + 1] + params[j + 2]) / 3.0);
+    }
+    k.extend([1.0; 4]);
+    k
+}
+
+/// The cubic B-spline basis functions on `knots`, all of them, at u.
+fn basis(knots: &[f64], u: f64) -> Vec<f64> {
+    let m = knots.len() - 1;
+    let n = m - 3;
+    let mut span = 3;
+    while span < n - 1 && u >= knots[span + 1] {
+        span += 1;
+    }
+    let mut b = vec![0.0; m];
+    b[span] = 1.0;
+    for d in 1..=3 {
+        for i in 0..m - d {
+            let left = if knots[i + d] > knots[i] { (u - knots[i]) / (knots[i + d] - knots[i]) * b[i] } else { 0.0 };
+            let right = if knots[i + d + 1] > knots[i + 1] {
+                (knots[i + d + 1] - u) / (knots[i + d + 1] - knots[i + 1]) * b[i + 1]
+            } else {
+                0.0
+            };
+            b[i] = left + right;
+        }
+    }
+    b.truncate(n);
+    b
+}
+
+/// Control points of the cubic B-spline through `pts` at `params`.
+fn interpolate(pts: &[[f64; 3]], params: &[f64], knots: &[f64]) -> Vec<[f64; 3]> {
+    let n = pts.len();
+    let mut a: Vec<Vec<f64>> = params.iter().map(|&u| basis(knots, u)).collect();
+    let mut rhs = pts.to_vec();
+    for c in 0..n {
+        let p = (c..n).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs())).unwrap();
+        a.swap(c, p);
+        rhs.swap(c, p);
+        for r in c + 1..n {
+            let f = a[r][c] / a[c][c];
+            if f != 0.0 {
+                for k in c..n {
+                    a[r][k] -= f * a[c][k];
+                }
+                for d in 0..3 {
+                    rhs[r][d] -= f * rhs[c][d];
+                }
+            }
+        }
+    }
+    let mut x = vec![[0.0; 3]; n];
+    for r in (0..n).rev() {
+        let mut v = rhs[r];
+        for k in r + 1..n {
+            for d in 0..3 {
+                v[d] -= a[r][k] * x[k][d];
+            }
+        }
+        x[r] = [v[0] / a[r][r], v[1] / a[r][r], v[2] / a[r][r]];
+    }
+    x
+}
+
+/// Parameters by chord length along each row, averaged over the rows.
+fn chord_params(rows: &[Vec<[f64; 3]>]) -> Vec<f64> {
+    let n = rows[0].len();
+    let mut acc = vec![0.0; n];
+    for row in rows {
+        let d: Vec<f64> = (1..n).map(|j| {
+            let v = sub(row[j], row[j - 1]);
+            (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+        }).collect();
+        let total: f64 = d.iter().sum();
+        let mut s = 0.0;
+        for j in 1..n {
+            s += d[j - 1];
+            acc[j] += if total > 0.0 { s / total } else { j as f64 / (n - 1) as f64 };
+        }
+    }
+    let k = rows.len() as f64;
+    let mut p: Vec<f64> = acc.iter().map(|a| a / k).collect();
+    p[n - 1] = 1.0;
+    p
+}
+
+/// A bicubic B-spline surface through a grid of points [u][v]: its
+/// control net and knots. Rows along u share `u_params`, so two patches
+/// built from the same row of points share that boundary exactly.
+struct Patch {
+    net: Vec<Vec<[f64; 3]>>,
+    uk: Vec<f64>,
+    vk: Vec<f64>,
+}
+
+impl Patch {
+    fn through(data: &[Vec<[f64; 3]>], u_params: &[f64]) -> Patch {
+        let v_params = chord_params(data);
+        let (uk, vk) = (interp_knots(u_params), interp_knots(&v_params));
+        let rows: Vec<Vec<[f64; 3]>> = data.iter().map(|r| interpolate(r, &v_params, &vk)).collect();
+        let nv = rows[0].len();
+        let cols: Vec<Vec<[f64; 3]>> =
+            (0..nv).map(|j| interpolate(&rows.iter().map(|r| r[j]).collect::<Vec<_>>(), u_params, &uk)).collect();
+        let net = (0..rows.len()).map(|i| cols.iter().map(|c| c[i]).collect()).collect();
+        Patch { net, uk, vk }
+    }
+
+    /// du × dv near the middle of the patch.
+    fn normal(&self) -> [f64; 3] {
+        let (i, j) = (self.net.len() / 2, self.net[0].len() / 2);
+        let du = sub(self.net[i + 1][j], self.net[i - 1][j]);
+        let dv = sub(self.net[i][j + 1], self.net[i][j - 1]);
+        cross(du, dv)
+    }
+}
+
+fn distinct_knots(k: &[f64]) -> (String, String) {
+    let mut vals: Vec<f64> = Vec::new();
+    let mut mults: Vec<usize> = Vec::new();
+    for &x in k {
+        if vals.last().is_some_and(|&l| (x - l).abs() < 1e-12) {
+            *mults.last_mut().unwrap() += 1;
+        } else {
+            vals.push(x);
+            mults.push(1);
+        }
+    }
+    let m: Vec<String> = mults.iter().map(|m| m.to_string()).collect();
+    let v: Vec<String> = vals.iter().map(|&x| num(x)).collect();
+    (m.join(","), v.join(","))
+}
+
+/// Clamped cubic B-splines (each on knots 0..1) joined end to end into
+/// one, with a C0 knot at each joint so each piece is kept exactly.
+fn join_splines(pieces: &[(Vec<[f64; 3]>, Vec<f64>)]) -> (Vec<[f64; 3]>, Vec<f64>) {
+    let mut ctrl: Vec<[f64; 3]> = Vec::new();
+    let mut knots = vec![0.0; 4];
+    let n = pieces.len();
+    for (i, (c, k)) in pieces.iter().enumerate() {
+        ctrl.extend(if i == 0 { &c[..] } else { &c[1..] });
+        let off = i as f64;
+        knots.extend(k[4..k.len() - 4].iter().map(|x| x + off));
+        knots.extend(std::iter::repeat_n(off + 1.0, if i + 1 == n { 4 } else { 3 }));
+    }
+    let span = n as f64;
+    (ctrl, knots.into_iter().map(|x| x / span).collect())
+}
+
+fn spline_curve(w: &mut Writer, ctrl: &[[f64; 3]], knots: &[f64]) -> usize {
+    let ids: Vec<String> = ctrl.iter().map(|&p| format!("#{}", w.point(p))).collect();
+    let (m, v) = distinct_knots(knots);
+    w.add(format!(
+        "B_SPLINE_CURVE_WITH_KNOTS('',3,({}),.UNSPECIFIED.,.F.,.F.,({m}),({v}),.UNSPECIFIED.)",
+        ids.join(",")
+    ))
+}
+
+fn spline_surface(w: &mut Writer, p: &Patch) -> usize {
+    let rows: Vec<String> = p
+        .net
+        .iter()
+        .map(|r| format!("({})", r.iter().map(|&q| format!("#{}", w.point(q))).collect::<Vec<_>>().join(",")))
+        .collect();
+    let (um, uv) = distinct_knots(&p.uk);
+    let (vm, vv) = distinct_knots(&p.vk);
+    w.add(format!(
+        "B_SPLINE_SURFACE_WITH_KNOTS('',3,3,({}),.UNSPECIFIED.,.F.,.F.,.F.,({um}),({vm}),({uv}),({vv}),.UNSPECIFIED.)",
+        rows.join(",")
+    ))
+}
+
+/// A hypoid gear or pinion as a MANIFOLD_SOLID_BREP, in its own frame
+/// (pitch apex at the origin, axis +z) and placed by `w.place`. Each
+/// flank and tip land is a bicubic B-spline through the generated
+/// sections; neighbouring patches are built from the same rows of points
+/// so their shared edges are exact iso-curves of both. The ends lie on the
+/// section cones at the toe and heel, then flat hub faces and the bore.
+fn hypoid_brep(w: &mut Writer, m: &Member, name: &str) -> Option<usize> {
+    let hub = m.hub_faces();
+    if m.bore / 2.0 >= hub[0].1.min(hub[1].1) {
+        return None;
+    }
+    let z = m.teeth as usize;
+    let pitch = m.pitch();
+    let ns = m.stations.len();
+    let last = ns - 1;
+    let u_params: Vec<f64> = (0..ns).map(|k| k as f64 / last as f64).collect();
+    let tip_n = 5;
+    let gamma = m.blank.pitch;
+    let (sg, cg) = gamma.sin_cos();
+    let e_phi = |phi: f64, sign: f64| [-sign * phi.sin(), sign * phi.cos(), 0.0];
+
+    // Patches per tooth: right flank, tip land, left flank.
+    let mut patches: Vec<[(Patch, bool); 3]> = Vec::with_capacity(z);
+    for tooth in 0..z {
+        let rot = tooth as f64 * pitch;
+        let right = m.flank(false, tooth);
+        let left = m.flank(true, tooth);
+        let tip: Vec<Vec<[f64; 3]>> = (0..ns)
+            .map(|k| {
+                let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
+                (0..tip_n)
+                    .map(|i| {
+                        let f = i as f64 / (tip_n - 1) as f64;
+                        m.point(m.stations[k], a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f + rot)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mid = ns / 2;
+        let phi_of = |side: &Vec<Vec<[f64; 2]>>| side[mid][side[mid].len() / 2][1] + rot;
+        let tip_phi = (m.right[mid].last().unwrap()[1] + m.left[mid].last().unwrap()[1]) / 2.0 + rot;
+        let off = [cg * tip_phi.cos(), cg * tip_phi.sin(), -sg];
+        let make = |data: &[Vec<[f64; 3]>], out: [f64; 3]| {
+            let p = Patch::through(data, &u_params);
+            let agrees = {
+                let n = p.normal();
+                n[0] * out[0] + n[1] * out[1] + n[2] * out[2] > 0.0
+            };
+            (p, agrees)
+        };
+        patches.push([make(&right, e_phi(phi_of(&m.right), -1.0)), make(&tip, off), make(&left, e_phi(phi_of(&m.left), 1.0))]);
+    }
+
+    // Corner vertices per tooth and end: seam, right tip, left tip.
+    let corner = |p: &Patch, u: usize, v: usize| p.net[if u == 0 { 0 } else { p.net.len() - 1 }][if v == 0 { 0 } else { p.net[0].len() - 1 }];
+    let mut seam_v = vec![[0usize; 2]; z];
+    let mut rtip_v = vec![[0usize; 2]; z];
+    let mut ltip_v = vec![[0usize; 2]; z];
+    for t in 0..z {
+        for e in 0..2 {
+            seam_v[t][e] = w.vertex(corner(&patches[t][0].0, e, 0));
+            rtip_v[t][e] = w.vertex(corner(&patches[t][0].0, e, 1));
+            ltip_v[t][e] = w.vertex(corner(&patches[t][2].0, e, 1));
+        }
+    }
+    let row = |p: &Patch, v: usize| -> Vec<[f64; 3]> { p.net.iter().map(|r| if v == 0 { r[0] } else { *r.last().unwrap() }).collect() };
+    let col = |p: &Patch, u: usize| -> Vec<[f64; 3]> { if u == 0 { p.net[0].clone() } else { p.net.last().unwrap().clone() } };
+    // Edges along the face (u): seam, right tip, left tip.
+    let mut seam_e = Vec::with_capacity(z);
+    let mut rtip_e = Vec::with_capacity(z);
+    let mut ltip_e = Vec::with_capacity(z);
+    for t in 0..z {
+        let [(r, _), _, (l, _)] = &patches[t];
+        let c = spline_curve(w, &row(r, 0), &r.uk);
+        seam_e.push(w.edge(seam_v[t][0], seam_v[t][1], c, true));
+        let c = spline_curve(w, &row(r, 1), &r.uk);
+        rtip_e.push(w.edge(rtip_v[t][0], rtip_v[t][1], c, true));
+        let c = spline_curve(w, &row(l, 1), &l.uk);
+        ltip_e.push(w.edge(ltip_v[t][0], ltip_v[t][1], c, true));
+    }
+    // Edges across the ends (v): right flank, tip, left flank, per end.
+    let mut rend = vec![[0usize; 2]; z];
+    let mut tend = vec![[0usize; 2]; z];
+    let mut lend = vec![[0usize; 2]; z];
+    for t in 0..z {
+        let next = (t + 1) % z;
+        let [(r, _), (tp, _), (l, _)] = &patches[t];
+        for e in 0..2 {
+            let c = spline_curve(w, &col(r, e), &r.vk);
+            rend[t][e] = w.edge(seam_v[t][e], rtip_v[t][e], c, true);
+            let c = spline_curve(w, &col(tp, e), &tp.vk);
+            tend[t][e] = w.edge(rtip_v[t][e], ltip_v[t][e], c, true);
+            let c = spline_curve(w, &col(l, e), &l.vk);
+            lend[t][e] = w.edge(seam_v[next][e], ltip_v[t][e], c, true);
+        }
+    }
+
+    let mut faces = Vec::new();
+    // A patch's boundary anticlockwise in (u, v): v = 0 forwards, u = 1
+    // up, v = 1 back, u = 0 down; reversed if the outside is the other way.
+    let mut patch_face = |w: &mut Writer, p: &Patch, agrees: bool, b: usize, r: usize, t: usize, l: usize| {
+        let surf = spline_surface(w, p);
+        let lp = vec![(b, true), (r, true), (t, false), (l, false)];
+        let lp = if agrees { lp } else { lp.into_iter().rev().map(|(e, f)| (e, !f)).collect() };
+        faces.push(w.face(surf, agrees, &[(lp, true)]));
+    };
+    for t in 0..z {
+        let next = (t + 1) % z;
+        let [(r, ra), (tp, ta), (l, la)] = &patches[t];
+        patch_face(w, r, *ra, seam_e[t], rend[t][1], rtip_e[t], rend[t][0]);
+        patch_face(w, tp, *ta, rtip_e[t], tend[t][1], ltip_e[t], tend[t][0]);
+        patch_face(w, l, *la, seam_e[next], lend[t][1], ltip_e[t], lend[t][0]);
+    }
+
+    // Tooth ends. Each is a ruled patch from the hub circle up to the
+    // tooth's end outline (its right flank, tip and left flank end edges,
+    // joined into one curve), lying close to the section cone. Its sides
+    // are straight lines on the cone below the seams, and its foot, a
+    // spline on the hub circle, is shared with the flat face.
+    let mut hub_v = vec![[0usize; 2]; z];
+    let mut side_e = vec![[0usize; 2]; z];
+    for t in 0..z {
+        let rot = t as f64 * pitch;
+        for (e, k) in [(0usize, 0usize), (1, last)] {
+            let (zh, rh) = hub[e];
+            let phi = m.right[k][0][1] + rot;
+            let foot = [rh * phi.cos(), rh * phi.sin(), zh];
+            hub_v[t][e] = w.vertex(foot);
+            let line = w.line(foot, corner(&patches[t][0].0, e, 0));
+            side_e[t][e] = w.edge(hub_v[t][e], seam_v[t][e], line, true);
+        }
+    }
+    let mut foot_e = vec![[0usize; 2]; z];
+    for t in 0..z {
+        let next = (t + 1) % z;
+        let rot = t as f64 * pitch;
+        let [(r, _), (tp, _), (l, _)] = &patches[t];
+        for (e, k) in [(0usize, 0usize), (1, last)] {
+            let (zh, rh) = hub[e];
+            let back: Vec<[f64; 3]> = col(l, e).into_iter().rev().collect();
+            let back_k: Vec<f64> = l.vk.iter().rev().map(|x| 1.0 - x).collect();
+            let pieces = [(col(r, e), r.vk.clone()), (col(tp, e), tp.vk.clone()), (back, back_k)];
+            let (top, knots) = join_splines(&pieces);
+            // The foot in matching pieces, between the same azimuths.
+            let phis = [
+                m.right[k][0][1],
+                m.right[k].last().unwrap()[1],
+                m.left[k].last().unwrap()[1],
+                m.left[k][0][1],
+            ]
+            .map(|p| p + rot);
+            let feet: Vec<(Vec<[f64; 3]>, Vec<f64>)> = pieces
+                .iter()
+                .enumerate()
+                .map(|(i, (c, kn))| {
+                    let greville: Vec<f64> = (0..c.len()).map(|j| (kn[j + 1] + kn[j + 2] + kn[j + 3]) / 3.0).collect();
+                    let pts: Vec<[f64; 3]> = greville
+                        .iter()
+                        .map(|&g| {
+                            let a = phis[i] + (phis[i + 1] - phis[i]) * g;
+                            [rh * a.cos(), rh * a.sin(), zh]
+                        })
+                        .collect();
+                    (interpolate(&pts, &greville, kn), kn.clone())
+                })
+                .collect();
+            let (bottom, _) = join_splines(&feet);
+            let curve = spline_curve(w, &bottom, &knots);
+            foot_e[t][e] = w.edge(hub_v[t][e], hub_v[next][e], curve, true);
+            // Outward: towards the apex at the toe, away at the heel.
+            let i = top.len() / 2;
+            let n = cross(sub(bottom[i + 1], bottom[i - 1]), sub(top[i], bottom[i]));
+            let mid = (phis[1] + phis[2]) / 2.0;
+            let out = [sg * mid.cos(), sg * mid.sin(), cg];
+            let agrees = (n[0] * out[0] + n[1] * out[1] + n[2] * out[2] > 0.0) == (e == 1);
+            let rows: Vec<String> =
+                bottom.iter().zip(&top).map(|(&b, &q)| format!("(#{},#{})", w.point(b), w.point(q))).collect();
+            let (um, uv) = distinct_knots(&knots);
+            let surf = w.add(format!(
+                "B_SPLINE_SURFACE_WITH_KNOTS('',3,1,({}),.UNSPECIFIED.,.F.,.F.,.F.,({um}),(2,2),({uv}),(0.0,1.0),.UNSPECIFIED.)",
+                rows.join(",")
+            ));
+            let lp = vec![
+                (foot_e[t][e], true),
+                (side_e[next][e], true),
+                (lend[t][e], true),
+                (tend[t][e], false),
+                (rend[t][e], false),
+                (side_e[t][e], false),
+            ];
+            let lp = if agrees { lp } else { lp.into_iter().rev().map(|(x, f)| (x, !f)).collect() };
+            faces.push(w.face(surf, agrees, &[(lp, true)]));
+        }
+    }
+    // Flat faces and the bore.
+    let rb = (m.bore / 2.0).max(0.0);
+    let (lo, hi) = if hub[0].0 < hub[1].0 { (0, 1) } else { (1, 0) };
+    let bore = (rb > 0.0).then(|| walls(w, &hole([0.0, 0.0], rb), hub[lo].0, hub[hi].0, &mut faces));
+    for (e, up) in [(hi, true), (lo, false)] {
+        let zf = hub[e].0;
+        let plane = w.plane([0.0, 0.0, zf], [0.0, 0.0, if up { 1.0 } else { -1.0 }], [1.0, 0.0, 0.0]);
+        let ring: Vec<(usize, bool)> =
+            if up { (0..z).map(|t| (foot_e[t][e], true)).collect() } else { (0..z).rev().map(|t| (foot_e[t][e], false)).collect() };
+        let mut bounds = vec![(ring, true)];
+        if let Some(h) = &bore {
+            let inner = if up { h.top.iter().map(|&x| (x, true)).collect() } else { h.bottom.iter().rev().map(|&x| (x, false)).collect() };
+            bounds.push((inner, true));
+        }
+        faces.push(w.face(plane, true, &bounds));
+    }
+
+    let list: Vec<String> = faces.iter().map(|f| format!("#{f}")).collect();
+    let shell = w.add(format!("CLOSED_SHELL('',({}))", list.join(",")));
+    Some(w.add(format!("MANIFOLD_SOLID_BREP('{}',#{shell})", text(name))))
+}
+
 /// STEP strings are ISO 8859-1 between single quotes, which double.
 fn text(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii() && !c.is_ascii_control()).collect::<String>().replace('\'', "''")
 }
 
-pub fn step(shapes: &[Shape], bevels: &[BevelPart], name: &str) -> String {
+pub fn step(shapes: &[Shape], bevels: &[BevelPart], hypoids: &[HypoidPart], name: &str) -> String {
     let name = if name.is_empty() { "gearcraft".to_string() } else { text(name) };
     let mut w = Writer { out: String::new(), next: 1, place: None };
     let ctx = w.add("APPLICATION_CONTEXT('core data for automotive mechanical design processes')");
@@ -500,6 +897,13 @@ pub fn step(shapes: &[Shape], bevels: &[BevelPart], name: &str) -> String {
         }
         w.place = None;
     }
+    for h in hypoids {
+        w.place = Some((h.frame, h.rot));
+        if let Some(id) = hypoid_brep(&mut w, &h.member, &h.name) {
+            items.push(format!("#{id}"));
+        }
+        w.place = None;
+    }
     let rep = w.add(format!("ADVANCED_BREP_SHAPE_REPRESENTATION('{name}',({}),#{geo})", items.join(",")));
     w.add(format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep})"));
 
@@ -524,7 +928,7 @@ mod tests {
         // A closed, manifold shell: each edge bounds exactly two faces,
         // once in each direction.
         let shapes = export::shapes(&Project::default(), 0.0, None, |_| true);
-        let text = step(&shapes, &[], "t");
+        let text = step(&shapes, &[], &[], "t");
         assert_closed(&text);
         assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), shapes.len());
     }
@@ -544,7 +948,7 @@ mod tests {
         assert!(g.base > g.root);
         let bevels = export::bevels(&p, 0.3, None, |_| true);
         assert_eq!(bevels.len(), 3);
-        let text = step(&[], &bevels, "t");
+        let text = step(&[], &bevels, &[], "t");
         assert_closed(&text);
         assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 3);
     }
@@ -563,9 +967,50 @@ mod tests {
         std::fs::write(dir.join("pair.gearcraft"), serde_json::to_string_pretty(&p).unwrap()).unwrap();
         for (i, g) in p.gears.iter().enumerate() {
             let one = export::bevels(&p, 0.0, Some(g.id), |_| true);
-            std::fs::write(dir.join(format!("bevel{i}.step")), step(&[], &one, "b")).unwrap();
+            std::fs::write(dir.join(format!("bevel{i}.step")), step(&[], &one, &[], "b")).unwrap();
         }
-        std::fs::write(dir.join("pair.step"), step(&[], &export::bevels(&p, 0.0, None, |_| true), "pair")).unwrap();
+        std::fs::write(dir.join("pair.step"), step(&[], &export::bevels(&p, 0.0, None, |_| true), &[], "pair")).unwrap();
+    }
+
+    fn hypoid_project() -> Project {
+        use crate::hypoid::Role;
+        use crate::train::{Link, PitchUnit};
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_hypoid(Role::Pinion), 0.0, 0.0);
+        p.add_child(a, PitchUnit::Module.starter_hypoid(Role::Ring), Link::Hypoid);
+        p.normalize();
+        p
+    }
+
+    #[test]
+    fn hypoid_gears_are_closed() {
+        let parts = export::hypoids(&hypoid_project(), 0.2, None, |_| true, |_| None);
+        assert_eq!(parts.len(), 2);
+        let text = step(&[], &[], &parts, "t");
+        assert_closed(&text);
+        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 2);
+    }
+
+    /// `GEARCRAFT_HYPOID_STEP=dir cargo test write_hypoid_samples` writes
+    /// the car hypoid set (and its project) for checking in a CAD program.
+    #[test]
+    fn write_hypoid_samples() {
+        let Ok(dir) = std::env::var("GEARCRAFT_HYPOID_STEP") else { return };
+        let dir = std::path::Path::new(&dir);
+        let mut p = hypoid_project();
+        // Some backlash, so the flanks are clear rather than touching.
+        p.gears[1].params.backlash = 0.1;
+        std::fs::write(dir.join("hypoid.gearcraft"), serde_json::to_string_pretty(&p).unwrap()).unwrap();
+        for (i, g) in p.gears.iter().enumerate() {
+            let one = export::hypoids(&p, 0.0, Some(g.id), |_| true, |_| None);
+            std::fs::write(dir.join(format!("hypoid{i}.step")), step(&[], &[], &one, "h")).unwrap();
+        }
+        // The pair at a few positions through one pinion tooth's mesh.
+        for k in 0..4 {
+            let a = std::f64::consts::TAU / 11.0 * k as f64 / 4.0;
+            let all = export::hypoids(&p, a, None, |_| true, |_| None);
+            std::fs::write(dir.join(format!("hypoid_pair{k}.step")), step(&[], &[], &all, "pair")).unwrap();
+        }
     }
 
     fn assert_closed(text: &str) {
@@ -588,5 +1033,75 @@ mod tests {
         assert_eq!(num(-2.5), "-2.5");
         assert_eq!(num(1e-14), "0.0");
         assert_eq!(num(0.1234567891234), "0.1234567891");
+    }
+}
+
+#[cfg(test)]
+mod cloud {
+    //! A point cloud off the hypoid STEP surfaces, run through the mesh.
+    use super::*;
+    use crate::hypoid::{Spec, tests::car};
+
+    fn rz(a: f64, x: [f64; 3]) -> [f64; 3] {
+        let (s, c) = a.sin_cos();
+        [x[0] * c - x[1] * s, x[0] * s + x[1] * c, x[2]]
+    }
+
+    fn eval(p: &Patch, u: f64, v: f64) -> [f64; 3] {
+        let (bu, bv) = (basis(&p.uk, u), basis(&p.vk, v));
+        let mut out = [0.0; 3];
+        for (i, row) in p.net.iter().enumerate() {
+            for (j, q) in row.iter().enumerate() {
+                for d in 0..3 {
+                    out[d] += bu[i] * bv[j] * q[d];
+                }
+            }
+        }
+        out
+    }
+
+    /// Tooth 0's flank surfaces, as written to STEP, sampled densely.
+    fn cloud(m: &Member) -> Vec<[f64; 3]> {
+        let ns = m.stations.len();
+        let up: Vec<f64> = (0..ns).map(|k| k as f64 / (ns - 1) as f64).collect();
+        let mut pts = Vec::new();
+        for left in [false, true] {
+            let p = Patch::through(&m.flank(left, 0), &up);
+            for i in 0..=50 {
+                for j in 0..=80 {
+                    pts.push(eval(&p, i as f64 / 50.0, j as f64 / 80.0));
+                }
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn step_surfaces_mesh_without_colliding() {
+        for spec in [car(), Spec { offset: 0.0, ..car() }] {
+            let d = spec.design().unwrap();
+            let (pin, ring) = (d.pinion().unwrap(), d.ring().unwrap());
+            // The ring's surfaces hug the slots its cutter makes.
+            let bulge = cloud(&ring).iter().map(|&y| d.any_slot(y, 0.0)).fold(f64::MIN, f64::max);
+            assert!(bulge < 0.01, "ring surface {bulge} mm into its slot");
+            // The pinion's surfaces, every tooth, through a ring pitch of
+            // motion, stay out of the true ring gear.
+            let rb = d.ring_blank();
+            let k = d.sense * spec.ring_teeth as f64 / spec.pinion_teeth as f64;
+            let pitch = TAU / spec.pinion_teeth as f64;
+            let pc = cloud(&pin);
+            let mut deepest = f64::MIN;
+            for step in 0..48 {
+                let theta = TAU / spec.ring_teeth as f64 * step as f64 / 48.0;
+                for tooth in 0..spec.pinion_teeth {
+                    for &q in &pc {
+                        let y = rz(-theta, d.pinion_to_design(rz(k * theta + tooth as f64 * pitch, q)));
+                        let v = rb.inside_pub([y[0].hypot(y[1]), y[2]]).min(-d.any_slot(y, 0.0));
+                        deepest = deepest.max(v);
+                    }
+                }
+            }
+            assert!(deepest < 1e-3, "pinion surface {deepest} mm into the ring (offset {})", spec.offset);
+        }
     }
 }

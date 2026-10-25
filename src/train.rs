@@ -6,6 +6,7 @@
 
 use crate::gear::{self, GearParams, Issue, MeshInfo, ToothStandard};
 use crate::bevel::{self, Bevel, BevelGeom};
+use crate::hypoid::{self, Design, Role};
 use crate::pulley::{self, BeltSection};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -34,6 +35,22 @@ pub enum Placement {
     /// this gear's axis is `shaft_angle` degrees from the parent's, leaning
     /// towards azimuth `angle` round the parent's axis.
     Bevel { parent: u64, angle: f64, shaft_angle: f64 },
+    /// A hypoid (or, with no offset, spiral bevel) ring gear driven by
+    /// hypoid pinion `parent`. The pinion's shaft passes `offset` mm from
+    /// this gear's axis at `shaft_angle` degrees to it; `spiral` is the
+    /// pinion's mean spiral angle (degrees). `angle` turns this gear round
+    /// the pinion's axis. A cutter radius of 0 picks one to suit.
+    Hypoid {
+        parent: u64,
+        angle: f64,
+        offset: f64,
+        shaft_angle: f64,
+        spiral: f64,
+        #[serde(default)]
+        reverse_hand: bool,
+        #[serde(default)]
+        cutter_radius: f64,
+    },
 }
 
 impl Placement {
@@ -43,7 +60,8 @@ impl Placement {
             Placement::Mesh { parent, .. }
             | Placement::Axle { parent, .. }
             | Placement::Belt { parent, .. }
-            | Placement::Bevel { parent, .. } => Some(parent),
+            | Placement::Bevel { parent, .. }
+            | Placement::Hypoid { parent, .. } => Some(parent),
         }
     }
 }
@@ -55,6 +73,7 @@ pub enum Link {
     Axle,
     Belt,
     Bevel,
+    Hypoid,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,6 +159,16 @@ impl PitchUnit {
         GearParams { face_width: 4.0 * p.module, bevel: Some(Bevel::default()), ..p }
     }
 
+    /// Half of a car-style hypoid set: 11:41, module 5 at the heel.
+    pub fn starter_hypoid(self, role: Role) -> GearParams {
+        let m = if self.is_inch() { 25.4 / 5.0 } else { 5.0 };
+        let p = self.starter(if role == Role::Pinion { 11 } else { 41 });
+        match role {
+            Role::Pinion => GearParams { module: m, bore: 3.0 * m, face_width: 6.4 * m, hypoid: Some(role), ..p },
+            Role::Ring => GearParams { module: m, bore: 22.0 * m, face_width: 6.4 * m, hypoid: Some(role), ..p },
+        }
+    }
+
     /// A sensible fresh gear in this system.
     pub fn starter(self, teeth: u32) -> GearParams {
         match self {
@@ -192,6 +221,8 @@ pub struct Solved {
     /// Where the part sits in 3D: its own axes (z along its shaft) and
     /// origin (the back face centre, or a bevel gear's cone apex).
     pub frame: Frame3,
+    /// A hypoid ring gear's solved pair design.
+    pub hypoid: Option<Box<Design>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,6 +261,29 @@ fn v_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 fn v_unit(a: [f64; 3]) -> [f64; 3] {
     let l = v_dot(a, a).sqrt().max(1e-300);
     [a[0] / l, a[1] / l, a[2] / l]
+}
+
+/// The hypoid set made by pinion `pinion` and ring gear `ring` placed by
+/// `placement` (a Placement::Hypoid).
+pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement) -> Option<hypoid::Spec> {
+    let Placement::Hypoid { offset, shaft_angle, spiral, reverse_hand, cutter_radius, .. } = *placement else {
+        return None;
+    };
+    Some(hypoid::Spec {
+        pinion_teeth: pinion.teeth,
+        ring_teeth: ring.teeth,
+        module: ring.module,
+        pressure_angle: ring.pressure_angle,
+        face: ring.face_width,
+        offset,
+        shaft_angle,
+        spiral,
+        reverse_hand,
+        cutter_radius,
+        backlash: ring.backlash,
+        pinion_bore: pinion.bore,
+        ring_bore: ring.bore,
+    })
 }
 
 /// Along its own axis, where a part starts and ends relative to its frame
@@ -410,6 +464,19 @@ impl Project {
                 params.bevel = params.bevel.or(Some(Bevel::default()));
                 Placement::Bevel { parent, angle: direction(), shaft_angle: 90.0 }
             }
+            Link::Hypoid => {
+                params.hypoid = Some(Role::Ring);
+                params.bevel = None;
+                Placement::Hypoid {
+                    parent,
+                    angle: 0.0,
+                    offset: (0.03 * params.module * params.teeth as f64).round() * 5.0,
+                    shaft_angle: 90.0,
+                    spiral: 45.0,
+                    reverse_hand: false,
+                    cutter_radius: 0.0,
+                }
+            }
             Link::Belt => {
                 params.belt = pp.belt.or(params.belt);
                 params.belt_width = pp.belt_width;
@@ -464,7 +531,7 @@ impl Project {
         for i in 0..self.gears.len() {
             let g = &self.gears[i];
             let own = kind_name(&g.params);
-            let is_default = ["Gear", "Pulley", "Bevel"].iter().filter(|k| **k != own).any(|k| {
+            let is_default = ["Gear", "Pulley", "Bevel", "Pinion", "Ring gear"].iter().filter(|k| **k != own).any(|k| {
                 g.name.strip_prefix(k).and_then(|n| n.trim().parse::<u32>().ok()).is_some()
             });
             if is_default {
@@ -509,6 +576,15 @@ impl Project {
                                 self.gears[i].params.bevel = Some(Bevel { pitch_angle: cd.to_degrees() });
                                 coned[i] = true;
                             }
+                        }
+                        if matches!(self.gears[i].placement, Placement::Hypoid { .. }) {
+                            // The ring gear sets the pair's teeth.
+                            let src = self.gears[i].params.clone();
+                            let dst = &mut self.gears[pi].params;
+                            dst.module = src.module;
+                            dst.pressure_angle = src.pressure_angle;
+                            dst.hypoid = Some(Role::Pinion);
+                            self.gears[i].params.hypoid = Some(Role::Ring);
                         }
                         let belted = matches!(self.gears[i].placement, Placement::Belt { .. });
                         if belted && self.gears[i].match_parent && self.gears[pi].params.is_pulley() {
@@ -562,6 +638,7 @@ impl Project {
                         depth: ps.depth + 1,
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
+                        hypoid: None,
                     }
                 }
                 (Placement::Belt { angle, belt_teeth, .. }, Some(pi)) => {
@@ -591,6 +668,7 @@ impl Project {
                         depth: ps.depth + 1,
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
+                        hypoid: None,
                     }
                 }
                 (Placement::Bevel { angle, .. }, Some(pi)) => {
@@ -621,6 +699,52 @@ impl Project {
                         depth: ps.depth + 1,
                         z: f.origin[2],
                         frame,
+                        hypoid: None,
+                    }
+                }
+                (Placement::Hypoid { angle, .. }, Some(pi)) => {
+                    let pg = &self.gears[pi];
+                    let ps = &out[pi];
+                    let design = hypoid_spec(&pg.params, &g.params, &g.placement).and_then(|sp| sp.design());
+                    let f = ps.frame;
+                    let beta = angle.to_radians();
+                    let turn = |v: [f64; 3]| {
+                        let (sn, cs) = beta.sin_cos();
+                        f.turn([v[0] * cs - v[1] * sn, v[0] * sn + v[1] * cs, v[2]])
+                    };
+                    match design {
+                        Some(d) => {
+                            // The ring's frame from where generation put it
+                            // relative to the pinion, turned round the
+                            // pinion's axis by β.
+                            let (o, x, y, z) = d.ring_in_pinion();
+                            let (so, co) = beta.sin_cos();
+                            let origin = f.apply([o[0] * co - o[1] * so, o[0] * so + o[1] * co, o[2]]);
+                            let frame = Frame3 { origin, x: turn(x), y: turn(y), z: turn(z) };
+                            let k = d.sense * pg.params.teeth as f64 / g.params.teeth as f64;
+                            Solved {
+                                center: [origin[0], origin[1]],
+                                ratio: k * ps.ratio,
+                                phase: k * (ps.phase - beta),
+                                mesh: None,
+                                belt: None,
+                                depth: ps.depth + 1,
+                                z: origin[2],
+                                frame,
+                                hypoid: Some(Box::new(d)),
+                            }
+                        }
+                        None => Solved {
+                            center: ps.center,
+                            ratio: ps.ratio,
+                            phase: 0.0,
+                            mesh: None,
+                            belt: None,
+                            depth: ps.depth + 1,
+                            z: f.origin[2],
+                            frame: f,
+                            hypoid: None,
+                        },
                     }
                 }
                 (Placement::Axle { phase, .. }, Some(pi)) => {
@@ -634,6 +758,7 @@ impl Project {
                         depth: ps.depth + 1,
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
+                        hypoid: None,
                     }
                 }
                 (Placement::Root { x, y, phase }, _) => Solved {
@@ -645,6 +770,7 @@ impl Project {
                     depth: 0,
                     z: 0.0,
                     frame: Frame3::at([0.0; 3]),
+                    hypoid: None,
                 },
                 // Unreachable after normalize(); draw it at the origin.
                 (_, None) => {
@@ -657,12 +783,13 @@ impl Project {
                         depth: 0,
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
+                        hypoid: None,
                     }
                 }
             };
             let mut s = s;
             match (&g.placement, parent) {
-                (Placement::Bevel { .. }, _) => {}
+                (Placement::Bevel { .. } | Placement::Hypoid { .. }, _) => {}
                 (Placement::Axle { .. }, Some(pi)) => {
                     // Stacked along the parent's shaft: this part starts
                     // where the parent ends.
@@ -708,7 +835,7 @@ impl Project {
         for i in 0..self.gears.len() {
             for j in i + 1..self.gears.len() {
                 let (a, b) = (&self.gears[i], &self.gears[j]);
-                if a.params.is_bevel() || b.params.is_bevel() {
+                if a.params.is_bevel() || b.params.is_bevel() || a.params.is_hypoid() || b.params.is_hypoid() {
                     continue;
                 }
                 let related = |x: &Gear, y: &Gear| matches!(x.placement, Placement::Mesh { parent, .. } if parent == y.id);
@@ -736,6 +863,11 @@ pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
 }
 
 fn kind_name(params: &GearParams) -> &'static str {
+    match params.hypoid {
+        Some(Role::Pinion) => return "Pinion",
+        Some(Role::Ring) => return "Ring gear",
+        None => {}
+    }
     if params.is_pulley() {
         "Pulley"
     } else if params.is_bevel() {

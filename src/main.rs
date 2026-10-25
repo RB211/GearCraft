@@ -9,6 +9,7 @@ mod bevel;
 mod chrome;
 mod export;
 mod gear;
+mod hypoid;
 mod pulley;
 mod step;
 mod train;
@@ -55,7 +56,8 @@ fn headless_export(file: Option<std::path::PathBuf>, out: &std::path::Path) -> e
     project.normalize();
     let shapes = export::shapes(&project, 0.0, None, |_| true);
     let bevels = export::bevels(&project, 0.0, None, |_| true);
-    export::write(out, &shapes, &bevels, project.pitch_unit.is_inch()).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
+    let hypoids = export::hypoids(&project, 0.0, None, |_| true, |_| None);
+    export::write(out, &shapes, &bevels, &hypoids, project.pitch_unit.is_inch()).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
     Ok(())
 }
 

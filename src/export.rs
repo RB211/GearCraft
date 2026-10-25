@@ -7,7 +7,9 @@
 
 use crate::bevel::BevelGeom;
 use crate::gear;
-use crate::train::{Frame3, Gear, Project};
+use crate::hypoid::{Member, Role};
+use crate::train::{self, Frame3, Gear, Placement, Project};
+use std::sync::Arc;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -162,7 +164,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .gears
         .iter()
         .zip(&solved)
-        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && !g.params.is_bevel())
+        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && !g.params.is_bevel() && !g.params.is_hypoid())
         .filter_map(|(g, s)| {
             let prof = gear::tooth_profile(&g.params)?;
             let (center, rot) = if only.is_none() { (s.center, s.phase + s.ratio * driver_angle) } else { ([0.0, 0.0], 0.0) };
@@ -205,9 +207,60 @@ pub fn bevels(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .collect()
 }
 
+/// A hypoid pinion or ring gear for STEP: its generated sections and
+/// where it sits.
+pub struct HypoidPart {
+    pub name: String,
+    pub member: Member,
+    pub frame: Frame3,
+    pub rot: f64,
+}
+
+/// The hypoid gears to export, placed as `shapes` places the others.
+/// `cached` hands over a set's teeth if they are already generated (by
+/// ring gear id); otherwise they are generated here. Sets that have no
+/// solution are left out.
+pub fn hypoids(
+    project: &Project,
+    driver_angle: f64,
+    only: Option<u64>,
+    keep: impl Fn(&Gear) -> bool,
+    cached: impl Fn(u64) -> Option<Arc<(Member, Member)>>,
+) -> Vec<HypoidPart> {
+    let solved = project.solve();
+    let mut out = Vec::new();
+    for ring in &project.gears {
+        let Placement::Hypoid { parent, .. } = ring.placement else { continue };
+        let Some(pi) = project.index_of(parent) else { continue };
+        let pinion = &project.gears[pi];
+        let wanted: Vec<(&Gear, usize)> = [(pinion, 0), (ring, 1)]
+            .into_iter()
+            .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g))
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let pair = cached(ring.id).or_else(|| {
+            let d = train::hypoid_spec(&pinion.params, &ring.params, &ring.placement)?.design()?;
+            Some(Arc::new((d.pinion().ok()?, d.ring().ok()?)))
+        });
+        let Some(pair) = pair else { continue };
+        for (g, which) in wanted {
+            let Some(i) = project.index_of(g.id) else { continue };
+            let s = &solved[i];
+            let (frame, rot) =
+                if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) };
+            let member = if which == 0 { pair.0.clone() } else { pair.1.clone() };
+            debug_assert_eq!(g.params.hypoid, Some(if which == 0 { Role::Pinion } else { Role::Ring }));
+            out.push(HypoidPart { name: g.name.clone(), member, frame, rot });
+        }
+    }
+    out
+}
+
 /// Write DXF, SVG or STEP, chosen by the file extension, in inches or mm.
-/// Only STEP carries bevel gears.
-pub fn write(path: &Path, shapes: &[Shape], bevels: &[BevelPart], inch: bool) -> std::io::Result<()> {
+/// Only STEP carries bevel and hypoid gears.
+pub fn write(path: &Path, shapes: &[Shape], bevels: &[BevelPart], hypoids: &[HypoidPart], inch: bool) -> std::io::Result<()> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     std::fs::write(
@@ -215,7 +268,7 @@ pub fn write(path: &Path, shapes: &[Shape], bevels: &[BevelPart], inch: bool) ->
         match ext.as_str() {
             "svg" => svg(shapes, inch),
             // STEP carries its own units; it is always written in mm.
-            "step" | "stp" => crate::step::step(shapes, bevels, &name),
+            "step" | "stp" => crate::step::step(shapes, bevels, hypoids, &name),
             _ => dxf(shapes, inch),
         },
     )

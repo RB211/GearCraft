@@ -6,6 +6,7 @@
 use crate::bevel::BevelGeom;
 use crate::export;
 use crate::gear::{self, FillMesh, GearParams, Profile};
+use crate::hypoid::Member;
 use crate::pulley::BeltLoop;
 use crate::train::Frame3;
 use eframe::egui::{self, Color32, Pos2, Rect};
@@ -196,6 +197,170 @@ pub fn bevel_solid(g: &BevelGeom) -> Solid {
         s.walls(&hole, g.front_face().0, g.back_face().0, false);
     }
     s
+}
+
+/// A hypoid gear or pinion from its generated sections (axis +z, pitch
+/// apex at the origin): flank grids, tip lands, the toe and heel end cones
+/// down to the hub circles, flat faces and the bore.
+pub fn hypoid_solid(m: &Member) -> Solid {
+    let mut s = Solid::default();
+    let z = m.teeth as usize;
+    let pitch = m.pitch();
+    let last = m.stations.len() - 1;
+    let (sg, cg) = m.blank.pitch.sin_cos();
+    // Outward directions: along the cone, and off its surface.
+    let along = |phi: f64| [sg * phi.cos(), sg * phi.sin(), cg];
+    let off = |phi: f64| [cg * phi.cos(), cg * phi.sin(), -sg];
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    // A grid of points as quads, its normals turned to agree with `hint`
+    // (one outward direction somewhere in the middle).
+    let grid = |s: &mut Solid, g: &[Vec<[f64; 3]>], hint: [f64; 3]| {
+        let (ni, nj) = (g.len(), g[0].len());
+        let q = |i: usize, j: usize| cross(sub(g[i + 1][j], g[i][j]), sub(g[i][j + 1], g[i][j]));
+        let flip = if dot(q(ni / 2 - (ni > 2) as usize, nj / 2 - (nj > 2) as usize), hint) < 0.0 { -1.0 } else { 1.0 };
+        for i in 0..ni - 1 {
+            for j in 0..nj - 1 {
+                let c = cross(sub(g[i + 1][j + 1], g[i][j]), sub(g[i][j + 1], g[i + 1][j]));
+                let l = dot(c, c).sqrt();
+                if l < 1e-15 {
+                    continue;
+                }
+                let n = [flip * c[0] / l, flip * c[1] / l, flip * c[2] / l];
+                s.quad(g[i][j], g[i + 1][j], g[i + 1][j + 1], g[i][j + 1], n);
+            }
+        }
+    };
+    let tip_steps = 4;
+    for tooth in 0..z {
+        let rot = tooth as f64 * pitch;
+        let (right, left) = (m.flank(false, tooth), m.flank(true, tooth));
+        let mid = m.stations.len() / 2;
+        let at = |side: &Vec<Vec<[f64; 2]>>, j: usize| side[mid][j][1] + rot;
+        let pm = |side: &Vec<Vec<[f64; 2]>>| at(side, side[mid].len() / 2);
+        let e_phi = |phi: f64, sign: f64| [-sign * phi.sin(), sign * phi.cos(), 0.0];
+        grid(&mut s, &right, e_phi(pm(&m.right), -1.0));
+        grid(&mut s, &left, e_phi(pm(&m.left), 1.0));
+        // Tip land between the flanks' top points.
+        let tip: Vec<Vec<[f64; 3]>> = (0..=last)
+            .map(|k| {
+                let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
+                (0..=tip_steps)
+                    .map(|i| {
+                        let f = i as f64 / tip_steps as f64;
+                        m.point(m.stations[k], a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f + rot)
+                    })
+                    .collect()
+            })
+            .collect();
+        let top = m.right[mid].len() - 1;
+        grid(&mut s, &tip, off((at(&m.right, top) + at(&m.left, top)) / 2.0));
+    }
+    // Toe and heel ends: per tooth, the section from the hub circle up
+    // round the tooth, clipped into triangles on the (φ, t) plane.
+    let hub_steps = 12;
+    for (e, k) in [(0usize, 0usize), (1, last)] {
+        let st = m.stations[k];
+        let ht = m.hub[e];
+        let scale = st * sg;
+        let base = m.right[k][0][1];
+        let mut poly: Vec<[f64; 2]> = vec![[base, ht]];
+        poly.extend(m.right[k].iter().map(|&[t, phi]| [phi, t]));
+        poly.extend(m.left[k].iter().rev().map(|&[t, phi]| [phi, t]));
+        let end = m.left[k][0][1];
+        poly.push([end, ht]);
+        for i in 1..hub_steps {
+            poly.push([end + (base - end) * i as f64 / hub_steps as f64, ht]);
+        }
+        let flat: Vec<[f64; 2]> = poly.iter().map(|&[phi, t]| [phi * scale, t]).collect();
+        let tris = ear_clip(&flat);
+        let sign = if e == 0 { -1.0 } else { 1.0 };
+        for tooth in 0..z {
+            let rot = tooth as f64 * pitch;
+            let pts: Vec<[f64; 3]> = poly.iter().map(|&[phi, t]| m.point(st, t, phi + rot)).collect();
+            let hint = along(base + rot + pitch / 2.0);
+            for t in &tris {
+                let [a, b, c] = t.map(|i| pts[i]);
+                let n = cross(sub(b, a), sub(c, a));
+                let l = dot(n, n).sqrt();
+                if l < 1e-15 {
+                    continue;
+                }
+                let f = if dot(n, hint) * sign < 0.0 { -1.0 } else { 1.0 };
+                let n = [f * n[0] / l, f * n[1] / l, f * n[2] / l];
+                let (ia, ib, ic) = (s.vert(a), s.vert(b), s.vert(c));
+                s.tris.push(([ia, ib, ic], n));
+            }
+        }
+    }
+    // Flat faces from the hub circles in to the bore, facing away from
+    // each other, and the bore between them.
+    let faces = m.hub_faces();
+    let rb = (m.bore / 2.0).max(0.0);
+    let segs = 128;
+    for e in 0..2 {
+        let (zf, rf) = faces[e];
+        let up = zf > faces[1 - e].0;
+        let nrm = [0.0, 0.0, if up { 1.0 } else { -1.0 }];
+        for i in 0..segs {
+            let (a, b) = (i as f64 * TAU / segs as f64, (i + 1) as f64 * TAU / segs as f64);
+            let o = |phi: f64, r: f64| [r * phi.cos(), r * phi.sin(), zf];
+            if rb > 0.0 {
+                s.quad(o(a, rb), o(b, rb), o(b, rf), o(a, rf), nrm);
+            } else {
+                let (o0, oa, ob) = (s.vert(o(0.0, 0.0)), s.vert(o(a, rf)), s.vert(o(b, rf)));
+                s.tris.push(([o0, oa, ob], nrm));
+            }
+        }
+    }
+    if rb > 0.0 {
+        let hole: Vec<[f64; 2]> = (0..64).map(|i| i as f64 * TAU / 64.0).map(|a| [rb * a.cos(), rb * a.sin()]).collect();
+        let (z0, z1) = (faces[0].0.min(faces[1].0), faces[0].0.max(faces[1].0));
+        s.walls(&hole, z0, z1, false);
+    }
+    s
+}
+
+/// Triangles filling a simple polygon, by ear clipping.
+pub fn ear_clip(poly: &[[f64; 2]]) -> Vec<[usize; 3]> {
+    let n = poly.len();
+    let area: f64 = (0..n).map(|i| {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        a[0] * b[1] - b[0] * a[1]
+    }).sum();
+    let mut idx: Vec<usize> = if area >= 0.0 { (0..n).collect() } else { (0..n).rev().collect() };
+    let cr = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut out = Vec::with_capacity(n.saturating_sub(2));
+    while idx.len() > 3 {
+        let m = idx.len();
+        let ear = (0..m).find(|&i| {
+            let (a, b, c) = (poly[idx[(i + m - 1) % m]], poly[idx[i]], poly[idx[(i + 1) % m]]);
+            if cr(a, b, c) <= 0.0 {
+                return false;
+            }
+            !idx.iter().enumerate().any(|(j, &p)| {
+                if j == i || j == (i + m - 1) % m || j == (i + 1) % m {
+                    return false;
+                }
+                let q = poly[p];
+                cr(a, b, q) >= 0.0 && cr(b, c, q) >= 0.0 && cr(c, a, q) >= 0.0
+            })
+        });
+        // A degenerate remainder: cut the flattest corner.
+        let i = ear.unwrap_or_else(|| {
+            (0..m)
+                .max_by(|&x, &y| {
+                    let f = |i: usize| cr(poly[idx[(i + m - 1) % m]], poly[idx[i]], poly[idx[(i + 1) % m]]);
+                    f(x).total_cmp(&f(y))
+                })
+                .unwrap()
+        });
+        out.push([idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]]);
+        idx.remove(i);
+    }
+    if idx.len() == 3 {
+        out.push([idx[0], idx[1], idx[2]]);
+    }
+    out
 }
 
 /// The belt as a solid in world coordinates: backing and teeth, `width`

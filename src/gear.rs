@@ -11,6 +11,7 @@
 //! tooth 0 pointing along +X.
 
 use crate::bevel::{Bevel, BevelGeom};
+use crate::hypoid::Role;
 use crate::pulley::{self, BeltSection};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
@@ -53,6 +54,11 @@ pub struct GearParams {
     /// `face_width` runs along the cone.
     #[serde(default)]
     pub bevel: Option<Bevel>,
+    /// Set for half of a hypoid or spiral bevel set. The pair's geometry
+    /// lives on the ring gear's placement; the ring's `module` (heel),
+    /// `pressure_angle`, `face_width` and `backlash` set the teeth.
+    #[serde(default)]
+    pub hypoid: Option<Role>,
 }
 
 impl Default for GearParams {
@@ -72,6 +78,7 @@ impl Default for GearParams {
             belt: None,
             belt_width: 0.0,
             bevel: None,
+            hypoid: None,
         }
     }
 }
@@ -216,9 +223,18 @@ impl GearParams {
     pub fn is_bevel(&self) -> bool {
         self.bevel.is_some()
     }
+    pub fn is_hypoid(&self) -> bool {
+        self.hypoid.is_some()
+    }
     /// Outside radius (a pulley's lies the pitch-line differential inside
     /// its pitch circle).
     pub fn tip_radius(&self) -> f64 {
+        // A hypoid pinion grows with the offset; this is a generous bound.
+        match self.hypoid {
+            Some(Role::Ring) => return self.pitch_radius() + self.module,
+            Some(Role::Pinion) => return 1.6 * self.pitch_radius() + 2.0 * self.module,
+            None => {}
+        }
         if let Some(g) = self.bevel.and_then(|_| BevelGeom::new(self)) {
             return g.outside_diameter() / 2.0;
         }
@@ -258,6 +274,9 @@ impl GearParams {
     }
 
     pub fn is_buildable(&self) -> bool {
+        if self.is_hypoid() {
+            return self.module > 0.0 && self.teeth >= 5;
+        }
         if self.is_bevel() {
             return BevelGeom::new(self).is_some();
         }
@@ -275,6 +294,10 @@ impl GearParams {
     /// Problems with this gear; `len` formats a length in mm for display.
     pub fn issues(&self, len: impl Fn(f64) -> String) -> Vec<Issue> {
         let mut out = Vec::new();
+        if self.is_hypoid() {
+            // Checked as a pair, with the ring gear's placement.
+            return out;
+        }
         if self.is_bevel() {
             match BevelGeom::new(self) {
                 Some(g) => return g.issues(len),
