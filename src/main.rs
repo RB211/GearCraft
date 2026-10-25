@@ -50,7 +50,7 @@ fn headless_export(file: Option<std::path::PathBuf>, out: &std::path::Path) -> e
         None => train::Project::default(),
     };
     project.normalize();
-    let shapes = export::shapes(&project, 0.0, None);
+    let shapes = export::shapes(&project, 0.0, None, |_| true);
     export::write(out, &shapes, project.pitch_unit.is_inch()).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
     Ok(())
 }

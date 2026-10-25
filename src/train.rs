@@ -272,10 +272,12 @@ impl Project {
         id
     }
 
-    fn fresh_name(&self) -> String {
-        let mut n = self.gears.len() + 1;
+    /// "Gear 3", "Pulley 2": the lowest number its kind has free.
+    pub fn fresh_name(&self, params: &GearParams) -> String {
+        let kind = kind_name(params);
+        let mut n = 1;
         loop {
-            let name = format!("Gear {n}");
+            let name = format!("{kind} {n}");
             if !self.gears.iter().any(|g| g.name == name) {
                 return name;
             }
@@ -285,7 +287,7 @@ impl Project {
 
     pub fn add_root(&mut self, params: GearParams, x: f64, y: f64) -> u64 {
         let id = self.fresh_id();
-        let name = self.fresh_name();
+        let name = self.fresh_name(&params);
         self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true });
         id
     }
@@ -338,7 +340,7 @@ impl Project {
             }
         };
         let id = self.fresh_id();
-        let name = self.fresh_name();
+        let name = self.fresh_name(&params);
         let at = self.subtree_end(pi);
         self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle });
         id
@@ -371,6 +373,21 @@ impl Project {
         }
         out.remove(0);
         out
+    }
+
+    /// Give parts still carrying the other kind's default name ("Gear 2"
+    /// on a pulley, from older files or a type switch) a name of their own.
+    pub fn fix_default_names(&mut self) {
+        for i in 0..self.gears.len() {
+            let g = &self.gears[i];
+            let other = if g.params.is_pulley() { "Gear" } else { "Pulley" };
+            let is_default = g.name.strip_prefix(other).and_then(|n| n.trim().parse::<u32>().ok()).is_some();
+            if is_default {
+                let params = g.params.clone();
+                self.gears[i].name = String::new();
+                self.gears[i].name = self.fresh_name(&params);
+            }
+        }
     }
 
     /// Remove a gear and everything attached to it.
@@ -542,6 +559,10 @@ pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
     a.tip_radius() + b.tip_radius() + 2.0 * a.pitch_radius().max(b.pitch_radius())
 }
 
+fn kind_name(params: &GearParams) -> &'static str {
+    if params.is_pulley() { "Pulley" } else { "Gear" }
+}
+
 fn belt_info(a: &GearParams, b: &GearParams, belt_teeth: u32) -> BeltInfo {
     let section = a.belt.filter(|s| b.belt == Some(*s));
     let mismatch = section.is_none();
@@ -682,6 +703,23 @@ mod tests {
         assert!((k - k.round()).abs() < 1e-9, "{k}");
         let len = lp.len();
         assert!((len - s[1].belt.as_ref().unwrap().length).abs() < 1e-6, "{len}");
+    }
+
+    #[test]
+    fn parts_are_named_by_kind() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_pulley(20), 0.0, 0.0);
+        let b = p.add_child(a, PitchUnit::Module.starter_pulley(30), Link::Belt);
+        p.add_child(b, GearParams::default(), Link::Axle);
+        let names: Vec<&str> = p.gears.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Pulley 1", "Pulley 2", "Gear 1"]);
+
+        // An older file's pulley called "Gear 2" is renamed; a custom name is kept.
+        p.gears[0].name = "Gear 2".into();
+        p.gears[1].name = "Motor".into();
+        p.fix_default_names();
+        assert_eq!(p.gears[0].name, "Pulley 1");
+        assert_eq!(p.gears[1].name, "Motor");
     }
 
     #[test]

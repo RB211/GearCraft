@@ -6,7 +6,7 @@
 //! fraction of a micron apart get merged by CAD import and tangle the loop.
 
 use crate::gear;
-use crate::train::Project;
+use crate::train::{Gear, Project};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -150,13 +150,15 @@ pub fn place(q: [f64; 2], center: [f64; 2], rot: f64) -> [f64; 2] {
 
 /// The whole train as it stands at `driver_angle`, or just gear `only`,
 /// which goes out at the origin with tooth 0 on +X, ready to cut.
-pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>) -> Vec<Shape> {
+/// The parts `keep` picks: placed as they sit in the train (turned to
+/// `driver_angle`), or, for a single part (`only`), at the origin.
+pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: impl Fn(&Gear) -> bool) -> Vec<Shape> {
     let solved = project.solve();
     project
         .gears
         .iter()
         .zip(&solved)
-        .filter(|(g, _)| only.is_none_or(|id| id == g.id))
+        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g))
         .filter_map(|(g, s)| {
             let prof = gear::tooth_profile(&g.params)?;
             let (center, rot) = if only.is_none() { (s.center, s.phase + s.ratio * driver_angle) } else { ([0.0, 0.0], 0.0) };
@@ -368,7 +370,7 @@ mod tests {
 
     #[test]
     fn dxf_has_no_pitch_circle_and_uses_bulges() {
-        let text = dxf(&shapes(&Project::default(), 0.0, None), false);
+        let text = dxf(&shapes(&Project::default(), 0.0, None, |_| true), false);
         assert!(!text.contains("PITCH"));
         assert!(text.contains("\n42\n"));
         assert_eq!(text.matches("\nCIRCLE\n").count(), 2); // the two bores

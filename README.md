@@ -6,7 +6,8 @@ One window, no pop-up parameter dialogs:
 
 - **Workspace** (top left): what you are designing, which sets the ribbon's tools. Spur Gears and
   Timing Pulleys today; internal/planetary, helical, clock wheels and escapements will join the list.
-  A project can mix parts from any workspace.
+  Each workspace shows only its own parts: switching to Timing Pulleys puts the gears away, and
+  switching back brings them (and what you had selected) back. One project file holds them all.
 - **Train** (left): the gears and pulleys in the project as a tree. Each is either fixed, meshing
   with an earlier gear, belted to an earlier pulley, or sharing an earlier gear's axle (compound
   gears for clock and reduction trains).
@@ -58,8 +59,8 @@ Headless export of a train:
 | --- | --- |
 | Ctrl+N / O / S / Shift+S | New, open, save, save as |
 | Ctrl+Z / Ctrl+Shift+Z | Undo, redo |
-| M / A | Add a meshing gear / a gear on the same axle |
-| B / P | Add a belted pulley / a pulley on the same axle |
+| M / A | Spur Gears: add a meshing gear / a gear on the same shaft |
+| B / P | Timing Pulleys: add a belt drive / a pulley on the same shaft |
 | Del | Delete the selected gear (and anything attached to it) |
 | Space | Run or pause |
 | F or double-click | Fit the train to the window |

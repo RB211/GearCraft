@@ -2,7 +2,7 @@ use crate::chrome::{self, Icon};
 use crate::export::{self, place};
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
-use crate::train::{self, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
+use crate::train::{self, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui,
     Vec2,
@@ -46,7 +46,7 @@ enum Pending {
 
 /// What the ribbon is set up to make. Each kind of gear gets its own
 /// workspace and tools; a project can still mix them.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Workspace {
     Spur,
     Pulleys,
@@ -124,6 +124,8 @@ pub struct GearCraftApp {
     /// Belt fitting picks from the ISO 5296 lengths only.
     belt_standard_only: bool,
     workspace: Workspace,
+    /// What was selected in each workspace, restored on switching back.
+    workspace_selection: HashMap<Workspace, u64>,
     title: String,
 }
 
@@ -154,6 +156,7 @@ impl GearCraftApp {
             unit_switch: None,
             belt_standard_only: true,
             workspace: Workspace::Spur,
+            workspace_selection: HashMap::new(),
             title: String::new(),
         };
         if let Some(f) = file {
@@ -166,13 +169,46 @@ impl GearCraftApp {
         self.status = Some((msg.into(), Instant::now()));
     }
 
+    // ---- workspaces ------------------------------------------------------
+
+    /// Whether a part belongs to the open workspace. Only those are drawn,
+    /// listed and picked; the others wait, untouched, in their own.
+    fn shown(&self, g: &Gear) -> bool {
+        Workspace::of(&g.params) == self.workspace
+    }
+
+    fn first_shown(&self) -> Option<u64> {
+        self.project.gears.iter().find(|g| self.shown(g)).map(|g| g.id)
+    }
+
+    fn switch_workspace(&mut self, to: Workspace) {
+        if to == self.workspace {
+            return;
+        }
+        if let Some(id) = self.selected {
+            self.workspace_selection.insert(self.workspace, id);
+        }
+        self.workspace = to;
+        self.selected = self
+            .workspace_selection
+            .get(&to)
+            .copied()
+            .filter(|id| self.project.get(*id).is_some_and(|g| self.shown(g)))
+            .or_else(|| self.first_shown());
+        self.drag = None;
+        self.fit_pending = true;
+    }
+
     // ---- files -----------------------------------------------------------
 
     fn replace_project(&mut self, project: Project, path: Option<PathBuf>) {
         self.selected = project.gears.first().map(|g| g.id);
+        self.workspace_selection.clear();
         if let Some(g) = project.gears.first() {
             self.workspace = Workspace::of(&g.params);
         }
+        let mut project = project;
+        project.fix_default_names();
         self.committed = project.clone();
         self.project = project;
         self.undo.clear();
@@ -238,7 +274,7 @@ impl GearCraftApp {
 
     fn export(&mut self, whole_train: bool, dxf: bool) {
         let only = if whole_train { None } else { self.selected };
-        let shapes = export::shapes(&self.project, self.driver_angle, only);
+        let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
         if shapes.is_empty() {
             self.flash("Nothing to export");
             return;
@@ -326,6 +362,7 @@ impl GearCraftApp {
             .gears
             .iter()
             .zip(&solved)
+            .filter(|(g, _)| self.shown(g))
             .map(|(g, s)| s.center[0] + g.params.tip_radius())
             .fold(f64::MIN, f64::max);
         let x = if right == f64::MIN { 0.0 } else { right + 40.0 };
@@ -339,8 +376,12 @@ impl GearCraftApp {
         if let Some(id) = self.selected {
             let i = self.project.index_of(id).unwrap_or(0);
             self.project.remove(id);
-            self.selected =
-                self.project.gears.get(i.saturating_sub(1)).or(self.project.gears.first()).map(|g| g.id);
+            self.selected = self.project.gears[..i.min(self.project.gears.len())]
+                .iter()
+                .rev()
+                .find(|g| self.shown(g))
+                .map(|g| g.id)
+                .or_else(|| self.first_shown());
         }
     }
 
@@ -379,8 +420,8 @@ impl GearCraftApp {
     fn after_history(&mut self) {
         self.committed = self.project.clone();
         self.dirty = true;
-        if self.selected.and_then(|id| self.project.get(id)).is_none() {
-            self.selected = self.project.gears.first().map(|g| g.id);
+        if !self.selected.and_then(|id| self.project.get(id)).is_some_and(|g| self.shown(g)) {
+            self.selected = self.first_shown();
         }
     }
 
@@ -425,7 +466,7 @@ impl GearCraftApp {
     fn fit(&mut self, rect: Rect, solved: &[Solved]) {
         let mut lo = [f64::MAX; 2];
         let mut hi = [f64::MIN; 2];
-        for (g, s) in self.project.gears.iter().zip(solved) {
+        for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
             let r = g.params.tip_radius().max(1.0);
             for k in 0..2 {
                 lo[k] = lo[k].min(s.center[k] - r);
@@ -444,12 +485,18 @@ impl GearCraftApp {
 
     /// The smallest gear under the pointer, so a pinion on top of its wheel
     /// can still be picked.
+    /// Overlaps among the parts on screen.
+    fn visible_collisions(&self, solved: &[Solved]) -> Vec<(usize, usize)> {
+        let g = &self.project.gears;
+        self.project.collisions(solved).into_iter().filter(|&(i, j)| self.shown(&g[i]) && self.shown(&g[j])).collect()
+    }
+
     fn hit(&self, solved: &[Solved], w: [f64; 2]) -> Option<u64> {
         self.project
             .gears
             .iter()
             .zip(solved)
-            .filter(|(g, s)| (w[0] - s.center[0]).hypot(w[1] - s.center[1]) <= g.params.tip_radius())
+            .filter(|(g, s)| self.shown(g) && (w[0] - s.center[0]).hypot(w[1] - s.center[1]) <= g.params.tip_radius())
             .min_by(|a, b| a.0.params.tip_radius().total_cmp(&b.0.params.tip_radius()))
             .map(|(g, _)| g.id)
     }
@@ -555,23 +602,26 @@ impl GearCraftApp {
             self.draw_grid(&painter, rect, &visuals);
         }
         self.refresh_cache();
-        let collisions = self.project.collisions(&solved);
+        let collisions = self.visible_collisions(&solved);
         self.draw_gears(&painter, rect, &visuals, &solved, &collisions);
 
-        if self.project.gears.is_empty() {
+        if !self.project.gears.iter().any(|g| self.shown(g)) {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "Empty project. Use \"New train\" to place a gear.",
+                match self.workspace {
+                    Workspace::Spur => "No gears yet. Use \"New Train\" to place one.",
+                    Workspace::Pulleys => "No pulleys yet. Use \"New Pulley\" to place one.",
+                },
                 FontId::proportional(16.0),
                 visuals.weak_text_color(),
             );
         }
         let hint = if rect.width() > 820.0 {
-            "Scroll: zoom · Drag empty space: pan · Drag a gear: move it, or swing it round its \
+            "Scroll: zoom · Drag empty space: pan · Drag a part: move it, or swing it round its \
              partner (Shift snaps 15°) · Double-click: fit"
         } else {
-            "Scroll zoom · drag pan · drag gear to move/swing"
+            "Scroll zoom · drag pan · drag part to move/swing"
         };
         painter.text(
             rect.left_bottom() + Vec2::new(8.0, -6.0),
@@ -620,7 +670,7 @@ impl GearCraftApp {
     /// engaged as the train runs.
     fn draw_belts(&self, painter: &egui::Painter, rect: Rect, visuals: &egui::Visuals, solved: &[Solved]) {
         let color = if visuals.dark_mode { Color32::from_gray(88) } else { Color32::from_gray(52) };
-        for (g, s) in self.project.gears.iter().zip(solved) {
+        for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
             let Some(bi) = &s.belt else { continue };
             let Some(pi) = g.placement.parent().and_then(|p| self.project.index_of(p)) else { continue };
             let pp = &self.project.gears[pi].params;
@@ -689,6 +739,9 @@ impl GearCraftApp {
         let mut selected_outline = None;
 
         for (i, (g, s)) in self.project.gears.iter().zip(solved).enumerate() {
+            if !self.shown(g) {
+                continue;
+            }
             let center = self.to_screen(rect, s.center);
             let ra_px = (g.params.tip_radius() * self.view.scale) as f32;
             if !rect.expand(ra_px).contains(center) {
@@ -766,7 +819,7 @@ impl GearCraftApp {
         }
 
         if self.show.labels {
-            for (g, s) in self.project.gears.iter().zip(solved) {
+            for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
                 let ra_px = (g.params.tip_radius() * self.view.scale) as f32;
                 if ra_px < 40.0 {
                     continue;
@@ -857,26 +910,32 @@ impl GearCraftApp {
                 }
                 ui.separator();
                 let has_sel = self.selected.is_some();
-                if ui.add_enabled(has_sel, egui::Button::new("Add meshing gear").shortcut_text("M")).clicked() {
-                    self.add_gear(Link::Mesh, false);
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Add belted pulley").shortcut_text("B")).clicked() {
-                    self.add_gear(Link::Belt, true);
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Add gear on same axle").shortcut_text("A")).clicked() {
-                    self.add_gear(Link::Axle, false);
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Add pulley on same axle").shortcut_text("P")).clicked() {
-                    self.add_gear(Link::Axle, true);
-                }
-                if ui.button("New gear train").clicked() {
-                    self.add_train(false);
-                }
-                if ui.button("New pulley train").clicked() {
-                    self.add_train(true);
+                match self.workspace {
+                    Workspace::Spur => {
+                        if ui.add_enabled(has_sel, egui::Button::new("Add meshing gear").shortcut_text("M")).clicked() {
+                            self.add_gear(Link::Mesh, false);
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("Add gear on same shaft").shortcut_text("A")).clicked() {
+                            self.add_gear(Link::Axle, false);
+                        }
+                        if ui.button("New gear train").clicked() {
+                            self.add_train(false);
+                        }
+                    }
+                    Workspace::Pulleys => {
+                        if ui.add_enabled(has_sel, egui::Button::new("Add belt drive").shortcut_text("B")).clicked() {
+                            self.add_gear(Link::Belt, true);
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("Add pulley on same shaft").shortcut_text("P")).clicked() {
+                            self.add_gear(Link::Axle, true);
+                        }
+                        if ui.button("New pulley").clicked() {
+                            self.add_train(true);
+                        }
+                    }
                 }
                 ui.separator();
-                if ui.add_enabled(has_sel, egui::Button::new("Delete gear").shortcut_text("Del")).clicked() {
+                if ui.add_enabled(has_sel, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
                     self.delete_selected();
                 }
             });
@@ -919,7 +978,7 @@ impl GearCraftApp {
                 for w in Workspace::ALL {
                     let text = RichText::new(format!("{}   {}", w.glyph(), w.name())).size(14.0);
                     if ui.selectable_label(self.workspace == w, text).on_hover_text(w.hint()).clicked() {
-                        self.workspace = w;
+                        self.switch_workspace(w);
                     }
                 }
                 ui.separator();
@@ -1016,7 +1075,8 @@ impl GearCraftApp {
         ui.add_space(4.0);
         let solved = self.project.solve();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (g, s) in self.project.gears.iter().zip(&solved) {
+            let ws = self.workspace;
+            for (g, s) in self.project.gears.iter().zip(&solved).filter(|(g, _)| Workspace::of(&g.params) == ws) {
                 let (icon, how) = match g.placement {
                     Placement::Root { .. } => ("⏺", "driver"),
                     Placement::Mesh { .. } => ("⚙", "meshes"),
@@ -1042,16 +1102,25 @@ impl GearCraftApp {
     }
 
     fn properties(&mut self, ui: &mut Ui) {
-        let Some(idx) = self.selected.and_then(|id| self.project.index_of(id)) else {
+        let idx = self.selected.and_then(|id| self.project.index_of(id)).filter(|&i| self.shown(&self.project.gears[i]));
+        let Some(idx) = idx else {
             ui.heading("Properties");
-            ui.label(RichText::new("Select a gear on the canvas or in the train list.").weak());
+            let what = if self.workspace == Workspace::Pulleys { "pulley" } else { "gear" };
+            ui.label(RichText::new(format!("Select a {what} on the canvas or in the train list.")).weak());
             return;
         };
         let solved = self.project.solve();
-        let collisions = self.project.collisions(&solved);
+        let collisions = self.visible_collisions(&solved);
         let unit = self.project.pitch_unit;
         let rpm = self.project.driver_rpm;
-        let earlier: Vec<(u64, String)> = self.project.gears[..idx].iter().map(|g| (g.id, g.name.clone())).collect();
+        // Partners come from this workspace (plus a current partner from
+        // another, so an existing link still shows).
+        let own_parent = self.project.gears[idx].placement.parent();
+        let earlier: Vec<(u64, String)> = self.project.gears[..idx]
+            .iter()
+            .filter(|g| self.shown(g) || Some(g.id) == own_parent)
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
         let parent_idx = self.project.gears[idx].placement.parent().and_then(|p| self.project.index_of(p));
         let parent_name = parent_idx.map(|p| self.project.gears[p].name.clone());
         let others: Vec<String> = collisions
@@ -1068,7 +1137,6 @@ impl GearCraftApp {
             .filter(|g| g.params.is_pulley())
             .map(|g| (g.id, g.name.clone()))
             .collect();
-        let parent_is_pulley = parent_idx.is_some_and(|p| self.project.gears[p].params.is_pulley());
         // Belt fits need the whole project, so they run after the panel.
         let mut fit_req: Option<f64> = None;
         let mut fit_start = false;
@@ -1078,32 +1146,6 @@ impl GearCraftApp {
             ui.horizontal(|ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut g.name);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Type");
-                let was = g.params.is_pulley();
-                let mut pulley = was;
-                ui.selectable_value(&mut pulley, false, "⚙ Gear");
-                ui.selectable_value(&mut pulley, true, "🔗 Timing pulley");
-                if pulley != was {
-                    let (teeth, bore) = (g.params.teeth, g.params.bore);
-                    g.params = if pulley {
-                        GearParams { bore, ..unit.starter_pulley(teeth.max(10)) }
-                    } else {
-                        GearParams { bore, ..unit.starter(teeth) }
-                    };
-                    // Keep the link sensible: gears mesh, pulleys take a belt.
-                    match g.placement {
-                        Placement::Mesh { parent, angle } if pulley && parent_is_pulley => {
-                            g.placement = Placement::Belt { parent, angle, belt_teeth: 0, target: 0.0 };
-                            fit_start = true;
-                        }
-                        Placement::Belt { parent, angle, .. } if !pulley => {
-                            g.placement = Placement::Mesh { parent, angle };
-                        }
-                        _ => {}
-                    }
-                }
             });
             ui.add_space(6.0);
 
@@ -1522,7 +1564,11 @@ impl GearCraftApp {
             ui.separator();
             ui.label(format!("{:.2} px/mm", self.view.scale));
             ui.separator();
-            ui.label(format!("{} parts", self.project.gears.len()));
+            let n = self.project.gears.iter().filter(|g| self.shown(g)).count();
+            ui.label(match self.workspace {
+                Workspace::Spur => format!("{n} gears"),
+                Workspace::Pulleys => format!("{n} pulleys"),
+            });
             if let Some((msg, at)) = &self.status {
                 if at.elapsed() < Duration::from_secs(6) {
                     ui.separator();
@@ -1566,17 +1612,24 @@ impl GearCraftApp {
         if key(Key::F) {
             self.fit_pending = true;
         }
-        if key(Key::M) {
-            self.add_gear(Link::Mesh, false);
-        }
-        if key(Key::B) {
-            self.add_gear(Link::Belt, true);
-        }
-        if key(Key::A) {
-            self.add_gear(Link::Axle, false);
-        }
-        if key(Key::P) {
-            self.add_gear(Link::Axle, true);
+        // Each workspace's own tools: M/A for gears, B/P for pulleys.
+        match self.workspace {
+            Workspace::Spur => {
+                if key(Key::M) {
+                    self.add_gear(Link::Mesh, false);
+                }
+                if key(Key::A) {
+                    self.add_gear(Link::Axle, false);
+                }
+            }
+            Workspace::Pulleys => {
+                if key(Key::B) {
+                    self.add_gear(Link::Belt, true);
+                }
+                if key(Key::P) {
+                    self.add_gear(Link::Axle, true);
+                }
+            }
         }
         if key(Key::Delete) {
             self.delete_selected();
@@ -1840,7 +1893,49 @@ fn fmt_period(rpm: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::train::Project;
     use egui_kittest::{Harness, kittest::Queryable};
+
+    /// A project with a gear pair and a belted pulley pair.
+    fn mixed() -> Project {
+        let mut p = Project::empty();
+        let g = p.add_root(PitchUnit::Module.starter(24), 0.0, 0.0);
+        p.add_child(g, PitchUnit::Module.starter(36), Link::Mesh);
+        let q = p.add_root(PitchUnit::Module.starter_pulley(20), 300.0, 0.0);
+        p.add_child(q, PitchUnit::Module.starter_pulley(30), Link::Belt);
+        p.normalize();
+        p
+    }
+
+    #[test]
+    fn switching_workspace_shows_only_its_parts() {
+        let mut harness = Harness::builder().with_size(Vec2::new(1400.0, 860.0)).build_eframe(|cc| {
+            let mut app = GearCraftApp::new(cc, None);
+            app.replace_project(mixed(), None);
+            app
+        });
+        harness.run_steps(3);
+        let listed = |h: &Harness<'_, GearCraftApp>, name: &str| h.query_by_label_contains(name).is_some();
+        assert!(listed(&harness, "Gear 1") && !listed(&harness, "Pulley 1"));
+        assert_eq!(harness.state().selected, harness.state().project.gears.first().map(|g| g.id));
+
+        harness.state_mut().switch_workspace(Workspace::Pulleys);
+        harness.run_steps(3);
+        assert!(!listed(&harness, "Gear 1") && listed(&harness, "Pulley 1"));
+        let app = harness.state();
+        let sel = app.selected.and_then(|id| app.project.get(id)).unwrap();
+        assert!(sel.params.is_pulley(), "selection moves to a pulley");
+
+        // Back again: the gears return, with the gear selection restored.
+        let pulley = app.selected;
+        harness.state_mut().switch_workspace(Workspace::Spur);
+        harness.run_steps(3);
+        assert!(listed(&harness, "Gear 1") && !listed(&harness, "Pulley 1"));
+        assert_eq!(harness.state().selected, harness.state().project.gears.first().map(|g| g.id));
+        harness.state_mut().switch_workspace(Workspace::Pulleys);
+        assert_eq!(harness.state().selected, pulley);
+        assert_eq!(harness.state().project.gears.len(), 4, "nothing was removed");
+    }
 
     /// Renders the window offscreen to GEARCRAFT_SHOT (a PNG path) so the
     /// layout can be looked at without opening a window. Skipped unless set.
@@ -1859,6 +1954,11 @@ mod tests {
         }
         if let Some(a) = std::env::var("GEARCRAFT_SHOT_ANGLE").ok().and_then(|a| a.parse::<f64>().ok()) {
             harness.state_mut().driver_angle = a.to_radians();
+            harness.step();
+        }
+        if std::env::var("GEARCRAFT_SHOT_PULLEYS").is_ok() {
+            harness.state_mut().switch_workspace(Workspace::Pulleys);
+            harness.step();
             harness.step();
         }
         if let Ok(ws) = std::env::var("GEARCRAFT_SHOT_MENU") {
