@@ -1,4 +1,6 @@
+use crate::bevel::BevelGeom;
 use crate::chrome::{self, Icon};
+use crate::view3d;
 use crate::export::{self, place};
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
@@ -20,6 +22,20 @@ struct Cached {
     params: GearParams,
     outline: Vec<[f64; 2]>,
     fill: FillMesh,
+    solid: view3d::Solid,
+}
+
+/// A belt's layout for drawing: its pitch-line loop, offsets of the land,
+/// back and tooth tip from the pitch line, tooth half-widths at base and
+/// tip, and where each tooth sits along the loop.
+struct BeltShape {
+    lp: pulley::BeltLoop,
+    land: f64,
+    back: f64,
+    depth: f64,
+    half_base: f64,
+    half_tip: f64,
+    stations: Vec<f64>,
 }
 
 /// Canvas camera: world point at the middle of the canvas, pixels per mm.
@@ -49,17 +65,19 @@ enum Pending {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Workspace {
     Spur,
+    Bevel,
     Pulleys,
 }
 
 impl Workspace {
-    const ALL: [Workspace; 2] = [Workspace::Spur, Workspace::Pulleys];
+    const ALL: [Workspace; 3] = [Workspace::Spur, Workspace::Bevel, Workspace::Pulleys];
     /// On the roadmap, listed so the menu shows where they will go.
     const PLANNED: [&str; 4] = ["Internal & Planetary", "Helical", "Clock Wheels", "Escapements"];
 
     fn name(self) -> &'static str {
         match self {
             Workspace::Spur => "Spur Gears",
+            Workspace::Bevel => "Bevel Gears",
             Workspace::Pulleys => "Timing Pulleys",
         }
     }
@@ -67,6 +85,7 @@ impl Workspace {
     fn glyph(self) -> &'static str {
         match self {
             Workspace::Spur => "⚙",
+            Workspace::Bevel => "🔻",
             Workspace::Pulleys => "🔗",
         }
     }
@@ -74,6 +93,7 @@ impl Workspace {
     fn icon(self) -> Icon<'static> {
         match self {
             Workspace::Spur => Icon::Gear,
+            Workspace::Bevel => Icon::Bevel,
             Workspace::Pulleys => Icon::Pulley,
         }
     }
@@ -81,12 +101,19 @@ impl Workspace {
     fn hint(self) -> &'static str {
         match self {
             Workspace::Spur => "Involute spur gears: meshing pairs, compound trains",
+            Workspace::Bevel => "Straight bevel gears with spherical involute teeth, at any shaft angle",
             Workspace::Pulleys => "MXL to XXH timing pulleys and the belts between them",
         }
     }
 
     fn of(params: &GearParams) -> Self {
-        if params.is_pulley() { Workspace::Pulleys } else { Workspace::Spur }
+        if params.is_pulley() {
+            Workspace::Pulleys
+        } else if params.is_bevel() {
+            Workspace::Bevel
+        } else {
+            Workspace::Spur
+        }
     }
 }
 
@@ -126,6 +153,12 @@ pub struct GearCraftApp {
     workspace: Workspace,
     /// What was selected in each workspace, restored on switching back.
     workspace_selection: HashMap<Workspace, u64>,
+    /// Showing the 3D view instead of the plan.
+    three_d: bool,
+    camera: view3d::Camera,
+    /// Last 3D frame's triangles, for picking.
+    frame3d: view3d::Frame,
+    texture3d: Option<egui::TextureHandle>,
     title: String,
 }
 
@@ -157,6 +190,10 @@ impl GearCraftApp {
             belt_standard_only: true,
             workspace: Workspace::Spur,
             workspace_selection: HashMap::new(),
+            three_d: false,
+            camera: view3d::Camera::default(),
+            frame3d: view3d::Frame::default(),
+            texture3d: None,
             title: String::new(),
         };
         if let Some(f) = file {
@@ -175,6 +212,11 @@ impl GearCraftApp {
     /// listed and picked; the others wait, untouched, in their own.
     fn shown(&self, g: &Gear) -> bool {
         Workspace::of(&g.params) == self.workspace
+    }
+
+    /// Bevel gears only make sense in 3D: their axes leave the plane.
+    fn in_3d(&self) -> bool {
+        self.three_d || self.workspace == Workspace::Bevel
     }
 
     fn first_shown(&self) -> Option<u64> {
@@ -272,28 +314,34 @@ impl GearCraftApp {
         }
     }
 
-    fn export(&mut self, whole_train: bool, dxf: bool) {
+    /// Export as `ext` (dxf, svg or step).
+    fn export(&mut self, whole_train: bool, ext: &str) {
         let only = if whole_train { None } else { self.selected };
         let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
-        if shapes.is_empty() {
-            self.flash("Nothing to export");
+        let bevels = export::bevels(&self.project, self.driver_angle, only, |g| self.shown(g));
+        if !bevels.is_empty() && ext != "step" {
+            self.flash("DXF and SVG are flat outlines: export bevel gears as STEP.");
             return;
         }
-        let (ext, label) = if dxf { ("dxf", "DXF") } else { ("svg", "SVG") };
+        let Some(first) = shapes.first().map(|s| &s.name).or(bevels.first().map(|b| &b.name)) else {
+            self.flash("Nothing to export");
+            return;
+        };
+        let label = ext.to_ascii_uppercase();
         let stem = if whole_train {
             self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or("train".into())
         } else {
-            shapes[0].name.replace(' ', "_")
+            first.replace(' ', "_")
         };
         let Some(mut path) =
-            rfd::FileDialog::new().add_filter(label, &[ext]).set_file_name(format!("{stem}.{ext}")).save_file()
+            rfd::FileDialog::new().add_filter(&label, &[ext]).set_file_name(format!("{stem}.{ext}")).save_file()
         else {
             return;
         };
         if path.extension().is_none() {
             path.set_extension(ext);
         }
-        match export::write(&path, &shapes, self.project.pitch_unit.is_inch()) {
+        match export::write(&path, &shapes, &bevels, self.project.pitch_unit.is_inch()) {
             Ok(()) => self.flash(format!("Exported {}", path.display())),
             Err(e) => self.flash(format!("Could not write {}: {e}", path.display())),
         }
@@ -343,7 +391,7 @@ impl GearCraftApp {
         // A meshing gear or belted pulley starts as a copy so the pair is
         // 1:1 until edited; a compound is usually a fraction of its wheel.
         let params = match link {
-            Link::Mesh | Link::Belt => pp.clone(),
+            Link::Mesh | Link::Belt | Link::Bevel => pp.clone(),
             Link::Axle => match (pulley, pp.belt) {
                 (true, Some(b)) => GearParams { teeth: (pp.teeth / 2).max(b.min_teeth()), ..pp.clone() },
                 (true, None) => GearParams { bore: pp.bore, ..unit.starter_pulley(20) },
@@ -353,6 +401,45 @@ impl GearCraftApp {
         };
         let id = self.project.add_child(parent.id, params, link);
         self.selected = Some(id);
+    }
+
+    /// Add a bevel gear meshing with (or on the shaft of) the selected
+    /// one, or a fresh pair if none is selected.
+    fn add_bevel(&mut self, link: Link) {
+        let Some(parent) = self.selected.and_then(|id| self.project.get(id)).filter(|g| g.params.is_bevel()) else {
+            self.add_bevel_pair();
+            return;
+        };
+        let pp = &parent.params;
+        let params = match link {
+            Link::Axle => GearParams { teeth: (pp.teeth / 2).max(12), ..pp.clone() },
+            _ => pp.clone(),
+        };
+        let id = self.project.add_child(parent.id, params, link);
+        self.selected = Some(id);
+    }
+
+    /// A 20-tooth pinion driving a 40-tooth wheel at right angles.
+    fn add_bevel_pair(&mut self) {
+        let x = self.clear_x();
+        let unit = self.project.pitch_unit;
+        let pinion = self.project.add_root(unit.starter_bevel(20), x, 0.0);
+        let wheel = self.project.add_child(pinion, unit.starter_bevel(40), Link::Bevel);
+        self.selected = Some(wheel);
+    }
+
+    /// Where a new train can go, clear of the parts on show.
+    fn clear_x(&self) -> f64 {
+        let solved = self.project.solve();
+        let right = self
+            .project
+            .gears
+            .iter()
+            .zip(&solved)
+            .filter(|(g, _)| self.shown(g))
+            .map(|(g, s)| s.center[0] + g.params.tip_radius())
+            .fold(f64::MIN, f64::max);
+        if right == f64::MIN { 0.0 } else { right + 40.0 }
     }
 
     fn add_train(&mut self, pulley: bool) {
@@ -432,11 +519,18 @@ impl GearCraftApp {
             if self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
                 continue;
             }
-            match gear::tooth_profile(&g.params) {
+            if let Some(geom) = BevelGeom::new(&g.params).filter(|_| g.params.is_buildable()) {
+                let solid = view3d::bevel_solid(&geom);
+                let fill = FillMesh { verts: Vec::new(), tris: Vec::new() };
+                self.cache.insert(g.id, Cached { params: g.params.clone(), outline: Vec::new(), fill, solid });
+                continue;
+            }
+            match gear::tooth_profile(&g.params).filter(|_| !g.params.is_bevel()) {
                 Some(prof) => {
                     let outline = gear::outline(&g.params, &prof);
                     let fill = gear::fill_mesh(&g.params, &prof);
-                    self.cache.insert(g.id, Cached { params: g.params.clone(), outline, fill });
+                    let solid = view3d::gear_solid(&g.params, &prof, &fill);
+                    self.cache.insert(g.id, Cached { params: g.params.clone(), outline, fill, solid });
                 }
                 None => {
                     self.cache.remove(&g.id);
@@ -502,6 +596,10 @@ impl GearCraftApp {
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
+        if self.in_3d() {
+            self.canvas_3d(ui);
+            return;
+        }
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         let mut solved = self.project.solve();
@@ -543,7 +641,7 @@ impl GearCraftApp {
                             self.drag = Some(Drag::Move(id, [w[0] - c[0], w[1] - c[1]]));
                         }
                         Placement::Mesh { .. } | Placement::Belt { .. } => self.drag = Some(Drag::Swing(id)),
-                        Placement::Axle { .. } => {}
+                        Placement::Axle { .. } | Placement::Bevel { .. } => {}
                     }
                 }
             }
@@ -611,6 +709,7 @@ impl GearCraftApp {
                 Align2::CENTER_CENTER,
                 match self.workspace {
                     Workspace::Spur => "No gears yet. Use \"New Train\" to place one.",
+                    Workspace::Bevel => "No bevel gears yet. Use \"New Pair\" to place one.",
                     Workspace::Pulleys => "No pulleys yet. Use \"New Pulley\" to place one.",
                 },
                 FontId::proportional(16.0),
@@ -664,64 +763,205 @@ impl GearCraftApp {
         painter.text(rect.right_top() + Vec2::new(-8.0, 6.0), Align2::RIGHT_TOP, label, FontId::proportional(11.0), base);
     }
 
+    /// Where the belt driving part `i` runs, at the current drive angle;
+    /// None if there is no workable belt (drawn as a dashed error line).
+    fn belt_shape(&self, i: usize, solved: &[Solved]) -> Option<BeltShape> {
+        let g = &self.project.gears[i];
+        let s = &solved[i];
+        let bi = s.belt.as_ref().filter(|b| !b.too_short && !b.mismatch)?;
+        let pi = g.placement.parent().and_then(|p| self.project.index_of(p))?;
+        let pp = &self.project.gears[pi].params;
+        let section = g.params.belt?;
+        let lp = pulley::BeltLoop::new(solved[pi].center, pp.pitch_radius(), s.center, g.params.pitch_radius())?;
+        let tooth = section.belt_tooth();
+        // Offsets from the pitch line, outward positive: the belt's land
+        // rides on the pulley tips, half the PLD inside it.
+        let land = -section.rack(g.params.teeth).pld / 2.0;
+        let back = land + tooth.thickness - tooth.height;
+        let half_base = tooth.width / 2.0;
+        let half_tip = (half_base - tooth.height * tooth.half_angle.to_radians().tan()).max(0.05);
+        let pitch = lp.len() / bi.teeth as f64;
+        let rot = solved[pi].phase + solved[pi].ratio * self.driver_angle;
+        let s0 = lp.s_on_first(rot + pulley::groove_angle(pp.teeth));
+        let stations = (0..bi.teeth).map(|k| s0 + k as f64 * pitch).collect();
+        Some(BeltShape { lp, land, back, depth: tooth.height, half_base, half_tip, stations })
+    }
+
     /// Belts drawn as they sit: the backing on the pulley tips, each tooth
     /// in a groove. The loop is laid out from the parent pulley's grooves,
     /// and the solve phases the driven pulley to match, so they stay
     /// engaged as the train runs.
     fn draw_belts(&self, painter: &egui::Painter, rect: Rect, visuals: &egui::Visuals, solved: &[Solved]) {
         let color = if visuals.dark_mode { Color32::from_gray(88) } else { Color32::from_gray(52) };
-        for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
-            let Some(bi) = &s.belt else { continue };
-            let Some(pi) = g.placement.parent().and_then(|p| self.project.index_of(p)) else { continue };
-            let pp = &self.project.gears[pi].params;
-            let lp = pulley::BeltLoop::new(solved[pi].center, pp.pitch_radius(), s.center, g.params.pitch_radius());
-            let (Some(lp), Some(section), false, false) = (lp, g.params.belt, bi.too_short, bi.mismatch) else {
-                let ends = [self.to_screen(rect, solved[pi].center), self.to_screen(rect, s.center)];
-                painter.extend(Shape::dashed_line(&ends, Stroke::new(1.5, visuals.error_fg_color), 6.0, 4.0));
+        for (i, (g, s)) in self.project.gears.iter().zip(solved).enumerate() {
+            if s.belt.is_none() || !self.shown(g) {
+                continue;
+            }
+            let Some(b) = self.belt_shape(i, solved) else {
+                if let Some(pi) = g.placement.parent().and_then(|p| self.project.index_of(p)) {
+                    let ends = [self.to_screen(rect, solved[pi].center), self.to_screen(rect, s.center)];
+                    painter.extend(Shape::dashed_line(&ends, Stroke::new(1.5, visuals.error_fg_color), 6.0, 4.0));
+                }
                 continue;
             };
-            let tooth = section.belt_tooth();
-            // Offsets from the pitch line, outward positive: the belt's
-            // land rides on the pulley tips, half the PLD inside it.
-            let land = -section.rack(g.params.teeth).pld / 2.0;
-            let back = land + tooth.thickness - tooth.height;
             let place = |s: f64, off: f64, along: f64| {
-                let (p, n) = lp.at(s);
+                let (p, n) = b.lp.at(s);
                 let t = [-n[1], n[0]];
                 self.to_screen(rect, [p[0] + n[0] * off + t[0] * along, p[1] + n[1] * off + t[1] * along])
             };
 
-            let len = lp.len();
+            let len = b.lp.len();
             let n = ((len * self.view.scale / 3.0) as usize).clamp(120, 4000);
-            let mid = (land + back) / 2.0;
+            let mid = (b.land + b.back) / 2.0;
             let mut band: Vec<Pos2> = (0..=n).map(|k| place(len * k as f64 / n as f64, mid, 0.0)).collect();
             band.push(band[1]);
-            let width = ((back - land) * self.view.scale) as f32;
+            let width = ((b.back - b.land) * self.view.scale) as f32;
             painter.add(Shape::line(band, Stroke::new(width.max(1.5), color)));
 
-            let pitch = len / bi.teeth as f64;
-            if pitch * self.view.scale < 3.0 {
+            if len / b.stations.len() as f64 * self.view.scale < 3.0 {
                 continue;
             }
-            let rot = solved[pi].phase + solved[pi].ratio * self.driver_angle;
-            let s0 = lp.s_on_first(rot + pulley::groove_angle(pp.teeth));
-            let half_base = tooth.width / 2.0;
-            let half_tip = (half_base - tooth.height * tooth.half_angle.to_radians().tan()).max(0.05);
             // Start inside the backing so tooth and band join without a seam.
-            let root = land + 0.25 * (back - land);
-            for k in 0..bi.teeth {
-                let at = s0 + k as f64 * pitch;
+            let root = b.land + 0.25 * (b.back - b.land);
+            for &at in &b.stations {
                 let quad = vec![
-                    place(at, root, -half_base),
-                    place(at, land, -half_base),
-                    place(at, land - tooth.height, -half_tip),
-                    place(at, land - tooth.height, half_tip),
-                    place(at, land, half_base),
-                    place(at, root, half_base),
+                    place(at, root, -b.half_base),
+                    place(at, b.land, -b.half_base),
+                    place(at, b.land - b.depth, -b.half_tip),
+                    place(at, b.land - b.depth, b.half_tip),
+                    place(at, b.land, b.half_base),
+                    place(at, root, b.half_base),
                 ];
                 painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
             }
         }
+    }
+
+    // ---- 3D view ---------------------------------------------------------
+
+    fn fit_3d(&mut self, rect: Rect, solved: &[Solved]) {
+        let mut lo = [f64::MAX; 3];
+        let mut hi = [f64::MIN; 3];
+        for (g, s) in self.project.gears.iter().zip(solved).filter(|(g, _)| self.shown(g)) {
+            let r = g.params.tip_radius().max(1.0);
+            let (z0, z1) = match BevelGeom::new(&g.params) {
+                Some(b) => (b.front_face().0, b.back(b.tip) * b.tip.cos()),
+                None => (0.0, g.params.face_width),
+            };
+            for i in 0..8 {
+                let local = [if i & 1 == 0 { -r } else { r }, if i & 2 == 0 { -r } else { r }, if i & 4 == 0 { z0 } else { z1 }];
+                let p = s.frame.apply(local);
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        if lo[0] > hi[0] {
+            self.camera = view3d::Camera::default();
+            return;
+        }
+        self.camera.fit(rect, lo, hi);
+    }
+
+    fn canvas_3d(&mut self, ui: &mut Ui) {
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let rect = resp.rect;
+        let solved = self.project.solve();
+        self.refresh_cache();
+        if rect.size() != self.canvas_size {
+            self.canvas_size = rect.size();
+            self.fit_pending |= self.auto_fit;
+        }
+        if self.fit_pending {
+            self.fit_3d(rect, &solved);
+            self.fit_pending = false;
+            self.auto_fit = true;
+        }
+        if let Some(hover) = resp.hover_pos() {
+            let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta().y, i.zoom_delta()));
+            let factor = zoom as f64 * (scroll as f64 * 0.0025).exp();
+            if factor != 1.0 {
+                self.auto_fit = false;
+                self.camera.zoom(rect, hover, factor);
+            }
+        }
+        if resp.dragged() {
+            self.auto_fit = false;
+            let d = resp.drag_delta();
+            let (orbit, shift) = ui.input(|i| (i.pointer.primary_down(), i.modifiers.shift));
+            if orbit && !shift {
+                self.camera.orbit(d.x as f64, d.y as f64);
+            } else {
+                self.camera.pan(d.x as f64, d.y as f64);
+            }
+        }
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.selected = self.frame3d.pick(p);
+            }
+        }
+        if resp.double_clicked() {
+            self.fit_pending = true;
+        }
+        self.cursor = None;
+
+        let visuals = ui.visuals().clone();
+        let painter = painter.with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
+        let belts: Vec<(view3d::Solid, u64)> = (0..self.project.gears.len())
+            .filter(|&i| self.shown(&self.project.gears[i]) && solved[i].belt.is_some())
+            .filter_map(|i| {
+                let b = self.belt_shape(i, &solved)?;
+                let g = &self.project.gears[i];
+                let pi = g.placement.parent().and_then(|p| self.project.index_of(p))?;
+                let z_mid = solved[pi].z + self.project.gears[pi].params.face_width / 2.0;
+                let solid = view3d::belt_solid(
+                    &b.lp, &b.stations, b.land, b.back, b.depth, b.half_base, b.half_tip, z_mid, g.params.belt_width,
+                );
+                Some((solid, g.id))
+            })
+            .collect();
+        let belt_color = if visuals.dark_mode { Color32::from_gray(70) } else { Color32::from_gray(60) };
+        let mut parts: Vec<view3d::Placed> = Vec::new();
+        for (i, (g, s)) in self.project.gears.iter().zip(&solved).enumerate() {
+            let Some(c) = self.cache.get(&g.id).filter(|_| self.shown(g)) else { continue };
+            let base = gear_color_3d(i, s.depth);
+            let color = if Some(g.id) == self.selected { base.lerp_to_gamma(chrome::ACCENT, 0.45) } else { base };
+            let rot = s.phase + s.ratio * self.driver_angle;
+            parts.push(view3d::Placed { solid: &c.solid, frame: s.frame, rot, color, id: g.id });
+        }
+        for (solid, id) in &belts {
+            parts.push(view3d::Placed { solid, frame: train::Frame3::at([0.0; 3]), rot: 0.0, color: belt_color, id: *id });
+        }
+        let ppp = ui.ctx().pixels_per_point();
+        self.frame3d = view3d::render(rect, ppp, &self.camera, &parts, visuals.extreme_bg_color);
+        let image = self.frame3d.image.clone();
+        match &mut self.texture3d {
+            Some(t) => t.set(image, egui::TextureOptions::NEAREST),
+            None => self.texture3d = Some(ui.ctx().load_texture("view3d", image, egui::TextureOptions::NEAREST)),
+        }
+        if let Some(t) = &self.texture3d {
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.image(t.id(), rect, uv, Color32::WHITE);
+        }
+
+        if parts.is_empty() {
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Nothing to show in 3D yet.",
+                FontId::proportional(16.0),
+                visuals.weak_text_color(),
+            );
+        }
+        painter.text(
+            rect.left_bottom() + Vec2::new(8.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            "Drag: orbit · Shift+drag or right-drag: pan · Scroll: zoom · Click: select · Double-click: fit",
+            FontId::proportional(11.0),
+            visuals.weak_text_color(),
+        );
     }
 
     fn draw_gears(
@@ -879,18 +1119,23 @@ impl GearCraftApp {
                 ui.separator();
                 ui.menu_button("Export", |ui| {
                     let has_sel = self.selected.is_some();
-                    if ui.add_enabled(has_sel, egui::Button::new("Selected gear as DXF…")).clicked() {
-                        self.export(false, true);
-                    }
-                    if ui.add_enabled(has_sel, egui::Button::new("Selected gear as SVG…")).clicked() {
-                        self.export(false, false);
+                    // Bevel gears have no flat outline to draw.
+                    let flat = self.workspace != Workspace::Bevel;
+                    let why = "Bevel gears export as STEP only";
+                    for (ext, label) in [("step", "STEP (3D solid)"), ("dxf", "DXF"), ("svg", "SVG")] {
+                        let ok = ext == "step" || flat;
+                        let r = ui.add_enabled(has_sel && ok, egui::Button::new(format!("Selected part as {label}…")));
+                        if r.on_disabled_hover_text(why).clicked() {
+                            self.export(false, ext);
+                        }
                     }
                     ui.separator();
-                    if ui.button("Whole train as DXF…").clicked() {
-                        self.export(true, true);
-                    }
-                    if ui.button("Whole train as SVG…").clicked() {
-                        self.export(true, false);
+                    for (ext, label) in [("step", "STEP (3D solids)"), ("dxf", "DXF"), ("svg", "SVG")] {
+                        let ok = ext == "step" || flat;
+                        let r = ui.add_enabled(ok, egui::Button::new(format!("Whole train as {label}…")));
+                        if r.on_disabled_hover_text(why).clicked() {
+                            self.export(true, ext);
+                        }
                     }
                 });
                 ui.separator();
@@ -920,6 +1165,17 @@ impl GearCraftApp {
                         }
                         if ui.button("New gear train").clicked() {
                             self.add_train(false);
+                        }
+                    }
+                    Workspace::Bevel => {
+                        if ui.add_enabled(has_sel, egui::Button::new("Add meshing bevel").shortcut_text("M")).clicked() {
+                            self.add_bevel(Link::Bevel);
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("Add bevel on same shaft").shortcut_text("A")).clicked() {
+                            self.add_bevel(Link::Axle);
+                        }
+                        if ui.button("New bevel pair").clicked() {
+                            self.add_bevel_pair();
                         }
                     }
                     Workspace::Pulleys => {
@@ -1012,6 +1268,17 @@ impl GearCraftApp {
                     self.add_train(false);
                 }
             }),
+            Workspace::Bevel => chrome::group(ui, "Create", |ui| {
+                if big(ui, Icon::Bevel, "Mesh Bevel", false, true).on_hover_text("A bevel gear meshing with the selected one (M)").clicked() {
+                    self.add_bevel(Link::Bevel);
+                }
+                if big(ui, Icon::Glyph("◎"), "Same Shaft", false, true).on_hover_text("A bevel gear on the selected gear's shaft (A)").clicked() {
+                    self.add_bevel(Link::Axle);
+                }
+                if big(ui, Icon::Glyph("➕"), "New Pair", false, true).on_hover_text("A 20-tooth pinion and 40-tooth wheel at right angles").clicked() {
+                    self.add_bevel_pair();
+                }
+            }),
             Workspace::Pulleys => chrome::group(ui, "Create", |ui| {
                 if big(ui, Icon::Pulley, "Belt Drive", false, true).on_hover_text("Add a pulley driven by a belt from the selected pulley (B)").clicked() {
                     self.add_gear(Link::Belt, true);
@@ -1058,13 +1325,25 @@ impl GearCraftApp {
             });
         });
         chrome::group(ui, "View", |ui| {
+            let plan_ok = self.workspace != Workspace::Bevel;
+            for (three_d, label, hint) in [(false, "2D", "Plan view"), (true, "3D", "Solids of their face width; drag to orbit")] {
+                let hint = if plan_ok || three_d { hint } else { "Bevel gears are shown in 3D only" };
+                if big(ui, Icon::Text(label), if three_d { "Solid" } else { "Plan" }, self.in_3d() == three_d, plan_ok || three_d)
+                    .on_hover_text(hint)
+                    .clicked()
+                    && self.three_d != three_d
+                {
+                    self.three_d = three_d;
+                    self.fit_pending = true;
+                }
+            }
             if big(ui, Icon::Glyph("⛶"), "Fit", false, true).on_hover_text("F, or double-click the canvas").clicked() {
                 self.fit_pending = true;
             }
-            if big(ui, Icon::Glyph("○"), "Pitch", self.show.pitch, true).on_hover_text("Pitch circle of the selected part").clicked() {
+            if big(ui, Icon::Glyph("○"), "Pitch", self.show.pitch, !self.in_3d()).on_hover_text("Pitch circle of the selected part").clicked() {
                 self.show.pitch = !self.show.pitch;
             }
-            if big(ui, Icon::Glyph("◎"), "Base", self.show.base, true).on_hover_text("Base circle of the selected gear").clicked() {
+            if big(ui, Icon::Glyph("◎"), "Base", self.show.base, !self.in_3d()).on_hover_text("Base circle of the selected gear").clicked() {
                 self.show.base = !self.show.base;
             }
         });
@@ -1082,6 +1361,7 @@ impl GearCraftApp {
                     Placement::Mesh { .. } => ("⚙", "meshes"),
                     Placement::Axle { .. } => ("◎", "same axle"),
                     Placement::Belt { .. } => ("🔗", "belt"),
+                    Placement::Bevel { .. } => ("⚙", "meshes"),
                 };
                 ui.horizontal(|ui| {
                     ui.add_space(s.depth.min(12) as f32 * 14.0);
@@ -1209,7 +1489,8 @@ impl GearCraftApp {
                     );
                 });
             } else {
-                let locked = g.match_parent && matches!(g.placement, Placement::Mesh { .. });
+                let locked = g.match_parent && matches!(g.placement, Placement::Mesh { .. } | Placement::Bevel { .. });
+                let is_bevel = g.params.is_bevel();
                 section(ui, "Teeth", |ui| {
                     egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                         ui.label("Teeth");
@@ -1250,7 +1531,7 @@ impl GearCraftApp {
                         });
                         ui.end_row();
 
-                        if matches!(g.placement, Placement::Mesh { .. }) {
+                        if matches!(g.placement, Placement::Mesh { .. } | Placement::Bevel { .. }) {
                             ui.label("");
                             ui.checkbox(&mut g.match_parent, "Same tooth system as partner").on_hover_text(
                                 "Copy pitch, pressure angle and rack proportions from the meshing partner. \
@@ -1259,10 +1540,14 @@ impl GearCraftApp {
                             ui.end_row();
                         }
 
+                        if is_bevel {
+                            g.params.profile_shift = 0.0;
+                        } else {
                         ui.label("Profile shift x");
                         ui.add(egui::DragValue::new(&mut g.params.profile_shift).range(-1.0..=1.5).speed(0.005).max_decimals(3))
                             .on_hover_text("Moves the cutter out (+) or in (−) by x × module. Positive shift cures undercut on small pinions.");
                         ui.end_row();
+                        }
 
                         ui.label("Backlash");
                         len_drag(ui, &mut g.params.backlash, unit, 0.0..=5.0, 0.002)
@@ -1300,7 +1585,10 @@ impl GearCraftApp {
                     len_drag(ui, &mut g.params.bore, unit, 0.0..=10000.0, 0.1);
                     ui.end_row();
                     ui.label("Face width");
-                    len_drag(ui, &mut g.params.face_width, unit, 0.0..=10000.0, 0.1);
+                    let r = len_drag(ui, &mut g.params.face_width, unit, 0.0..=10000.0, 0.1);
+                    if g.params.is_bevel() {
+                        r.on_hover_text("Along the cone, from the back (large) end towards the apex.");
+                    }
                     ui.end_row();
                 });
             });
@@ -1308,11 +1596,12 @@ impl GearCraftApp {
             section(ui, "Placement", |ui| {
                 let kind = match g.placement {
                     Placement::Root { .. } => 0,
-                    Placement::Mesh { .. } => 1,
+                    Placement::Mesh { .. } | Placement::Bevel { .. } => 1,
                     Placement::Axle { .. } => 2,
                     Placement::Belt { .. } => 3,
                 };
                 let is_pulley = g.params.is_pulley();
+                let is_bevel = g.params.is_bevel();
                 let mut new_kind = kind;
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut new_kind, 0, "Fixed");
@@ -1331,11 +1620,12 @@ impl GearCraftApp {
                 if new_kind != kind {
                     let parent = g.placement.parent().or(earlier.last().map(|e| e.0)).unwrap_or(0);
                     let angle = match g.placement {
-                        Placement::Mesh { angle, .. } => angle,
+                        Placement::Mesh { angle, .. } | Placement::Bevel { angle, .. } => angle,
                         _ => 0.0,
                     };
                     g.placement = match new_kind {
                         0 => Placement::Root { x: s.center[0], y: s.center[1], phase: 0.0 },
+                        1 if is_bevel => Placement::Bevel { parent, angle, shaft_angle: 90.0 },
                         1 => Placement::Mesh { parent, angle },
                         2 => Placement::Axle { parent, phase: 0.0 },
                         _ => {
@@ -1420,6 +1710,25 @@ impl GearCraftApp {
                         }
                         ui.end_row();
                     }
+                    Placement::Bevel { parent, angle, shaft_angle } => {
+                        ui.label("Partner");
+                        parent_combo(ui, parent, &earlier);
+                        ui.end_row();
+                        ui.label("Shaft angle");
+                        ui.horizontal(|ui| {
+                            for a in [45.0, 60.0, 90.0, 120.0] {
+                                ui.selectable_value(shaft_angle, a, format!("{a}°"));
+                            }
+                            ui.add(egui::DragValue::new(shaft_angle).speed(0.5).range(10.0..=170.0).suffix("°"));
+                        })
+                        .response
+                        .on_hover_text("Angle between the two shafts. 90° is the usual right-angle drive.");
+                        ui.end_row();
+                        ui.label("Direction");
+                        ui.add(egui::DragValue::new(angle).speed(0.5).range(-360.0..=360.0).suffix("°"))
+                            .on_hover_text("Which way round the partner's axis this gear's shaft leans.");
+                        ui.end_row();
+                    }
                     Placement::Axle { parent, phase } => {
                         ui.label("Shares axle with");
                         parent_combo(ui, parent, &earlier);
@@ -1427,6 +1736,19 @@ impl GearCraftApp {
                         ui.label("Phase");
                         ui.add(egui::DragValue::new(phase).speed(0.5).range(-360.0..=360.0).suffix("°"));
                         ui.end_row();
+                    }
+                });
+                egui::Grid::new("axial").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Axial offset");
+                    let hint = match g.placement {
+                        Placement::Root { .. } => "Position of the back face along the axis.",
+                        Placement::Axle { .. } => "Gap along the shaft after the part it shares the shaft with.",
+                        _ => "Shift along the axis from centred on the partner's face.",
+                    };
+                    len_drag(ui, &mut g.axial, unit, -10000.0..=10000.0, 0.1).on_hover_text(hint);
+                    ui.end_row();
+                    if !g.params.is_bevel() {
+                        value_row(ui, "Faces at", format!("{} … {}", len(s.z, unit), len(s.z + g.params.face_width, unit)));
                     }
                 });
             });
@@ -1454,6 +1776,24 @@ impl GearCraftApp {
                         value_row(ui, "Pitch line differential", fmt(rack.pld));
                         value_row(ui, "Min face, flanged", fmt(w.flanged));
                         value_row(ui, "Min face, unflanged", fmt(w.unflanged));
+                    });
+                    return;
+                }
+                if let Some(b) = BevelGeom::new(&p) {
+                    let deg = |a: f64| format!("{:.3}°", a.to_degrees());
+                    egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        value_row(ui, "Pitch cone angle", deg(b.delta));
+                        value_row(ui, "Tip cone angle", deg(b.tip));
+                        value_row(ui, "Root cone angle", deg(b.root));
+                        value_row(ui, "Base cone angle", deg(b.base));
+                        value_row(ui, "Cone distance", fmt(b.cone_distance));
+                        value_row(ui, "Pitch Ø (large end)", fmt(2.0 * p.pitch_radius()));
+                        value_row(ui, "Outside Ø", fmt(b.outside_diameter()));
+                        value_row(ui, "Face width (max R/3)", format!("{} ({})", fmt(b.face), fmt(b.cone_distance / 3.0)));
+                        value_row(ui, "Virtual teeth", format!("{:.1}", b.virtual_teeth()));
+                        let (zb, _) = b.back_face();
+                        value_row(ui, "Apex to back face", fmt(zb));
+                        value_row(ui, "Circular pitch", fmt(p.circular_pitch()));
                     });
                     return;
                 }
@@ -1567,6 +1907,7 @@ impl GearCraftApp {
             let n = self.project.gears.iter().filter(|g| self.shown(g)).count();
             ui.label(match self.workspace {
                 Workspace::Spur => format!("{n} gears"),
+                Workspace::Bevel => format!("{n} bevel gears"),
                 Workspace::Pulleys => format!("{n} pulleys"),
             });
             if let Some((msg, at)) = &self.status {
@@ -1620,6 +1961,14 @@ impl GearCraftApp {
                 }
                 if key(Key::A) {
                     self.add_gear(Link::Axle, false);
+                }
+            }
+            Workspace::Bevel => {
+                if key(Key::M) {
+                    self.add_bevel(Link::Bevel);
+                }
+                if key(Key::A) {
+                    self.add_bevel(Link::Axle);
                 }
             }
             Workspace::Pulleys => {
@@ -1789,6 +2138,12 @@ fn circle_points(c: Pos2, r: f32) -> Vec<Pos2> {
         .collect()
 }
 
+/// Lighter than the plan colours: the 3D shading darkens them.
+fn gear_color_3d(index: usize, depth: usize) -> Color32 {
+    let hue = ((index as f32 * 0.618_034 + depth as f32 * 0.07) % 1.0 + 0.55) % 1.0;
+    egui::ecolor::Hsva::new(hue, 0.32, 0.86, 1.0).into()
+}
+
 fn gear_color(index: usize, depth: usize, dark: bool) -> Color32 {
     let hue = ((index as f32 * 0.618_034 + depth as f32 * 0.07) % 1.0 + 0.55) % 1.0;
     let (s, v) = if dark { (0.35, 0.42) } else { (0.30, 0.88) };
@@ -1956,9 +2311,42 @@ mod tests {
             harness.state_mut().driver_angle = a.to_radians();
             harness.step();
         }
+        if std::env::var("GEARCRAFT_SHOT_3D").is_ok() {
+            harness.state_mut().three_d = true;
+            harness.state_mut().fit_pending = true;
+            harness.step();
+            harness.step();
+        }
         if std::env::var("GEARCRAFT_SHOT_PULLEYS").is_ok() {
             harness.state_mut().switch_workspace(Workspace::Pulleys);
             harness.step();
+            harness.step();
+        }
+        if std::env::var("GEARCRAFT_SHOT_BEVEL").is_ok() {
+            let app = harness.state_mut();
+            app.switch_workspace(Workspace::Bevel);
+            if app.first_shown().is_none() {
+                app.add_bevel_pair();
+            }
+            app.fit_pending = true;
+            harness.step();
+            harness.step();
+        }
+        // "yaw,pitch,zoom[,x,y,z]": degrees, a scale factor after fitting, and
+        // optionally the point to look at.
+        if let Ok(cam) = std::env::var("GEARCRAFT_SHOT_CAM") {
+            let v: Vec<f64> = cam.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let app = harness.state_mut();
+            app.camera.yaw = v[0].to_radians();
+            app.camera.pitch = v[1].to_radians();
+            app.fit_pending = true;
+            harness.step();
+            let app = harness.state_mut();
+            app.camera.scale *= v.get(2).copied().unwrap_or(1.0);
+            if v.len() >= 6 {
+                app.camera.target = [v[3], v[4], v[5]];
+            }
+            app.auto_fit = false;
             harness.step();
         }
         if let Ok(ws) = std::env::var("GEARCRAFT_SHOT_MENU") {

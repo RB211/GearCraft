@@ -5,6 +5,7 @@
 //! be solved in one pass and can never loop.
 
 use crate::gear::{self, GearParams, Issue, MeshInfo, ToothStandard};
+use crate::bevel::{self, Bevel, BevelGeom};
 use crate::pulley::{self, BeltSection};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -29,15 +30,20 @@ pub enum Placement {
         #[serde(default)]
         target: f64,
     },
+    /// A bevel gear meshing with bevel `parent`: their apexes meet and
+    /// this gear's axis is `shaft_angle` degrees from the parent's, leaning
+    /// towards azimuth `angle` round the parent's axis.
+    Bevel { parent: u64, angle: f64, shaft_angle: f64 },
 }
 
 impl Placement {
     pub fn parent(&self) -> Option<u64> {
         match *self {
             Placement::Root { .. } => None,
-            Placement::Mesh { parent, .. } | Placement::Axle { parent, .. } | Placement::Belt { parent, .. } => {
-                Some(parent)
-            }
+            Placement::Mesh { parent, .. }
+            | Placement::Axle { parent, .. }
+            | Placement::Belt { parent, .. }
+            | Placement::Bevel { parent, .. } => Some(parent),
         }
     }
 }
@@ -48,6 +54,7 @@ pub enum Link {
     Mesh,
     Axle,
     Belt,
+    Bevel,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +66,11 @@ pub struct Gear {
     /// Keep module and pressure angle in step with the meshing parent.
     #[serde(default = "yes")]
     pub match_parent: bool,
+    /// Along the axis, mm: from the parent's face (a gear on the same
+    /// shaft starts where its parent ends; a meshing or belted one is
+    /// centred on its partner's face), or from z = 0 for a fixed part.
+    #[serde(default)]
+    pub axial: f64,
 }
 
 fn yes() -> bool {
@@ -121,6 +133,13 @@ impl PitchUnit {
         p
     }
 
+    /// A sensible fresh bevel gear in this system; its cone is set once it
+    /// has a mate.
+    pub fn starter_bevel(self, teeth: u32) -> GearParams {
+        let p = self.starter(teeth);
+        GearParams { face_width: 4.0 * p.module, bevel: Some(Bevel::default()), ..p }
+    }
+
     /// A sensible fresh gear in this system.
     pub fn starter(self, teeth: u32) -> GearParams {
         match self {
@@ -168,6 +187,59 @@ pub struct Solved {
     pub mesh: Option<MeshInfo>,
     pub belt: Option<BeltInfo>,
     pub depth: usize,
+    /// Back face along the axis; the part runs to z + face width.
+    pub z: f64,
+    /// Where the part sits in 3D: its own axes (z along its shaft) and
+    /// origin (the back face centre, or a bevel gear's cone apex).
+    pub frame: Frame3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame3 {
+    pub origin: [f64; 3],
+    pub x: [f64; 3],
+    pub y: [f64; 3],
+    pub z: [f64; 3],
+}
+
+impl Frame3 {
+    pub fn at(origin: [f64; 3]) -> Self {
+        Frame3 { origin, x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0], z: [0.0, 0.0, 1.0] }
+    }
+
+    /// A local point in world coordinates.
+    pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
+        let o = self.origin;
+        std::array::from_fn(|k| o[k] + p[0] * self.x[k] + p[1] * self.y[k] + p[2] * self.z[k])
+    }
+
+    /// A local direction in world coordinates.
+    pub fn turn(&self, d: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|k| d[0] * self.x[k] + d[1] * self.y[k] + d[2] * self.z[k])
+    }
+}
+
+fn v_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn v_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn v_unit(a: [f64; 3]) -> [f64; 3] {
+    let l = v_dot(a, a).sqrt().max(1e-300);
+    [a[0] / l, a[1] / l, a[2] / l]
+}
+
+/// Along its own axis, where a part starts and ends relative to its frame
+/// origin: a spur gear or pulley from its back face, a bevel gear from its
+/// apex (front face to back face).
+fn axial_extent(p: &GearParams) -> (f64, f64) {
+    match BevelGeom::new(p) {
+        Some(g) => (g.front_face().0, g.back_face().0),
+        None => (0.0, p.face_width),
+    }
 }
 
 /// How a belted pulley pair sits.
@@ -288,7 +360,7 @@ impl Project {
     pub fn add_root(&mut self, params: GearParams, x: f64, y: f64) -> u64 {
         let id = self.fresh_id();
         let name = self.fresh_name(&params);
-        self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true });
+        self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true, axial: 0.0 });
         id
     }
 
@@ -300,15 +372,20 @@ impl Project {
         // Point away from the parent's own parent so a chain grows outward
         // instead of folding back on itself, and clear of its siblings.
         let direction = || {
-            let angle = match &self.gears[pi].placement {
-                Placement::Mesh { angle, .. } | Placement::Belt { angle, .. } => *angle,
+            let angle = match (&self.gears[pi].placement, link) {
+                (_, Link::Bevel) => 0.0,
+                (Placement::Mesh { angle, .. } | Placement::Belt { angle, .. }, _) => *angle,
                 _ => 0.0,
             };
             let taken: Vec<f64> = self
                 .gears
                 .iter()
                 .filter_map(|g| match g.placement {
-                    Placement::Mesh { parent: p, angle } | Placement::Belt { parent: p, angle, .. } if p == parent => {
+                    Placement::Mesh { parent: p, angle }
+                    | Placement::Belt { parent: p, angle, .. }
+                    | Placement::Bevel { parent: p, angle, .. }
+                        if p == parent =>
+                    {
                         Some(angle)
                     }
                     _ => None,
@@ -327,6 +404,12 @@ impl Project {
                 params.pressure_angle = pp.pressure_angle;
                 Placement::Mesh { parent, angle: direction() }
             }
+            Link::Bevel => {
+                params.module = pp.module;
+                params.pressure_angle = pp.pressure_angle;
+                params.bevel = params.bevel.or(Some(Bevel::default()));
+                Placement::Bevel { parent, angle: direction(), shaft_angle: 90.0 }
+            }
             Link::Belt => {
                 params.belt = pp.belt.or(params.belt);
                 params.belt_width = pp.belt_width;
@@ -342,7 +425,7 @@ impl Project {
         let id = self.fresh_id();
         let name = self.fresh_name(&params);
         let at = self.subtree_end(pi);
-        self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle });
+        self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle, axial: 0.0 });
         id
     }
 
@@ -380,8 +463,10 @@ impl Project {
     pub fn fix_default_names(&mut self) {
         for i in 0..self.gears.len() {
             let g = &self.gears[i];
-            let other = if g.params.is_pulley() { "Gear" } else { "Pulley" };
-            let is_default = g.name.strip_prefix(other).and_then(|n| n.trim().parse::<u32>().ok()).is_some();
+            let own = kind_name(&g.params);
+            let is_default = ["Gear", "Pulley", "Bevel"].iter().filter(|k| **k != own).any(|k| {
+                g.name.strip_prefix(k).and_then(|n| n.trim().parse::<u32>().ok()).is_some()
+            });
             if is_default {
                 let params = g.params.clone();
                 self.gears[i].name = String::new();
@@ -401,11 +486,30 @@ impl Project {
     /// or later parents become roots, linked tooth systems are synced, and
     /// standard rack coefficients are re-derived (fine pitch depends on DP).
     pub fn normalize(&mut self) {
+        // Bevel cones: the first mate of a gear fixes its cone; later
+        // mates follow from their tooth counts (the cones share an apex).
+        let mut coned = vec![false; self.gears.len()];
         for i in 0..self.gears.len() {
             if let Some(p) = self.gears[i].placement.parent() {
                 match self.gears[..i].iter().position(|g| g.id == p) {
                     Some(pi) => {
-                        let meshes = matches!(self.gears[i].placement, Placement::Mesh { .. });
+                        let meshes = matches!(self.gears[i].placement, Placement::Mesh { .. } | Placement::Bevel { .. });
+                        if let Placement::Bevel { shaft_angle, .. } = self.gears[i].placement {
+                            let (zp, zc) = (self.gears[pi].params.teeth, self.gears[i].params.teeth);
+                            if self.gears[pi].params.is_bevel() && self.gears[i].params.is_bevel() && zp > 0 && zc > 0 {
+                                let cd = if coned[pi] {
+                                    let pd = self.gears[pi].params.bevel.unwrap_or_default().pitch_angle.to_radians();
+                                    (zc as f64 * pd.sin() / zp as f64).clamp(-1.0, 1.0).asin()
+                                } else {
+                                    let (pd, cd) = bevel::pitch_angles(zp, zc, shaft_angle.to_radians());
+                                    self.gears[pi].params.bevel = Some(Bevel { pitch_angle: pd.to_degrees() });
+                                    coned[pi] = true;
+                                    cd
+                                };
+                                self.gears[i].params.bevel = Some(Bevel { pitch_angle: cd.to_degrees() });
+                                coned[i] = true;
+                            }
+                        }
                         let belted = matches!(self.gears[i].placement, Placement::Belt { .. });
                         if belted && self.gears[i].match_parent && self.gears[pi].params.is_pulley() {
                             let (belt, width) = (self.gears[pi].params.belt, self.gears[pi].params.belt_width);
@@ -456,6 +560,8 @@ impl Project {
                         mesh: Some(mi),
                         belt: None,
                         depth: ps.depth + 1,
+                        z: 0.0,
+                        frame: Frame3::at([0.0; 3]),
                     }
                 }
                 (Placement::Belt { angle, belt_teeth, .. }, Some(pi)) => {
@@ -483,6 +589,38 @@ impl Project {
                         mesh: None,
                         belt: Some(bi),
                         depth: ps.depth + 1,
+                        z: 0.0,
+                        frame: Frame3::at([0.0; 3]),
+                    }
+                }
+                (Placement::Bevel { angle, .. }, Some(pi)) => {
+                    let pg = &self.gears[pi];
+                    let ps = &out[pi];
+                    let (zp, zc) = (pg.params.teeth as f64, g.params.teeth as f64);
+                    let beta = angle.to_radians();
+                    let pd = pg.params.bevel.unwrap_or_default().pitch_angle.to_radians();
+                    let cd = g.params.bevel.unwrap_or_default().pitch_angle.to_radians();
+                    let f = ps.frame;
+                    // Lean the axis away from the parent's by the two pitch
+                    // cones; they touch along the generator at azimuth β.
+                    let towards = f.turn([beta.cos(), beta.sin(), 0.0]);
+                    let sigma = pd + cd;
+                    let axis: [f64; 3] = std::array::from_fn(|k| sigma.cos() * f.z[k] + sigma.sin() * towards[k]);
+                    let contact: [f64; 3] = std::array::from_fn(|k| pd.cos() * f.z[k] + pd.sin() * towards[k]);
+                    // Local x points away from the contact line, so the
+                    // contact sits at azimuth π as it does for a spur mesh.
+                    let along = v_dot(contact, axis);
+                    let x = v_unit(std::array::from_fn(|k| -(contact[k] - along * axis[k])));
+                    let frame = Frame3 { origin: f.origin, x, y: v_cross(axis, x), z: axis };
+                    Solved {
+                        center: [f.origin[0], f.origin[1]],
+                        ratio: -ps.ratio * zp / zc,
+                        phase: PI + PI / zc - (ps.phase - beta) * zp / zc,
+                        mesh: None,
+                        belt: None,
+                        depth: ps.depth + 1,
+                        z: f.origin[2],
+                        frame,
                     }
                 }
                 (Placement::Axle { phase, .. }, Some(pi)) => {
@@ -494,6 +632,8 @@ impl Project {
                         mesh: None,
                         belt: None,
                         depth: ps.depth + 1,
+                        z: 0.0,
+                        frame: Frame3::at([0.0; 3]),
                     }
                 }
                 (Placement::Root { x, y, phase }, _) => Solved {
@@ -503,10 +643,43 @@ impl Project {
                     mesh: None,
                     belt: None,
                     depth: 0,
+                    z: 0.0,
+                    frame: Frame3::at([0.0; 3]),
                 },
                 // Unreachable after normalize(); draw it at the origin.
-                (_, None) => Solved { center: [0.0, 0.0], ratio: 1.0, phase: 0.0, mesh: None, belt: None, depth: 0 },
+                (_, None) => {
+                    Solved {
+                        center: [0.0, 0.0],
+                        ratio: 1.0,
+                        phase: 0.0,
+                        mesh: None,
+                        belt: None,
+                        depth: 0,
+                        z: 0.0,
+                        frame: Frame3::at([0.0; 3]),
+                    }
+                }
             };
+            let mut s = s;
+            match (&g.placement, parent) {
+                (Placement::Bevel { .. }, _) => {}
+                (Placement::Axle { .. }, Some(pi)) => {
+                    // Stacked along the parent's shaft: this part starts
+                    // where the parent ends.
+                    let f = out[pi].frame;
+                    let shift = axial_extent(&self.gears[pi].params).1 + g.axial - axial_extent(&g.params).0;
+                    s.frame = Frame3 { origin: f.apply([0.0, 0.0, shift]), ..f };
+                    s.z = s.frame.origin[2];
+                }
+                (Placement::Mesh { .. } | Placement::Belt { .. }, Some(pi)) => {
+                    s.z = g.axial + out[pi].z + (self.gears[pi].params.face_width - g.params.face_width) / 2.0;
+                    s.frame = Frame3::at([s.center[0], s.center[1], s.z]);
+                }
+                _ => {
+                    s.z = g.axial;
+                    s.frame = Frame3::at([s.center[0], s.center[1], s.z]);
+                }
+            }
             out.push(s);
         }
         out
@@ -535,6 +708,9 @@ impl Project {
         for i in 0..self.gears.len() {
             for j in i + 1..self.gears.len() {
                 let (a, b) = (&self.gears[i], &self.gears[j]);
+                if a.params.is_bevel() || b.params.is_bevel() {
+                    continue;
+                }
                 let related = |x: &Gear, y: &Gear| matches!(x.placement, Placement::Mesh { parent, .. } if parent == y.id);
                 if related(a, b) || related(b, a) {
                     continue;
@@ -560,7 +736,13 @@ pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
 }
 
 fn kind_name(params: &GearParams) -> &'static str {
-    if params.is_pulley() { "Pulley" } else { "Gear" }
+    if params.is_pulley() {
+        "Pulley"
+    } else if params.is_bevel() {
+        "Bevel"
+    } else {
+        "Gear"
+    }
 }
 
 fn belt_info(a: &GearParams, b: &GearParams, belt_teeth: u32) -> BeltInfo {
@@ -703,6 +885,81 @@ mod tests {
         assert!((k - k.round()).abs() < 1e-9, "{k}");
         let len = lp.len();
         assert!((len - s[1].belt.as_ref().unwrap().length).abs() < 1e-6, "{len}");
+    }
+
+    #[test]
+    fn parts_stack_along_their_shafts() {
+        let mut p = Project::empty();
+        let a = p.add_root(GearParams { face_width: 10.0, ..Default::default() }, 0.0, 0.0);
+        let b = p.add_child(a, GearParams { teeth: 60, face_width: 6.0, ..Default::default() }, Link::Mesh);
+        let c = p.add_child(b, GearParams { teeth: 12, face_width: 8.0, ..Default::default() }, Link::Axle);
+        p.add_child(c, GearParams { teeth: 48, face_width: 4.0, ..Default::default() }, Link::Mesh);
+        p.normalize();
+        let s = p.solve();
+        assert_eq!(s.iter().map(|s| s.z).collect::<Vec<_>>(), [0.0, 2.0, 8.0, 10.0]);
+        // An offset moves the part and everything after it along the shaft.
+        p.gears[2].axial = 1.5;
+        let s = p.solve();
+        assert_eq!(s[3].z, 11.5);
+    }
+
+    fn deg(p: &Project, i: usize) -> f64 {
+        p.gears[i].params.bevel.unwrap().pitch_angle
+    }
+
+    #[test]
+    fn bevel_pair_shares_an_apex_and_meets_at_the_shaft_angle() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_bevel(20), 30.0, 0.0);
+        let b = p.add_child(a, PitchUnit::Module.starter_bevel(40), Link::Bevel);
+        p.normalize();
+        let s = p.solve();
+        assert!((deg(&p, 0) - 0.5f64.atan().to_degrees()).abs() < 1e-9);
+        assert!((deg(&p, 0) + deg(&p, 1) - 90.0).abs() < 1e-9);
+        assert_eq!(s[0].frame.origin, s[1].frame.origin);
+        assert!(v_dot(s[0].frame.z, s[1].frame.z).abs() < 1e-12);
+        assert!((s[1].ratio + 0.5).abs() < 1e-12);
+        // The contact line lies on both pitch cones.
+        let d0 = deg(&p, 0).to_radians();
+        let contact = s[0].frame.turn([d0.sin(), 0.0, d0.cos()]);
+        assert!((v_dot(contact, s[1].frame.z) - deg(&p, 1).to_radians().cos()).abs() < 1e-12);
+        // At azimuth π in the wheel's own frame, as for a spur mesh.
+        let local = [v_dot(contact, s[1].frame.x), v_dot(contact, s[1].frame.y)];
+        assert!(local[0] < 0.0 && local[1].abs() < 1e-12);
+
+        // A third gear on the wheel follows the wheel's cone, so its shaft
+        // is square to the wheel's too.
+        let c = p.add_child(b, PitchUnit::Module.starter_bevel(20), Link::Bevel);
+        p.normalize();
+        let s = p.solve();
+        let i = p.index_of(c).unwrap();
+        assert!((deg(&p, i) - deg(&p, 0)).abs() < 1e-9);
+        assert!(v_dot(s[1].frame.z, s[i].frame.z).abs() < 1e-9);
+
+        // Another shaft angle.
+        if let Placement::Bevel { shaft_angle, .. } = &mut p.gears[1].placement {
+            *shaft_angle = 60.0;
+        }
+        p.normalize();
+        let s = p.solve();
+        assert!((deg(&p, 0) + deg(&p, 1) - 60.0).abs() < 1e-9);
+        assert!((v_dot(s[0].frame.z, s[1].frame.z) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bevel_on_a_shaft_starts_at_the_back_face_before_it() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_bevel(20), 0.0, 0.0);
+        let b = p.add_child(a, PitchUnit::Module.starter_bevel(40), Link::Bevel);
+        let c = p.add_child(b, PitchUnit::Module.starter_bevel(16), Link::Axle);
+        p.normalize();
+        let s = p.solve();
+        let i = p.index_of(c).unwrap();
+        let back = axial_extent(&p.gears[1].params).1;
+        let front = axial_extent(&p.gears[i].params).0;
+        let (u, v) = (s[1].frame.apply([0.0, 0.0, back]), s[i].frame.apply([0.0, 0.0, front]));
+        assert!((0..3).all(|k| (u[k] - v[k]).abs() < 1e-9), "{u:?} {v:?}");
+        assert_eq!(s[i].ratio, s[1].ratio);
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! with: CAD sketches and CAM toolpaths both choke on those, and points a
 //! fraction of a micron apart get merged by CAD import and tangle the loop.
 
+use crate::bevel::BevelGeom;
 use crate::gear;
-use crate::train::{Gear, Project};
+use crate::train::{Frame3, Gear, Project};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -17,6 +18,9 @@ pub struct Shape {
     pub path: Vec<([f64; 2], f64)>,
     pub center: [f64; 2],
     pub bore: f64,
+    /// Back face along the axis and the face width, for solid output.
+    pub z: f64,
+    pub height: f64,
 }
 
 /// Fit a closed outline with lines and circular arcs. Every input point
@@ -158,7 +162,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .gears
         .iter()
         .zip(&solved)
-        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g))
+        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && !g.params.is_bevel())
         .filter_map(|(g, s)| {
             let prof = gear::tooth_profile(&g.params)?;
             let (center, rot) = if only.is_none() { (s.center, s.phase + s.ratio * driver_angle) } else { ([0.0, 0.0], 0.0) };
@@ -169,15 +173,52 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
                 path: fit_arcs(&outline, tolerance(g.params.module)),
                 center,
                 bore: g.params.bore,
+                z: if only.is_none() { s.z } else { 0.0 },
+                height: g.params.face_width,
             })
         })
         .collect()
 }
 
-/// Write DXF or SVG, chosen by the file extension, in inches or mm.
-pub fn write(path: &Path, shapes: &[Shape], inch: bool) -> std::io::Result<()> {
-    let is_svg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
-    std::fs::write(path, if is_svg { svg(shapes, inch) } else { dxf(shapes, inch) })
+/// A bevel gear for STEP: its geometry and where it sits.
+pub struct BevelPart {
+    pub name: String,
+    pub geom: BevelGeom,
+    pub frame: Frame3,
+    pub rot: f64,
+}
+
+/// The bevel gears to export, placed as `shapes` places the others.
+pub fn bevels(project: &Project, driver_angle: f64, only: Option<u64>, keep: impl Fn(&Gear) -> bool) -> Vec<BevelPart> {
+    let solved = project.solve();
+    project
+        .gears
+        .iter()
+        .zip(&solved)
+        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && g.params.is_buildable())
+        .filter_map(|(g, s)| {
+            let geom = BevelGeom::new(&g.params)?;
+            let (frame, rot) =
+                if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) };
+            Some(BevelPart { name: g.name.clone(), geom, frame, rot })
+        })
+        .collect()
+}
+
+/// Write DXF, SVG or STEP, chosen by the file extension, in inches or mm.
+/// Only STEP carries bevel gears.
+pub fn write(path: &Path, shapes: &[Shape], bevels: &[BevelPart], inch: bool) -> std::io::Result<()> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    std::fs::write(
+        path,
+        match ext.as_str() {
+            "svg" => svg(shapes, inch),
+            // STEP carries its own units; it is always written in mm.
+            "step" | "stp" => crate::step::step(shapes, bevels, &name),
+            _ => dxf(shapes, inch),
+        },
+    )
 }
 
 /// Shapes rescaled from mm into the output unit.
@@ -191,6 +232,8 @@ fn in_units(shapes: &[Shape], inch: bool) -> Vec<Shape> {
             path: s.path.iter().map(|&(q, b)| ([q[0] * k, q[1] * k], b)).collect(),
             center: [s.center[0] * k, s.center[1] * k],
             bore: s.bore * k,
+            z: s.z * k,
+            height: s.height * k,
         })
         .collect()
 }

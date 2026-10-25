@@ -10,6 +10,7 @@
 //! everywhere else. A gear's local outline is centred on the origin with
 //! tooth 0 pointing along +X.
 
+use crate::bevel::{Bevel, BevelGeom};
 use crate::pulley::{self, BeltSection};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
@@ -47,6 +48,11 @@ pub struct GearParams {
     /// Belt width, mm (pulleys only).
     #[serde(default)]
     pub belt_width: f64,
+    /// Set for a straight bevel gear: its pitch cone, which the solve
+    /// derives from the mate. `module` is then the large-end module and
+    /// `face_width` runs along the cone.
+    #[serde(default)]
+    pub bevel: Option<Bevel>,
 }
 
 impl Default for GearParams {
@@ -65,6 +71,7 @@ impl Default for GearParams {
             face_width: 10.0,
             belt: None,
             belt_width: 0.0,
+            bevel: None,
         }
     }
 }
@@ -206,9 +213,15 @@ impl GearParams {
     pub fn is_pulley(&self) -> bool {
         self.belt.is_some()
     }
+    pub fn is_bevel(&self) -> bool {
+        self.bevel.is_some()
+    }
     /// Outside radius (a pulley's lies the pitch-line differential inside
     /// its pitch circle).
     pub fn tip_radius(&self) -> f64 {
+        if let Some(g) = self.bevel.and_then(|_| BevelGeom::new(self)) {
+            return g.outside_diameter() / 2.0;
+        }
         match self.belt {
             Some(b) => self.pitch_radius() - b.rack(self.teeth).pld / 2.0,
             None => self.pitch_radius() + self.module * (self.addendum + self.profile_shift),
@@ -245,6 +258,9 @@ impl GearParams {
     }
 
     pub fn is_buildable(&self) -> bool {
+        if self.is_bevel() {
+            return BevelGeom::new(self).is_some();
+        }
         if self.is_pulley() {
             return self.teeth >= 3 && self.root_radius() > 0.0;
         }
@@ -259,6 +275,15 @@ impl GearParams {
     /// Problems with this gear; `len` formats a length in mm for display.
     pub fn issues(&self, len: impl Fn(f64) -> String) -> Vec<Issue> {
         let mut out = Vec::new();
+        if self.is_bevel() {
+            match BevelGeom::new(self) {
+                Some(g) => return g.issues(len),
+                None => {
+                    out.push(Issue::error("These parameters do not describe a bevel gear (check teeth, module and the cone)."));
+                    return out;
+                }
+            }
+        }
         if let Some(b) = self.belt {
             if !self.is_buildable() {
                 out.push(Issue::error("Too few teeth to make a pulley."));

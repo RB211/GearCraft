@@ -5,11 +5,14 @@
 //! derived values on the right, all updating as you type.
 
 mod app;
+mod bevel;
 mod chrome;
 mod export;
 mod gear;
 mod pulley;
+mod step;
 mod train;
+mod view3d;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -51,7 +54,8 @@ fn headless_export(file: Option<std::path::PathBuf>, out: &std::path::Path) -> e
     };
     project.normalize();
     let shapes = export::shapes(&project, 0.0, None, |_| true);
-    export::write(out, &shapes, project.pitch_unit.is_inch()).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
+    let bevels = export::bevels(&project, 0.0, None, |_| true);
+    export::write(out, &shapes, &bevels, project.pitch_unit.is_inch()).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
     Ok(())
 }
 

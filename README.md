@@ -4,8 +4,8 @@ A gear and gear-train designer: a friendlier take on Gearotic, built with Rust a
 
 One window, no pop-up parameter dialogs:
 
-- **Workspace** (top left): what you are designing, which sets the ribbon's tools. Spur Gears and
-  Timing Pulleys today; internal/planetary, helical, clock wheels and escapements will join the list.
+- **Workspace** (top left): what you are designing, which sets the ribbon's tools. Spur Gears, Bevel
+  Gears and Timing Pulleys today; internal/planetary, helical, clock wheels and escapements will join the list.
   Each workspace shows only its own parts: switching to Timing Pulleys puts the gears away, and
   switching back brings them (and what you had selected) back. One project file holds them all.
 - **Train** (left): the gears and pulleys in the project as a tree. Each is either fixed, meshing
@@ -13,7 +13,8 @@ One window, no pop-up parameter dialogs:
   gears for clock and reduction trains).
 - **Canvas** (centre): live drawing of the whole train. Scroll to zoom, drag empty space to pan,
   drag a fixed gear to move it, drag a meshing gear to swing it round its partner (Shift snaps to 15°).
-  Space runs the animation.
+  Space runs the animation. View → 3D shows the parts as solids of their face width, stacked along
+  their shafts (Axial offset in the Placement section moves one along its shaft); drag to orbit.
 - **Properties** (right): the selected gear's parameters, with derived dimensions, mesh data
   (centre distance, working pressure angle, contact ratio, clearance) and warnings updating as you type.
 
@@ -23,6 +24,23 @@ Metric (module, mm) and inch (diametral pitch, inches) projects: pick with the M
 (it offers to convert existing gears to the nearest standard pitch), or File → New metric/inch project. Lengths,
 the grid and exports follow the project's units. Tooth standards: ISO 53, AGMA full depth (20°/25°),
 AGMA 14½° full depth, AGMA fine pitch (1.2/P + 0.002") and AGMA 20° stub.
+
+## Bevel gears
+
+Straight bevel gears with spherical involute teeth, the exact bevel counterpart of the involute,
+so a pair has conjugate action along the whole face. New Pair places a 20-tooth pinion and a 40-tooth
+wheel at right angles; Mesh Bevel (M) adds a mate to the selected gear at any shaft angle, and the pitch
+cones follow from the tooth counts. A gear's first mate sets its cone; further mates fit that cone, so
+a gear can drive several others. Proportions are the equal-addendum system at the large end (addendum
+1 m, dedendum 1.25 m), with a warning when the face width passes a third of the cone distance or the
+virtual tooth count is small enough to undercut. Bevel gears show in 3D only and export as STEP.
+
+## Export
+
+File → Export writes the selected part or the whole train as STEP (3D solids), DXF or SVG (flat
+outlines, in the project's units). STEP solids are exact B-reps rather than meshes: spur and pulley
+sides are the arc-fitted outline's planes and cylinders; bevel flanks are cubic B-spline cones
+through the apex, with conical tip and root lands and tooth ends on the back and front cones.
 
 ## Timing pulleys and belts
 
@@ -47,11 +65,15 @@ Offscreen screenshot of the window (for checking layout without opening it):
 
     GEARCRAFT_SHOT=out.png [GEARCRAFT_SHOT_FILE=project.gearcraft] cargo test screenshot
 
+Other `GEARCRAFT_SHOT_*` variables pick what it shows: `3D`, `BEVEL` (the Bevel Gears workspace,
+adding a pair if empty), `PULLEYS`, `LIGHT`, `ANGLE=deg` (drive position), `CAM=yaw,pitch,zoom[,x,y,z]`
+and `MENU=label` (click a widget first).
+
 The interface font is IBM Plex Sans (SIL Open Font License, `assets/fonts/OFL.txt`).
 
 Headless export of a train:
 
-    gearcraft project.gearcraft --export out.dxf     # or out.svg
+    gearcraft project.gearcraft --export out.dxf     # or out.svg, out.step
 
 ## Shortcuts
 
@@ -60,6 +82,7 @@ Headless export of a train:
 | Ctrl+N / O / S / Shift+S | New, open, save, save as |
 | Ctrl+Z / Ctrl+Shift+Z | Undo, redo |
 | M / A | Spur Gears: add a meshing gear / a gear on the same shaft |
+| M / A | Bevel Gears: add a meshing bevel / a bevel on the same shaft |
 | B / P | Timing Pulleys: add a belt drive / a pulley on the same shaft |
 | Del | Delete the selected gear (and anything attached to it) |
 | Space | Run or pause |
@@ -67,5 +90,5 @@ Headless export of a train:
 
 ## Roadmap
 
-HTD and GT pulleys, internal (ring) gears and planetary sets, helical gears, cycloidal clock profiles (BS 978),
-escapements, G-code output, and sending gears to SolidCraft.
+HTD and GT pulleys, internal (ring) gears and planetary sets, helical and spiral bevel gears, a section
+view for bevels, cycloidal clock profiles (BS 978), escapements, G-code output, and sending gears to SolidCraft.

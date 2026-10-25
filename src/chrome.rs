@@ -150,6 +150,34 @@ pub enum Icon<'a> {
     Gear,
     /// Two pulleys and their belt.
     Pulley,
+    /// A mitre pair, side on.
+    Bevel,
+}
+
+/// A bevel gear in perspective: a cone frustum with its teeth running
+/// down the slanted face from the small front face to the large back.
+fn bevel_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
+    let (top, rt) = (c + vec2(0.0, -5.0), vec2(5.0, 2.0));
+    let (bottom, rb) = (c + vec2(0.0, 5.0), vec2(11.5, 4.5));
+    let on = |o: Pos2, r: egui::Vec2, a: f32| o + vec2(r.x * a.cos(), r.y * a.sin());
+    let side = color.gamma_multiply(0.5);
+    // Body: the back half of the front face and the front half of the back.
+    let mut hull: Vec<Pos2> = (0..=16).map(|k| on(top, rt, std::f32::consts::PI * (1.0 + k as f32 / 16.0))).collect();
+    hull.extend((0..=16).map(|k| on(bottom, rb, std::f32::consts::PI * k as f32 / 16.0)));
+    painter.add(Shape::convex_polygon(hull, side, Stroke::NONE));
+    let teeth = 14;
+    let pitch = std::f32::consts::TAU / teeth as f32;
+    for k in 0..teeth {
+        let a = k as f32 * pitch + 0.2;
+        if a.sin() < -0.05 {
+            continue;
+        }
+        let w = pitch * 0.27;
+        let quad = vec![on(top, rt, a - w), on(top, rt, a + w), on(bottom, rb, a + w), on(bottom, rb, a - w)];
+        painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+    }
+    let face: Vec<Pos2> = (0..24).map(|k| on(top, rt, std::f32::consts::TAU * k as f32 / 24.0)).collect();
+    painter.add(Shape::convex_polygon(face, color, Stroke::NONE));
 }
 
 /// A belt drive: small and large pulley joined by the belt's straight runs.
@@ -181,6 +209,7 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, at: Pos2, color: Color32) {
         }
         Icon::Gear => gear_mark(painter, at, 11.0, color),
         Icon::Pulley => pulley_mark(painter, at, color),
+        Icon::Bevel => bevel_mark(painter, at, color),
     }
 }
 
