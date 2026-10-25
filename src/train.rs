@@ -1,0 +1,467 @@
+//! The project: a gear train as a list of gears, each either fixed in space
+//! (a root), meshing with an earlier gear, or sharing an earlier gear's
+//! axle (a compound gear). Parents always come before their children in
+//! `gears`, so the train can be solved in one pass and can never loop.
+
+use crate::gear::{self, GearParams, MeshInfo, ToothStandard};
+use serde::{Deserialize, Serialize};
+use std::f64::consts::PI;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Placement {
+    /// Fixed centre. Roots turn at the driver speed.
+    Root { x: f64, y: f64, phase: f64 },
+    /// Meshes with `parent`; `angle` (degrees) is the direction from the
+    /// parent's centre to this one.
+    Mesh { parent: u64, angle: f64 },
+    /// On the same arbor as `parent`, turning with it; `phase` in degrees.
+    Axle { parent: u64, phase: f64 },
+}
+
+impl Placement {
+    pub fn parent(&self) -> Option<u64> {
+        match *self {
+            Placement::Root { .. } => None,
+            Placement::Mesh { parent, .. } | Placement::Axle { parent, .. } => Some(parent),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Gear {
+    pub id: u64,
+    pub name: String,
+    pub params: GearParams,
+    pub placement: Placement,
+    /// Keep module and pressure angle in step with the meshing parent.
+    #[serde(default = "yes")]
+    pub match_parent: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Preferred modules (ISO 54, first and second choice).
+pub const STD_MODULES: [f64; 20] =
+    [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0];
+/// Diametral pitches stocked by the usual inch gear suppliers.
+pub const STD_DPS: [f64; 25] = [
+    1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 32.0, 40.0, 48.0,
+    64.0, 72.0, 80.0, 96.0, 120.0,
+];
+
+/// The entry of `list` closest to `v` on a log scale (pitch steps are
+/// roughly geometric).
+fn nearest(list: &[f64], v: f64) -> f64 {
+    list.iter().copied().min_by(|a, b| (a / v).ln().abs().total_cmp(&(b / v).ln().abs())).unwrap_or(v)
+}
+
+/// The project's unit system. Geometry is always held in millimetres;
+/// this only changes what is shown, typed and exported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PitchUnit {
+    /// Module, lengths in mm.
+    #[default]
+    Module,
+    /// Diametral pitch, lengths in inches.
+    DiametralPitch,
+}
+
+impl PitchUnit {
+    pub fn is_inch(self) -> bool {
+        self == PitchUnit::DiametralPitch
+    }
+    /// Millimetres per display unit.
+    pub fn factor(self) -> f64 {
+        if self.is_inch() { 25.4 } else { 1.0 }
+    }
+    pub fn suffix(self) -> &'static str {
+        if self.is_inch() { " in" } else { " mm" }
+    }
+    pub fn decimals(self) -> usize {
+        if self.is_inch() { 4 } else { 3 }
+    }
+    /// A sensible fresh gear in this system.
+    pub fn starter(self, teeth: u32) -> GearParams {
+        match self {
+            PitchUnit::Module => GearParams { teeth, ..Default::default() },
+            PitchUnit::DiametralPitch => {
+                let mut p = GearParams {
+                    teeth,
+                    module: 25.4 / 12.0,
+                    standard: ToothStandard::AgmaFullDepth,
+                    bore: 0.25 * 25.4,
+                    face_width: 0.5 * 25.4,
+                    ..Default::default()
+                };
+                p.apply_standard();
+                p
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Project {
+    pub version: u32,
+    pub gears: Vec<Gear>,
+    pub next_id: u64,
+    pub driver_rpm: f64,
+    pub pitch_unit: PitchUnit,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self::new(PitchUnit::Module)
+    }
+}
+
+/// Where a gear ends up and how it turns relative to the driver.
+#[derive(Clone, Debug)]
+pub struct Solved {
+    pub center: [f64; 2],
+    /// Angular velocity relative to the driver (negative = opposite way).
+    pub ratio: f64,
+    /// Rotation of the local outline when the driver is at angle 0.
+    pub phase: f64,
+    pub mesh: Option<MeshInfo>,
+    pub depth: usize,
+}
+
+impl Project {
+    /// A starter pair in the given unit system.
+    pub fn new(unit: PitchUnit) -> Self {
+        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit };
+        let a = p.add_root(unit.starter(20), 0.0, 0.0);
+        let wheel = GearParams { bore: unit.starter(40).bore * 1.25, ..unit.starter(40) };
+        p.add_child(a, wheel, false);
+        p
+    }
+
+    /// Switch unit system and resize every gear to the nearest standard
+    /// pitch of the new system, with that system's usual tooth standard.
+    /// Gears with custom rack proportions keep them.
+    pub fn convert_to(&mut self, unit: PitchUnit) {
+        for g in &mut self.gears {
+            let p = &mut g.params;
+            let custom = p.standard == ToothStandard::Custom;
+            match unit {
+                PitchUnit::DiametralPitch => {
+                    let dp = nearest(&STD_DPS, 25.4 / p.module);
+                    p.module = 25.4 / dp;
+                    if !custom {
+                        p.standard = if (p.pressure_angle - 14.5).abs() < 1e-9 {
+                            ToothStandard::Agma14_5
+                        } else if dp >= 20.0 {
+                            ToothStandard::AgmaFinePitch
+                        } else {
+                            ToothStandard::AgmaFullDepth
+                        };
+                    }
+                }
+                PitchUnit::Module => {
+                    p.module = nearest(&STD_MODULES, p.module);
+                    if !custom {
+                        p.standard = ToothStandard::Iso53;
+                    }
+                }
+            }
+        }
+        self.pitch_unit = unit;
+        self.normalize();
+    }
+
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self { gears: Vec::new(), ..Default::default() }
+    }
+
+    pub fn index_of(&self, id: u64) -> Option<usize> {
+        self.gears.iter().position(|g| g.id == id)
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Gear> {
+        self.gears.iter().find(|g| g.id == id)
+    }
+
+    fn fresh_id(&mut self) -> u64 {
+        let id = self.next_id.max(self.gears.iter().map(|g| g.id + 1).max().unwrap_or(1));
+        self.next_id = id + 1;
+        id
+    }
+
+    fn fresh_name(&self) -> String {
+        let mut n = self.gears.len() + 1;
+        loop {
+            let name = format!("Gear {n}");
+            if !self.gears.iter().any(|g| g.name == name) {
+                return name;
+            }
+            n += 1;
+        }
+    }
+
+    pub fn add_root(&mut self, params: GearParams, x: f64, y: f64) -> u64 {
+        let id = self.fresh_id();
+        let name = self.fresh_name();
+        self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true });
+        id
+    }
+
+    /// Add a gear meshing with (or on the axle of) `parent`, inserted after
+    /// the parent's subtree so the list keeps reading like the train.
+    pub fn add_child(&mut self, parent: u64, mut params: GearParams, on_axle: bool) -> u64 {
+        let Some(pi) = self.index_of(parent) else { return 0 };
+        let pp = self.gears[pi].params.clone();
+        params.module = pp.module;
+        params.pressure_angle = pp.pressure_angle;
+        let placement = if on_axle {
+            Placement::Axle { parent, phase: 0.0 }
+        } else {
+            // Point away from the parent's own parent so a chain grows
+            // outward instead of folding back on itself.
+            let angle = match &self.gears[pi].placement {
+                Placement::Mesh { angle, .. } => *angle,
+                _ => 0.0,
+            };
+            let taken: Vec<f64> = self
+                .gears
+                .iter()
+                .filter_map(|g| match g.placement {
+                    Placement::Mesh { parent: p, angle } if p == parent => Some(angle),
+                    _ => None,
+                })
+                .collect();
+            let mut a = angle;
+            while taken.iter().any(|t| ((t - a + 540.0) % 360.0 - 180.0).abs() < 30.0) {
+                a += 60.0;
+            }
+            Placement::Mesh { parent, angle: a % 360.0 }
+        };
+        let id = self.fresh_id();
+        let name = self.fresh_name();
+        let at = self.subtree_end(pi);
+        self.gears.insert(at, Gear { id, name, params, placement, match_parent: !on_axle });
+        id
+    }
+
+    /// Index one past the last descendant of the gear at `i`.
+    fn subtree_end(&self, i: usize) -> usize {
+        let mut inside = vec![self.gears[i].id];
+        let mut j = i + 1;
+        while j < self.gears.len() {
+            match self.gears[j].placement.parent() {
+                Some(p) if inside.contains(&p) => {
+                    inside.push(self.gears[j].id);
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        j
+    }
+
+    pub fn descendants(&self, id: u64) -> Vec<u64> {
+        let mut out = vec![id];
+        for g in &self.gears {
+            if let Some(p) = g.placement.parent() {
+                if out.contains(&p) {
+                    out.push(g.id);
+                }
+            }
+        }
+        out.remove(0);
+        out
+    }
+
+    /// Remove a gear and everything attached to it.
+    pub fn remove(&mut self, id: u64) {
+        let mut doomed = self.descendants(id);
+        doomed.push(id);
+        self.gears.retain(|g| !doomed.contains(&g.id));
+    }
+
+    /// Repair anything a hand-edited or older file could get wrong: unknown
+    /// or later parents become roots, linked tooth systems are synced, and
+    /// standard rack coefficients are re-derived (fine pitch depends on DP).
+    pub fn normalize(&mut self) {
+        for i in 0..self.gears.len() {
+            if let Some(p) = self.gears[i].placement.parent() {
+                match self.gears[..i].iter().position(|g| g.id == p) {
+                    Some(pi) => {
+                        let meshes = matches!(self.gears[i].placement, Placement::Mesh { .. });
+                        if meshes && self.gears[i].match_parent {
+                            let src = self.gears[pi].params.clone();
+                            let dst = &mut self.gears[i].params;
+                            dst.module = src.module;
+                            dst.pressure_angle = src.pressure_angle;
+                            dst.standard = src.standard;
+                            dst.addendum = src.addendum;
+                            dst.dedendum = src.dedendum;
+                            dst.root_fillet = src.root_fillet;
+                        }
+                    }
+                    None => self.gears[i].placement = Placement::Root { x: 0.0, y: 0.0, phase: 0.0 },
+                }
+            }
+            self.gears[i].params.apply_standard();
+        }
+        self.next_id = self.next_id.max(self.gears.iter().map(|g| g.id + 1).max().unwrap_or(1));
+    }
+
+    pub fn solve(&self) -> Vec<Solved> {
+        let mut out: Vec<Solved> = Vec::with_capacity(self.gears.len());
+        for g in &self.gears {
+            let parent = g.placement.parent().and_then(|p| self.gears.iter().position(|q| q.id == p));
+            let s = match (&g.placement, parent) {
+                (Placement::Mesh { angle, .. }, Some(pi)) => {
+                    let pg = &self.gears[pi];
+                    let ps = &out[pi];
+                    let mi = gear::mesh(&pg.params, &g.params);
+                    let beta = angle.to_radians();
+                    let (zp, zc) = (pg.params.teeth as f64, g.params.teeth as f64);
+                    // With the parent turned so a tooth points along the
+                    // line of centres, this gear needs a space facing back.
+                    let phase = beta + PI + PI / zc - (ps.phase - beta) * zp / zc;
+                    Solved {
+                        center: [ps.center[0] + mi.center * beta.cos(), ps.center[1] + mi.center * beta.sin()],
+                        ratio: -ps.ratio * zp / zc,
+                        phase,
+                        mesh: Some(mi),
+                        depth: ps.depth + 1,
+                    }
+                }
+                (Placement::Axle { phase, .. }, Some(pi)) => {
+                    let ps = &out[pi];
+                    Solved { center: ps.center, ratio: ps.ratio, phase: ps.phase + phase.to_radians(), mesh: None, depth: ps.depth + 1 }
+                }
+                (Placement::Root { x, y, phase }, _) => {
+                    Solved { center: [*x, *y], ratio: 1.0, phase: phase.to_radians(), mesh: None, depth: 0 }
+                }
+                // Unreachable after normalize(); draw it at the origin.
+                (_, None) => Solved { center: [0.0, 0.0], ratio: 1.0, phase: 0.0, mesh: None, depth: 0 },
+            };
+            out.push(s);
+        }
+        out
+    }
+
+    /// Pairs of gears whose tip circles overlap without meshing or sharing
+    /// an axle.
+    pub fn collisions(&self, solved: &[Solved]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for i in 0..self.gears.len() {
+            for j in i + 1..self.gears.len() {
+                let (a, b) = (&self.gears[i], &self.gears[j]);
+                let related = |x: &Gear, y: &Gear| matches!(x.placement, Placement::Mesh { parent, .. } if parent == y.id);
+                if related(a, b) || related(b, a) {
+                    continue;
+                }
+                let (ca, cb) = (solved[i].center, solved[j].center);
+                let d = (ca[0] - cb[0]).hypot(ca[1] - cb[1]);
+                if d < 1e-6 {
+                    continue; // same arbor
+                }
+                if d < a.params.tip_radius() + b.params.tip_radius() - 1e-6 {
+                    out.push((i, j));
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_pair_turns_opposite_at_tooth_ratio() {
+        let p = Project::default();
+        let s = p.solve();
+        assert_eq!(s.len(), 2);
+        assert!((s[1].ratio + 0.5).abs() < 1e-12);
+        assert!((s[1].center[0] - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compound_train_ratio_multiplies() {
+        let mut p = Project::empty();
+        let a = p.add_root(GearParams { teeth: 10, ..Default::default() }, 0.0, 0.0);
+        let b = p.add_child(a, GearParams { teeth: 60, ..Default::default() }, false);
+        let c = p.add_child(b, GearParams { teeth: 8, ..Default::default() }, true);
+        let _d = p.add_child(c, GearParams { teeth: 64, ..Default::default() }, false);
+        let s = p.solve();
+        assert!((s[3].ratio - 10.0 / 60.0 * 8.0 / 64.0).abs() < 1e-12);
+    }
+
+    fn inside(poly: &[[f64; 2]], q: [f64; 2]) -> bool {
+        let mut c = false;
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+                c = !c;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn meshing_teeth_never_overlap() {
+        // (pinion teeth, shift, wheel teeth, shift, direction)
+        for (za, xa, zb, xb, dir) in [(13, 0.3, 31, 0.0, 37.0), (8, 0.0, 30, 0.0, 0.0), (20, 0.0, 20, 0.5, 200.0)] {
+            check_mesh(za, xa, zb, xb, dir);
+        }
+    }
+
+    fn check_mesh(za: u32, xa: f64, zb: u32, xb: f64, dir: f64) {
+        let mut p = Project::empty();
+        let pa = GearParams { teeth: za, profile_shift: xa, backlash: 0.05, ..Default::default() };
+        let a = p.add_root(pa, 0.0, 0.0);
+        let b = p.add_child(a, GearParams { teeth: zb, profile_shift: xb, backlash: 0.05, ..Default::default() }, false);
+        if let Placement::Mesh { angle, .. } = &mut p.gears[1].placement {
+            *angle = dir;
+        }
+        let s = p.solve();
+        let place = |i: usize, t: f64| {
+            let g = &p.gears[i].params;
+            let prof = gear::tooth_profile(g).unwrap();
+            let a = s[i].phase + s[i].ratio * t;
+            let (sn, cs) = a.sin_cos();
+            gear::outline(g, &prof)
+                .into_iter()
+                .map(|[x, y]| [s[i].center[0] + x * cs - y * sn, s[i].center[1] + x * sn + y * cs])
+                .collect::<Vec<_>>()
+        };
+        for k in 0..12 {
+            let t = k as f64 * 0.05;
+            let (oa, ob) = (place(0, t), place(1, t));
+            let bad = ob.iter().filter(|&&q| inside(&oa, q)).count();
+            assert_eq!(bad, 0, "driver angle {t}: {bad} points of gear {b} inside gear {a}");
+        }
+    }
+
+    #[test]
+    fn converting_picks_nearest_standard_pitch() {
+        let mut p = Project::default();
+        p.convert_to(PitchUnit::DiametralPitch);
+        // 2 mm module is 12.7 DP; the nearest stock pitch is 12.
+        assert!((25.4 / p.gears[0].params.module - 12.0).abs() < 1e-9);
+        assert_eq!(p.gears[1].params.standard, ToothStandard::AgmaFullDepth);
+        p.convert_to(PitchUnit::Module);
+        // 12 DP is 2.117 mm; back to 2.
+        assert!((p.gears[0].params.module - 2.0).abs() < 1e-12);
+        assert_eq!(p.gears[0].params.standard, ToothStandard::Iso53);
+    }
+
+    #[test]
+    fn remove_takes_the_subtree() {
+        let mut p = Project::default();
+        let first = p.gears[1].id;
+        p.add_child(first, GearParams::default(), true);
+        p.remove(first);
+        assert_eq!(p.gears.len(), 1);
+    }
+}
