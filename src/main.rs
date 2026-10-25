@@ -5,8 +5,10 @@
 //! derived values on the right, all updating as you type.
 
 mod app;
+mod chrome;
 mod export;
 mod gear;
+mod pulley;
 mod train;
 
 fn main() -> eframe::Result {

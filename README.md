@@ -4,8 +4,12 @@ A gear and gear-train designer: a friendlier take on Gearotic, built with Rust a
 
 One window, no pop-up parameter dialogs:
 
-- **Train** (left): the gears in the project as a tree. Each gear is either fixed, meshing with
-  an earlier gear, or sharing an earlier gear's axle (compound gears for clock and reduction trains).
+- **Workspace** (top left): what you are designing, which sets the ribbon's tools. Spur Gears and
+  Timing Pulleys today; internal/planetary, helical, clock wheels and escapements will join the list.
+  A project can mix parts from any workspace.
+- **Train** (left): the gears and pulleys in the project as a tree. Each is either fixed, meshing
+  with an earlier gear, belted to an earlier pulley, or sharing an earlier gear's axle (compound
+  gears for clock and reduction trains).
 - **Canvas** (centre): live drawing of the whole train. Scroll to zoom, drag empty space to pan,
   drag a fixed gear to move it, drag a meshing gear to swing it round its partner (Shift snaps to 15°).
   Space runs the animation.
@@ -19,9 +23,30 @@ Metric (module, mm) and inch (diametral pitch, inches) projects: pick with the M
 the grid and exports follow the project's units. Tooth standards: ISO 53, AGMA full depth (20°/25°),
 AGMA 14½° full depth, AGMA fine pitch (1.2/P + 0.002") and AGMA 20° stub.
 
+## Timing pulleys and belts
+
+Set a part's Type to Timing pulley to get the stock trapezoidal sections: MXL, XXL, XL, L, H, XH
+and XXH. Grooves are cut from the ISO 5294 generating racks, so they match bought pulleys
+(including the separate small-pulley racks for MXL and H). Stock tooth counts and belt widths
+come from the same standard; picking a width sets the face width for an unflanged pulley.
+
+Belt a pulley to another (B) and the belt's tooth count sets the centre distance. To work the
+other way, type the centre distance you want: GearCraft picks the ISO 5296 stock belt that comes
+closest and moves the pulley to where that belt puts it. Untick "Standard belts only" to allow any
+tooth count. The panel shows the belt designation (e.g. 130XL), pitch length, wrap and the teeth
+engaged on the smaller pulley, with a warning under 6.
+
+HTD, GT2/GT3, T and AT pulleys are not in yet: their groove shapes are not fully published.
+
 ## Build and run
 
     cargo run --release [project.gearcraft]
+
+Offscreen screenshot of the window (for checking layout without opening it):
+
+    GEARCRAFT_SHOT=out.png [GEARCRAFT_SHOT_FILE=project.gearcraft] cargo test screenshot
+
+The interface font is IBM Plex Sans (SIL Open Font License, `assets/fonts/OFL.txt`).
 
 Headless export of a train:
 
@@ -34,11 +59,12 @@ Headless export of a train:
 | Ctrl+N / O / S / Shift+S | New, open, save, save as |
 | Ctrl+Z / Ctrl+Shift+Z | Undo, redo |
 | M / A | Add a meshing gear / a gear on the same axle |
+| B / P | Add a belted pulley / a pulley on the same axle |
 | Del | Delete the selected gear (and anything attached to it) |
 | Space | Run or pause |
 | F or double-click | Fit the train to the window |
 
 ## Roadmap
 
-Internal (ring) gears and planetary sets, helical gears, cycloidal clock profiles (BS 978),
+HTD and GT pulleys, internal (ring) gears and planetary sets, helical gears, cycloidal clock profiles (BS 978),
 escapements, G-code output, and sending gears to SolidCraft.

@@ -1,6 +1,8 @@
+use crate::chrome::{self, Icon};
 use crate::export::{self, place};
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
-use crate::train::{Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
+use crate::pulley::{self, BeltSection};
+use crate::train::{self, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui,
     Vec2,
@@ -31,7 +33,7 @@ enum Drag {
     Pan,
     /// Moving a root gear; offset from its centre to the grab point.
     Move(u64, [f64; 2]),
-    /// Swinging a meshing gear around its parent.
+    /// Swinging a meshing gear or belted pulley around its parent.
     Swing(u64),
 }
 
@@ -40,6 +42,52 @@ enum Pending {
     New(PitchUnit),
     Open,
     Quit,
+}
+
+/// What the ribbon is set up to make. Each kind of gear gets its own
+/// workspace and tools; a project can still mix them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workspace {
+    Spur,
+    Pulleys,
+}
+
+impl Workspace {
+    const ALL: [Workspace; 2] = [Workspace::Spur, Workspace::Pulleys];
+    /// On the roadmap, listed so the menu shows where they will go.
+    const PLANNED: [&str; 4] = ["Internal & Planetary", "Helical", "Clock Wheels", "Escapements"];
+
+    fn name(self) -> &'static str {
+        match self {
+            Workspace::Spur => "Spur Gears",
+            Workspace::Pulleys => "Timing Pulleys",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Workspace::Spur => "⚙",
+            Workspace::Pulleys => "🔗",
+        }
+    }
+
+    fn icon(self) -> Icon<'static> {
+        match self {
+            Workspace::Spur => Icon::Gear,
+            Workspace::Pulleys => Icon::Pulley,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Workspace::Spur => "Involute spur gears: meshing pairs, compound trains",
+            Workspace::Pulleys => "MXL to XXH timing pulleys and the belts between them",
+        }
+    }
+
+    fn of(params: &GearParams) -> Self {
+        if params.is_pulley() { Workspace::Pulleys } else { Workspace::Spur }
+    }
 }
 
 struct Show {
@@ -73,11 +121,15 @@ pub struct GearCraftApp {
     pending: Option<Pending>,
     /// Asking whether to convert the gears for a Metric/Inch switch.
     unit_switch: Option<PitchUnit>,
+    /// Belt fitting picks from the ISO 5296 lengths only.
+    belt_standard_only: bool,
+    workspace: Workspace,
     title: String,
 }
 
 impl GearCraftApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
+        chrome::install_fonts(&cc.egui_ctx);
         let project = Project::default();
         let mut app = Self {
             selected: project.gears.first().map(|g| g.id),
@@ -100,6 +152,8 @@ impl GearCraftApp {
             status: None,
             pending: None,
             unit_switch: None,
+            belt_standard_only: true,
+            workspace: Workspace::Spur,
             title: String::new(),
         };
         if let Some(f) = file {
@@ -116,6 +170,9 @@ impl GearCraftApp {
 
     fn replace_project(&mut self, project: Project, path: Option<PathBuf>) {
         self.selected = project.gears.first().map(|g| g.id);
+        if let Some(g) = project.gears.first() {
+            self.workspace = Workspace::of(&g.params);
+        }
         self.committed = project.clone();
         self.project = project;
         self.undo.clear();
@@ -228,24 +285,41 @@ impl GearCraftApp {
 
     // ---- editing ---------------------------------------------------------
 
-    fn add_gear(&mut self, on_axle: bool) {
+    /// Add a gear (or pulley, if `pulley`) linked to the selected one.
+    fn add_gear(&mut self, link: Link, pulley: bool) {
         let Some(parent) = self.selected.and_then(|id| self.project.get(id)) else {
-            self.add_train();
+            self.add_train(pulley);
             return;
         };
         let pp = &parent.params;
-        // A compound pinion is usually a fraction of its wheel; a meshing
-        // gear starts as a copy so the pair is 1:1 until edited.
-        let params = if on_axle {
-            GearParams { teeth: (pp.teeth / 4).max(8), bore: pp.bore, ..pp.clone() }
-        } else {
-            pp.clone()
+        let unit = self.project.pitch_unit;
+        match link {
+            Link::Mesh if pp.is_pulley() => {
+                self.flash("Pulleys don't mesh: add a belted pulley (B), or a gear on its axle (A).");
+                return;
+            }
+            Link::Belt if !pp.is_pulley() => {
+                self.flash("Belts run between pulleys: put a pulley on this gear's axle first (P).");
+                return;
+            }
+            _ => {}
+        }
+        // A meshing gear or belted pulley starts as a copy so the pair is
+        // 1:1 until edited; a compound is usually a fraction of its wheel.
+        let params = match link {
+            Link::Mesh | Link::Belt => pp.clone(),
+            Link::Axle => match (pulley, pp.belt) {
+                (true, Some(b)) => GearParams { teeth: (pp.teeth / 2).max(b.min_teeth()), ..pp.clone() },
+                (true, None) => GearParams { bore: pp.bore, ..unit.starter_pulley(20) },
+                (false, Some(_)) => GearParams { bore: pp.bore, ..unit.starter(24) },
+                (false, None) => GearParams { teeth: (pp.teeth / 4).max(8), bore: pp.bore, ..pp.clone() },
+            },
         };
-        let id = self.project.add_child(parent.id, params, on_axle);
+        let id = self.project.add_child(parent.id, params, link);
         self.selected = Some(id);
     }
 
-    fn add_train(&mut self) {
+    fn add_train(&mut self, pulley: bool) {
         let solved = self.project.solve();
         let right = self
             .project
@@ -255,7 +329,9 @@ impl GearCraftApp {
             .map(|(g, s)| s.center[0] + g.params.tip_radius())
             .fold(f64::MIN, f64::max);
         let x = if right == f64::MIN { 0.0 } else { right + 40.0 };
-        let id = self.project.add_root(self.project.pitch_unit.starter(24), x, 0.0);
+        let unit = self.project.pitch_unit;
+        let params = if pulley { unit.starter_pulley(20) } else { unit.starter(24) };
+        let id = self.project.add_root(params, x, 0.0);
         self.selected = Some(id);
     }
 
@@ -419,7 +495,7 @@ impl GearCraftApp {
                             let c = solved[i].center;
                             self.drag = Some(Drag::Move(id, [w[0] - c[0], w[1] - c[1]]));
                         }
-                        Placement::Mesh { .. } => self.drag = Some(Drag::Swing(id)),
+                        Placement::Mesh { .. } | Placement::Belt { .. } => self.drag = Some(Drag::Swing(id)),
                         Placement::Axle { .. } => {}
                     }
                 }
@@ -445,7 +521,9 @@ impl GearCraftApp {
                 (Some(Drag::Swing(id)), Some(w)) => {
                     let i = self.project.index_of(id).unwrap();
                     let pi = self.project.gears[i].placement.parent().and_then(|p| self.project.index_of(p));
-                    if let (Placement::Mesh { angle, .. }, Some(pi)) = (&mut self.project.gears[i].placement, pi) {
+                    if let (Placement::Mesh { angle, .. } | Placement::Belt { angle, .. }, Some(pi)) =
+                        (&mut self.project.gears[i].placement, pi)
+                    {
                         let pc = solved[pi].center;
                         let mut a = (w[1] - pc[1]).atan2(w[0] - pc[0]).to_degrees();
                         if ui.input(|i| i.modifiers.shift) {
@@ -536,6 +614,66 @@ impl GearCraftApp {
         painter.text(rect.right_top() + Vec2::new(-8.0, 6.0), Align2::RIGHT_TOP, label, FontId::proportional(11.0), base);
     }
 
+    /// Belts drawn as they sit: the backing on the pulley tips, each tooth
+    /// in a groove. The loop is laid out from the parent pulley's grooves,
+    /// and the solve phases the driven pulley to match, so they stay
+    /// engaged as the train runs.
+    fn draw_belts(&self, painter: &egui::Painter, rect: Rect, visuals: &egui::Visuals, solved: &[Solved]) {
+        let color = if visuals.dark_mode { Color32::from_gray(88) } else { Color32::from_gray(52) };
+        for (g, s) in self.project.gears.iter().zip(solved) {
+            let Some(bi) = &s.belt else { continue };
+            let Some(pi) = g.placement.parent().and_then(|p| self.project.index_of(p)) else { continue };
+            let pp = &self.project.gears[pi].params;
+            let lp = pulley::BeltLoop::new(solved[pi].center, pp.pitch_radius(), s.center, g.params.pitch_radius());
+            let (Some(lp), Some(section), false, false) = (lp, g.params.belt, bi.too_short, bi.mismatch) else {
+                let ends = [self.to_screen(rect, solved[pi].center), self.to_screen(rect, s.center)];
+                painter.extend(Shape::dashed_line(&ends, Stroke::new(1.5, visuals.error_fg_color), 6.0, 4.0));
+                continue;
+            };
+            let tooth = section.belt_tooth();
+            // Offsets from the pitch line, outward positive: the belt's
+            // land rides on the pulley tips, half the PLD inside it.
+            let land = -section.rack(g.params.teeth).pld / 2.0;
+            let back = land + tooth.thickness - tooth.height;
+            let place = |s: f64, off: f64, along: f64| {
+                let (p, n) = lp.at(s);
+                let t = [-n[1], n[0]];
+                self.to_screen(rect, [p[0] + n[0] * off + t[0] * along, p[1] + n[1] * off + t[1] * along])
+            };
+
+            let len = lp.len();
+            let n = ((len * self.view.scale / 3.0) as usize).clamp(120, 4000);
+            let mid = (land + back) / 2.0;
+            let mut band: Vec<Pos2> = (0..=n).map(|k| place(len * k as f64 / n as f64, mid, 0.0)).collect();
+            band.push(band[1]);
+            let width = ((back - land) * self.view.scale) as f32;
+            painter.add(Shape::line(band, Stroke::new(width.max(1.5), color)));
+
+            let pitch = len / bi.teeth as f64;
+            if pitch * self.view.scale < 3.0 {
+                continue;
+            }
+            let rot = solved[pi].phase + solved[pi].ratio * self.driver_angle;
+            let s0 = lp.s_on_first(rot + pulley::groove_angle(pp.teeth));
+            let half_base = tooth.width / 2.0;
+            let half_tip = (half_base - tooth.height * tooth.half_angle.to_radians().tan()).max(0.05);
+            // Start inside the backing so tooth and band join without a seam.
+            let root = land + 0.25 * (back - land);
+            for k in 0..bi.teeth {
+                let at = s0 + k as f64 * pitch;
+                let quad = vec![
+                    place(at, root, -half_base),
+                    place(at, land, -half_base),
+                    place(at, land - tooth.height, -half_tip),
+                    place(at, land - tooth.height, half_tip),
+                    place(at, land, half_base),
+                    place(at, root, half_base),
+                ];
+                painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+            }
+        }
+    }
+
     fn draw_gears(
         &self,
         painter: &egui::Painter,
@@ -593,6 +731,7 @@ impl GearCraftApp {
             painter.line_segment([center + dir * r0, center + dir * (r0 + tick)], Stroke::new(1.5, edge));
         }
 
+        self.draw_belts(painter, rect, visuals, solved);
         for &(i, j) in collisions {
             for k in [i, j] {
                 let r = (self.project.gears[k].params.tip_radius() * self.view.scale) as f32;
@@ -633,7 +772,10 @@ impl GearCraftApp {
                     continue;
                 }
                 let at = self.to_screen(rect, s.center) + Vec2::new(0.0, 14.0);
-                let text = format!("{}  {}T", g.name, g.params.teeth);
+                let text = match g.params.belt {
+                    Some(b) => format!("{}  {}{}", g.name, g.params.teeth, b.name()),
+                    None => format!("{}  {}T", g.name, g.params.teeth),
+                };
                 let font = FontId::proportional(12.0);
                 let galley = painter.layout_no_wrap(text, font, visuals.text_color());
                 let r = Align2::CENTER_TOP.anchor_size(at, galley.size()).expand(3.0);
@@ -645,10 +787,22 @@ impl GearCraftApp {
 
     // ---- panels ----------------------------------------------------------
 
+    fn doc_name(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// The application bar: brand, menus, file actions and the document.
     fn menu_bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        chrome::app_bar_style(ui);
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
+            chrome::brand(ui);
+            chrome::bar_separator(ui);
+            ui.menu_button(RichText::new("File").size(14.0), |ui| {
                 let current = self.project.pitch_unit;
                 let shortcut = |u: PitchUnit| if u == current { "Ctrl+N" } else { "" };
                 if ui.add(egui::Button::new("New metric project").shortcut_text(shortcut(PitchUnit::Module))).clicked() {
@@ -691,7 +845,7 @@ impl GearCraftApp {
                     self.request(&ctx, Pending::Quit);
                 }
             });
-            ui.menu_button("Edit", |ui| {
+            ui.menu_button(RichText::new("Edit").size(14.0), |ui| {
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
                     self.undo();
                 }
@@ -704,20 +858,29 @@ impl GearCraftApp {
                 ui.separator();
                 let has_sel = self.selected.is_some();
                 if ui.add_enabled(has_sel, egui::Button::new("Add meshing gear").shortcut_text("M")).clicked() {
-                    self.add_gear(false);
+                    self.add_gear(Link::Mesh, false);
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Add belted pulley").shortcut_text("B")).clicked() {
+                    self.add_gear(Link::Belt, true);
                 }
                 if ui.add_enabled(has_sel, egui::Button::new("Add gear on same axle").shortcut_text("A")).clicked() {
-                    self.add_gear(true);
+                    self.add_gear(Link::Axle, false);
                 }
-                if ui.button("New train").clicked() {
-                    self.add_train();
+                if ui.add_enabled(has_sel, egui::Button::new("Add pulley on same axle").shortcut_text("P")).clicked() {
+                    self.add_gear(Link::Axle, true);
+                }
+                if ui.button("New gear train").clicked() {
+                    self.add_train(false);
+                }
+                if ui.button("New pulley train").clicked() {
+                    self.add_train(true);
                 }
                 ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Delete gear").shortcut_text("Del")).clicked() {
                     self.delete_selected();
                 }
             });
-            ui.menu_button("View", |ui| {
+            ui.menu_button(RichText::new("View").size(14.0), |ui| {
                 if ui.add(egui::Button::new("Fit to window").shortcut_text("F")).clicked() {
                     self.fit_pending = true;
                 }
@@ -727,19 +890,92 @@ impl GearCraftApp {
                 ui.checkbox(&mut self.show.base, "Base circle (selected)");
                 ui.checkbox(&mut self.show.labels, "Labels");
             });
+            chrome::bar_separator(ui);
+            if chrome::bar_icon(ui, "💾", "Save (Ctrl+S)", true) {
+                self.save(false);
+            }
+            if chrome::bar_icon(ui, "⟲", "Undo (Ctrl+Z)", !self.undo.is_empty()) {
+                self.undo();
+            }
+            if chrome::bar_icon(ui, "⟳", "Redo (Ctrl+Shift+Z)", !self.redo.is_empty()) {
+                self.redo();
+            }
+            chrome::bar_separator(ui);
+            chrome::doc_tab(ui, &self.doc_name(), self.dirty);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).size(13.0));
+            });
         });
     }
 
-    fn toolbar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Gears").strong());
+    /// The workspace card, then the ribbon: the workspace's own tools
+    /// followed by the groups every workspace shares.
+    fn ribbon(&mut self, ui: &mut Ui) {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            let card = chrome::workspace_card(ui, self.workspace.icon(), self.workspace.name())
+                .on_hover_text("Choose what to design");
+            egui::Popup::menu(&card).show(|ui| {
+                ui.set_min_width(220.0);
+                for w in Workspace::ALL {
+                    let text = RichText::new(format!("{}   {}", w.glyph(), w.name())).size(14.0);
+                    if ui.selectable_label(self.workspace == w, text).on_hover_text(w.hint()).clicked() {
+                        self.workspace = w;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Coming later").small().weak());
+                for name in Workspace::PLANNED {
+                    ui.add_enabled(false, egui::Button::new(RichText::new(name).size(14.0)).frame(false));
+                }
+            });
+            ui.add_space(4.0);
+            chrome::ribbon_frame(ui).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.workspace_tools(ui);
+                    self.shared_tools(ui);
+                    ui.add_space(ui.available_width());
+                });
+            });
+        });
+    }
+
+    fn workspace_tools(&mut self, ui: &mut Ui) {
+        let big = chrome::big_button;
+        match self.workspace {
+            Workspace::Spur => chrome::group(ui, "Create", |ui| {
+                if big(ui, Icon::Gear, "Mesh Gear", false, true).on_hover_text("A gear meshing with the selected one (M)").clicked() {
+                    self.add_gear(Link::Mesh, false);
+                }
+                if big(ui, Icon::Glyph("◎"), "Axle Gear", false, true).on_hover_text("A gear on the selected part's axle (A)").clicked() {
+                    self.add_gear(Link::Axle, false);
+                }
+                if big(ui, Icon::Glyph("➕"), "New Train", false, true).on_hover_text("A free-standing driver gear").clicked() {
+                    self.add_train(false);
+                }
+            }),
+            Workspace::Pulleys => chrome::group(ui, "Create", |ui| {
+                if big(ui, Icon::Pulley, "Belt Drive", false, true).on_hover_text("Add a pulley driven by a belt from the selected pulley (B)").clicked() {
+                    self.add_gear(Link::Belt, true);
+                }
+                if big(ui, Icon::Glyph("◎"), "Same Shaft", false, true).on_hover_text("Add a pulley on the same shaft as the selected part (P)").clicked() {
+                    self.add_gear(Link::Axle, true);
+                }
+                if big(ui, Icon::Glyph("➕"), "New Pulley", false, true).on_hover_text("Add a free-standing driver pulley").clicked() {
+                    self.add_train(true);
+                }
+            }),
+        }
+    }
+
+    fn shared_tools(&mut self, ui: &mut Ui) {
+        let big = chrome::big_button;
+        chrome::group(ui, "Units", |ui| {
             let current = self.project.pitch_unit;
-            for (unit, label, hint) in [
-                (PitchUnit::Module, "Metric", "Module pitch, dimensions in millimetres"),
-                (PitchUnit::DiametralPitch, "Inch", "Diametral pitch, dimensions in inches"),
+            for (unit, icon, label, hint) in [
+                (PitchUnit::Module, "mm", "Metric", "Module pitch, dimensions in millimetres"),
+                (PitchUnit::DiametralPitch, "in", "Inch", "Diametral pitch, dimensions in inches"),
             ] {
-                let text = RichText::new(label).strong();
-                if ui.selectable_label(current == unit, text).on_hover_text(hint).clicked() && current != unit {
+                if big(ui, Icon::Text(icon), label, current == unit, true).on_hover_text(hint).clicked() && current != unit {
                     if self.project.gears.is_empty() {
                         self.project.pitch_unit = unit;
                     } else {
@@ -747,32 +983,31 @@ impl GearCraftApp {
                     }
                 }
             }
-            ui.separator();
-            let label = if self.playing { "⏸ Pause" } else { "▶ Run" };
-            if ui.button(label).on_hover_text("Space").clicked() {
+        });
+        chrome::group(ui, "Motion", |ui| {
+            let (icon, label) = if self.playing { ("⏸", "Pause") } else { ("▶", "Run") };
+            if big(ui, Icon::Glyph(icon), label, self.playing, true).on_hover_text("Space").clicked() {
                 self.playing = !self.playing;
             }
-            if ui.button("⏮").on_hover_text("Back to the start position").clicked() {
+            if big(ui, Icon::Glyph("⏮"), "Reset", false, true).on_hover_text("Back to the start position").clicked() {
                 self.driver_angle = 0.0;
             }
-            ui.label("Driver");
-            ui.add(egui::DragValue::new(&mut self.project.driver_rpm).speed(0.1).range(-600.0..=600.0).suffix(" rpm"));
-            ui.separator();
-            if ui.button("⚙ Mesh gear").on_hover_text("Add a gear meshing with the selected one (M)").clicked() {
-                self.add_gear(false);
-            }
-            if ui.button("◎ Axle gear").on_hover_text("Add a gear on the selected gear's axle (A)").clicked() {
-                self.add_gear(true);
-            }
-            if ui.button("➕ New train").on_hover_text("Add a free-standing driver gear").clicked() {
-                self.add_train();
-            }
-            ui.separator();
-            if ui.button("Fit").on_hover_text("F").clicked() {
+            ui.vertical(|ui| {
+                ui.add_space(8.0);
+                ui.label("Driver");
+                ui.add(egui::DragValue::new(&mut self.project.driver_rpm).speed(0.1).range(-600.0..=600.0).suffix(" rpm"));
+            });
+        });
+        chrome::group(ui, "View", |ui| {
+            if big(ui, Icon::Glyph("⛶"), "Fit", false, true).on_hover_text("F, or double-click the canvas").clicked() {
                 self.fit_pending = true;
             }
-            ui.toggle_value(&mut self.show.pitch, "Pitch ○");
-            ui.toggle_value(&mut self.show.base, "Base ○");
+            if big(ui, Icon::Glyph("○"), "Pitch", self.show.pitch, true).on_hover_text("Pitch circle of the selected part").clicked() {
+                self.show.pitch = !self.show.pitch;
+            }
+            if big(ui, Icon::Glyph("◎"), "Base", self.show.base, true).on_hover_text("Base circle of the selected gear").clicked() {
+                self.show.base = !self.show.base;
+            }
         });
     }
 
@@ -786,12 +1021,17 @@ impl GearCraftApp {
                     Placement::Root { .. } => ("⏺", "driver"),
                     Placement::Mesh { .. } => ("⚙", "meshes"),
                     Placement::Axle { .. } => ("◎", "same axle"),
+                    Placement::Belt { .. } => ("🔗", "belt"),
                 };
                 ui.horizontal(|ui| {
                     ui.add_space(s.depth.min(12) as f32 * 14.0);
                     let text = RichText::new(format!("{icon}  {}", g.name));
                     let r = ui.selectable_label(self.selected == Some(g.id), text);
-                    ui.label(RichText::new(format!("{}T", g.params.teeth)).weak());
+                    let size = match g.params.belt {
+                        Some(b) => format!("{}{}", g.params.teeth, b.name()),
+                        None => format!("{}T", g.params.teeth),
+                    };
+                    ui.label(RichText::new(size).weak());
                     let r = r.on_hover_text(format!("{how} · ratio {}", fmt_ratio(s.ratio)));
                     if r.clicked() {
                         self.selected = Some(g.id);
@@ -823,6 +1063,15 @@ impl GearCraftApp {
             })
             .collect();
         let s = solved[idx].clone();
+        let earlier_pulleys: Vec<(u64, String)> = self.project.gears[..idx]
+            .iter()
+            .filter(|g| g.params.is_pulley())
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        let parent_is_pulley = parent_idx.is_some_and(|p| self.project.gears[p].params.is_pulley());
+        // Belt fits need the whole project, so they run after the panel.
+        let mut fit_req: Option<f64> = None;
+        let mut fit_start = false;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let g = &mut self.project.gears[idx];
@@ -830,91 +1079,178 @@ impl GearCraftApp {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut g.name);
             });
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                let was = g.params.is_pulley();
+                let mut pulley = was;
+                ui.selectable_value(&mut pulley, false, "⚙ Gear");
+                ui.selectable_value(&mut pulley, true, "🔗 Timing pulley");
+                if pulley != was {
+                    let (teeth, bore) = (g.params.teeth, g.params.bore);
+                    g.params = if pulley {
+                        GearParams { bore, ..unit.starter_pulley(teeth.max(10)) }
+                    } else {
+                        GearParams { bore, ..unit.starter(teeth) }
+                    };
+                    // Keep the link sensible: gears mesh, pulleys take a belt.
+                    match g.placement {
+                        Placement::Mesh { parent, angle } if pulley && parent_is_pulley => {
+                            g.placement = Placement::Belt { parent, angle, belt_teeth: 0, target: 0.0 };
+                            fit_start = true;
+                        }
+                        Placement::Belt { parent, angle, .. } if !pulley => {
+                            g.placement = Placement::Mesh { parent, angle };
+                        }
+                        _ => {}
+                    }
+                }
+            });
             ui.add_space(6.0);
 
-            let locked = g.match_parent && matches!(g.placement, Placement::Mesh { .. });
-            section(ui, "Teeth", |ui| {
-                egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("Teeth");
-                    ui.add(egui::DragValue::new(&mut g.params.teeth).range(3..=2000).speed(0.2));
-                    ui.end_row();
-
-                    ui.label(if unit.is_inch() { "Diametral pitch" } else { "Module" });
-                    ui.add_enabled_ui(!locked, |ui| ui.horizontal(|ui| pitch_input(ui, &mut g.params.module, unit)));
-                    ui.end_row();
-
-                    ui.label("Pressure angle");
-                    ui.add_enabled_ui(!locked, |ui| {
-                        ui.horizontal(|ui| {
-                            for pa in [14.5, 20.0, 25.0] {
-                                ui.selectable_value(&mut g.params.pressure_angle, pa, format!("{pa}°"));
-                            }
-                            ui.add(
-                                egui::DragValue::new(&mut g.params.pressure_angle)
-                                    .range(5.0..=40.0)
-                                    .speed(0.1)
-                                    .suffix("°"),
-                            );
-                        });
-                    });
-                    ui.end_row();
-
-                    ui.label("Tooth standard");
-                    ui.add_enabled_ui(!locked, |ui| {
-                        egui::ComboBox::from_id_salt("standard")
-                            .selected_text(g.params.standard.label())
-                            .show_ui(ui, |ui| {
-                                for st in ToothStandard::ALL {
-                                    ui.selectable_value(&mut g.params.standard, st, st.label()).on_hover_text(st.hint());
+            if let Some(mut belt) = g.params.belt {
+                let locked = g.match_parent && matches!(g.placement, Placement::Belt { .. });
+                section(ui, "Teeth", |ui| {
+                    egui::Grid::new("pulley").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Belt section");
+                        ui.add_enabled_ui(!locked, |ui| {
+                            egui::ComboBox::from_id_salt("section").selected_text(belt.label()).show_ui(ui, |ui| {
+                                for b in BeltSection::ALL {
+                                    ui.selectable_value(&mut belt, b, b.label());
                                 }
-                            })
-                            .response
-                            .on_hover_text(g.params.standard.hint());
-                    });
-                    ui.end_row();
-
-                    if matches!(g.placement, Placement::Mesh { .. }) {
-                        ui.label("");
-                        ui.checkbox(&mut g.match_parent, "Same tooth system as partner").on_hover_text(
-                            "Copy pitch, pressure angle and rack proportions from the meshing partner. \
-                             Pitch and pressure angle must match for gears to mesh.",
-                        );
-                        ui.end_row();
-                    }
-
-                    ui.label("Profile shift x");
-                    ui.add(egui::DragValue::new(&mut g.params.profile_shift).range(-1.0..=1.5).speed(0.005).max_decimals(3))
-                        .on_hover_text("Moves the cutter out (+) or in (−) by x × module. Positive shift cures undercut on small pinions.");
-                    ui.end_row();
-
-                    ui.label("Backlash");
-                    len_drag(ui, &mut g.params.backlash, unit, 0.0..=5.0, 0.002)
-                        .on_hover_text("Tooth thinning on the pitch circle. A pair's backlash is the sum of both.");
-                    ui.end_row();
-                });
-                egui::CollapsingHeader::new("Rack (advanced)").default_open(false).show(ui, |ui| {
-                    let per = if unit.is_inch() { "/P" } else { "× m" };
-                    let mut edited = false;
-                    ui.add_enabled_ui(!locked, |ui| {
-                        egui::Grid::new("rack").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                            let mut coef = |ui: &mut Ui, label: &str, v: &mut f64, range: RangeInclusive<f64>| {
-                                ui.label(label);
-                                let r = egui::DragValue::new(v).range(range).speed(0.002).max_decimals(4).suffix(per);
-                                edited |= ui.add(r).changed();
-                                ui.end_row();
-                            };
-                            coef(ui, "Addendum", &mut g.params.addendum, 0.2..=2.0);
-                            coef(ui, "Dedendum", &mut g.params.dedendum, 0.3..=2.5);
-                            coef(ui, "Root fillet radius", &mut g.params.root_fillet, 0.0..=0.6);
+                            });
                         });
+                        ui.end_row();
+                        if Some(belt) != g.params.belt {
+                            let w = belt.width_near(g.params.belt_width);
+                            g.params.belt = Some(belt);
+                            g.params.belt_width = w.width;
+                            g.params.face_width = w.unflanged;
+                            g.params.teeth = g.params.teeth.max(belt.min_teeth());
+                        }
+                        if matches!(g.placement, Placement::Belt { .. }) {
+                            ui.label("");
+                            ui.checkbox(&mut g.match_parent, "Same belt as partner")
+                                .on_hover_text("Copy the belt section and width from the pulley at the other end of the belt.");
+                            ui.end_row();
+                        }
+
+                        ui.label("Teeth");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut g.params.teeth).range(belt.min_teeth()..=400).speed(0.2));
+                            egui::ComboBox::from_id_salt("stock").selected_text("Stock sizes").show_ui(ui, |ui| {
+                                for z in belt.stock_teeth() {
+                                    ui.selectable_value(&mut g.params.teeth, z, format!("{z} teeth"));
+                                }
+                            });
+                        });
+                        ui.end_row();
+
+                        ui.label("Belt width");
+                        ui.add_enabled_ui(!locked, |ui| {
+                            let label = |w: &crate::pulley::BeltWidth| format!("{} ({})", w.code, len(w.width, unit));
+                            let current = belt.width_near(g.params.belt_width);
+                            egui::ComboBox::from_id_salt("width").selected_text(label(&current)).show_ui(ui, |ui| {
+                                for w in belt.widths() {
+                                    if ui.selectable_label(w.width == g.params.belt_width, label(w)).clicked() {
+                                        g.params.belt_width = w.width;
+                                        g.params.face_width = w.unflanged;
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
                     });
-                    if edited {
-                        g.params.standard = ToothStandard::Custom;
-                    } else if g.params.standard != ToothStandard::Custom {
-                        ui.label(RichText::new("Set by the tooth standard; editing switches to Custom.").weak().small());
-                    }
+                    ui.label(
+                        RichText::new("ISO 5294 groove. Picking a width sets the face width for an unflanged pulley.")
+                            .weak()
+                            .small(),
+                    );
                 });
-            });
+            } else {
+                let locked = g.match_parent && matches!(g.placement, Placement::Mesh { .. });
+                section(ui, "Teeth", |ui| {
+                    egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Teeth");
+                        ui.add(egui::DragValue::new(&mut g.params.teeth).range(3..=2000).speed(0.2));
+                        ui.end_row();
+
+                        ui.label(if unit.is_inch() { "Diametral pitch" } else { "Module" });
+                        ui.add_enabled_ui(!locked, |ui| ui.horizontal(|ui| pitch_input(ui, &mut g.params.module, unit)));
+                        ui.end_row();
+
+                        ui.label("Pressure angle");
+                        ui.add_enabled_ui(!locked, |ui| {
+                            ui.horizontal(|ui| {
+                                for pa in [14.5, 20.0, 25.0] {
+                                    ui.selectable_value(&mut g.params.pressure_angle, pa, format!("{pa}°"));
+                                }
+                                ui.add(
+                                    egui::DragValue::new(&mut g.params.pressure_angle)
+                                        .range(5.0..=40.0)
+                                        .speed(0.1)
+                                        .suffix("°"),
+                                );
+                            });
+                        });
+                        ui.end_row();
+
+                        ui.label("Tooth standard");
+                        ui.add_enabled_ui(!locked, |ui| {
+                            egui::ComboBox::from_id_salt("standard")
+                                .selected_text(g.params.standard.label())
+                                .show_ui(ui, |ui| {
+                                    for st in ToothStandard::ALL {
+                                        ui.selectable_value(&mut g.params.standard, st, st.label()).on_hover_text(st.hint());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(g.params.standard.hint());
+                        });
+                        ui.end_row();
+
+                        if matches!(g.placement, Placement::Mesh { .. }) {
+                            ui.label("");
+                            ui.checkbox(&mut g.match_parent, "Same tooth system as partner").on_hover_text(
+                                "Copy pitch, pressure angle and rack proportions from the meshing partner. \
+                                 Pitch and pressure angle must match for gears to mesh.",
+                            );
+                            ui.end_row();
+                        }
+
+                        ui.label("Profile shift x");
+                        ui.add(egui::DragValue::new(&mut g.params.profile_shift).range(-1.0..=1.5).speed(0.005).max_decimals(3))
+                            .on_hover_text("Moves the cutter out (+) or in (−) by x × module. Positive shift cures undercut on small pinions.");
+                        ui.end_row();
+
+                        ui.label("Backlash");
+                        len_drag(ui, &mut g.params.backlash, unit, 0.0..=5.0, 0.002)
+                            .on_hover_text("Tooth thinning on the pitch circle. A pair's backlash is the sum of both.");
+                        ui.end_row();
+                    });
+                    egui::CollapsingHeader::new("Rack (advanced)").default_open(false).show(ui, |ui| {
+                        let per = if unit.is_inch() { "/P" } else { "× m" };
+                        let mut edited = false;
+                        ui.add_enabled_ui(!locked, |ui| {
+                            egui::Grid::new("rack").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                                let mut coef = |ui: &mut Ui, label: &str, v: &mut f64, range: RangeInclusive<f64>| {
+                                    ui.label(label);
+                                    let r = egui::DragValue::new(v).range(range).speed(0.002).max_decimals(4).suffix(per);
+                                    edited |= ui.add(r).changed();
+                                    ui.end_row();
+                                };
+                                coef(ui, "Addendum", &mut g.params.addendum, 0.2..=2.0);
+                                coef(ui, "Dedendum", &mut g.params.dedendum, 0.3..=2.5);
+                                coef(ui, "Root fillet radius", &mut g.params.root_fillet, 0.0..=0.6);
+                            });
+                        });
+                        if edited {
+                            g.params.standard = ToothStandard::Custom;
+                        } else if g.params.standard != ToothStandard::Custom {
+                            ui.label(RichText::new("Set by the tooth standard; editing switches to Custom.").weak().small());
+                        }
+                    });
+                });
+            }
 
             section(ui, "Blank", |ui| {
                 egui::Grid::new("blank").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -932,23 +1268,45 @@ impl GearCraftApp {
                     Placement::Root { .. } => 0,
                     Placement::Mesh { .. } => 1,
                     Placement::Axle { .. } => 2,
+                    Placement::Belt { .. } => 3,
                 };
+                let is_pulley = g.params.is_pulley();
                 let mut new_kind = kind;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut new_kind, 0, "Fixed");
                     ui.add_enabled_ui(!earlier.is_empty(), |ui| {
-                        ui.selectable_value(&mut new_kind, 1, "Meshes with");
+                        if !is_pulley || kind == 1 {
+                            ui.selectable_value(&mut new_kind, 1, "Meshes with");
+                        }
                         ui.selectable_value(&mut new_kind, 2, "On axle of");
                     });
+                    if is_pulley || kind == 3 {
+                        ui.add_enabled_ui(!earlier_pulleys.is_empty(), |ui| {
+                            ui.selectable_value(&mut new_kind, 3, "Belt to");
+                        });
+                    }
                 });
                 if new_kind != kind {
                     let parent = g.placement.parent().or(earlier.last().map(|e| e.0)).unwrap_or(0);
+                    let angle = match g.placement {
+                        Placement::Mesh { angle, .. } => angle,
+                        _ => 0.0,
+                    };
                     g.placement = match new_kind {
                         0 => Placement::Root { x: s.center[0], y: s.center[1], phase: 0.0 },
-                        1 => Placement::Mesh { parent, angle: 0.0 },
-                        _ => Placement::Axle { parent, phase: 0.0 },
+                        1 => Placement::Mesh { parent, angle },
+                        2 => Placement::Axle { parent, phase: 0.0 },
+                        _ => {
+                            let parent = Some(parent)
+                                .filter(|p| earlier_pulleys.iter().any(|e| e.0 == *p))
+                                .or(earlier_pulleys.last().map(|e| e.0))
+                                .unwrap_or(0);
+                            fit_start = true;
+                            Placement::Belt { parent, angle, belt_teeth: 0, target: 0.0 }
+                        }
                     };
                 }
+                let belt_section = g.params.belt;
                 egui::Grid::new("place").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match &mut g.placement {
                     Placement::Root { x, y, phase } => {
                         ui.label("Centre X");
@@ -970,6 +1328,56 @@ impl GearCraftApp {
                             .on_hover_text("Angle of the line from the partner's centre to this gear's. You can also drag the gear on the canvas.");
                         ui.end_row();
                     }
+                    Placement::Belt { parent, angle, belt_teeth, target } => {
+                        ui.label("Partner");
+                        parent_combo(ui, parent, &earlier_pulleys);
+                        ui.end_row();
+                        ui.label("Direction");
+                        ui.add(egui::DragValue::new(angle).speed(0.5).range(-360.0..=360.0).suffix("°"))
+                            .on_hover_text("Angle of the line from the partner's centre to this pulley's. You can also drag the pulley on the canvas.");
+                        ui.end_row();
+
+                        ui.label("Centre distance");
+                        let actual = s.belt.as_ref().map(|b| b.center).unwrap_or(0.0);
+                        let mut want = if *target > 0.0 { *target } else { actual };
+                        let r = len_drag(ui, &mut want, unit, 1.0..=100_000.0, 0.5).on_hover_text(
+                            "The spacing you want. The belt that comes closest is picked and the pulley moves to \
+                             where that belt puts it.",
+                        );
+                        if r.changed() {
+                            fit_req = Some(want);
+                        }
+                        ui.end_row();
+                        ui.label("");
+                        let r = ui.checkbox(&mut self.belt_standard_only, "Standard belts only").on_hover_text(
+                            "Pick from the ISO 5296 stock lengths. Off: any whole number of teeth, for \
+                             made-to-order belts.",
+                        );
+                        if r.changed() {
+                            fit_req = Some(want);
+                        }
+                        ui.end_row();
+
+                        ui.label("Belt");
+                        let name = belt_section.and_then(|b| b.designation(*belt_teeth));
+                        egui::ComboBox::from_id_salt("belt")
+                            .selected_text(name.unwrap_or_else(|| "Non-standard".into()))
+                            .show_ui(ui, |ui| {
+                                for sb in belt_section.map(|b| b.standard_belts()).unwrap_or_default() {
+                                    let text = format!("{}  ·  {} teeth", sb.designation, sb.teeth);
+                                    if ui.selectable_label(*belt_teeth == sb.teeth, text).clicked() {
+                                        *belt_teeth = sb.teeth;
+                                        *target = 0.0;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Belt teeth");
+                        if ui.add(egui::DragValue::new(belt_teeth).range(10..=5000).speed(0.2)).changed() {
+                            *target = 0.0;
+                        }
+                        ui.end_row();
+                    }
                     Placement::Axle { parent, phase } => {
                         ui.label("Shares axle with");
                         parent_combo(ui, parent, &earlier);
@@ -982,10 +1390,29 @@ impl GearCraftApp {
             });
 
             let p = g.params.clone();
+            let asked = match g.placement {
+                Placement::Belt { target, .. } => target,
+                _ => 0.0,
+            };
             let fmt = |v: f64| len(v, unit);
             let mut issues = p.issues(fmt);
             section(ui, "Dimensions", |ui| {
                 if !p.is_buildable() {
+                    return;
+                }
+                if let Some(b) = p.belt {
+                    let rack = b.rack(p.teeth);
+                    let w = b.width_near(p.belt_width);
+                    egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        value_row(ui, "Pitch Ø", fmt(2.0 * p.pitch_radius()));
+                        value_row(ui, "Outside Ø", fmt(2.0 * p.tip_radius()));
+                        value_row(ui, "Root Ø", fmt(2.0 * p.root_radius()));
+                        value_row(ui, "Belt pitch", fmt(b.pitch()));
+                        value_row(ui, "Groove depth", fmt(rack.hr));
+                        value_row(ui, "Pitch line differential", fmt(rack.pld));
+                        value_row(ui, "Min face, flanged", fmt(w.flanged));
+                        value_row(ui, "Min face, unflanged", fmt(w.unflanged));
+                    });
                     return;
                 }
                 egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
@@ -1030,6 +1457,24 @@ impl GearCraftApp {
                     });
                 });
             }
+            if let (Some(bi), Some(pn)) = (&s.belt, &parent_name) {
+                issues.extend(bi.issues());
+                section(ui, &format!("Belt to {pn}"), |ui| {
+                    egui::Grid::new("beltinfo").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        value_row(ui, "Belt", bi.designation.clone().unwrap_or_else(|| "Non-standard length".into()));
+                        value_row(ui, "Belt teeth", bi.teeth.to_string());
+                        value_row(ui, "Pitch length", fmt(bi.length));
+                        value_row(ui, "Centre distance", fmt(bi.center));
+                        if asked > 0.0 && (bi.center - asked).abs() > 1e-6 {
+                            let d = bi.center - asked;
+                            value_row(ui, "Asked for", fmt(asked));
+                            value_row(ui, "Difference", format!("{}{}", if d > 0.0 { "+" } else { "" }, fmt(d)));
+                        }
+                        value_row(ui, "Wrap, smaller pulley", format!("{:.1}°", bi.wrap.to_degrees()));
+                        value_row(ui, "Teeth in mesh", format!("{:.1}", bi.teeth_in_mesh));
+                    });
+                });
+            }
             for o in others {
                 issues.push(Issue { level: Level::Error, text: format!("Overlaps {o} without meshing.") });
             }
@@ -1046,6 +1491,22 @@ impl GearCraftApp {
                 ui.label(RichText::new(format!("{icon} {}", is.text)).color(color));
             }
         });
+
+        let g = &self.project.gears[idx];
+        let id = g.id;
+        if fit_start {
+            let pp = g.placement.parent().and_then(|p| self.project.get(p));
+            fit_req = pp.map(|pp| train::starting_center(&pp.params, &g.params));
+        }
+        if let Some(t) = fit_req {
+            if self.project.fit_belt(id, t, self.belt_standard_only).is_none() {
+                self.flash("No belt fits: both ends need pulleys of the same belt section.");
+            } else if fit_start {
+                if let Placement::Belt { target, .. } = &mut self.project.gears[idx].placement {
+                    *target = 0.0;
+                }
+            }
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -1061,7 +1522,7 @@ impl GearCraftApp {
             ui.separator();
             ui.label(format!("{:.2} px/mm", self.view.scale));
             ui.separator();
-            ui.label(format!("{} gears", self.project.gears.len()));
+            ui.label(format!("{} parts", self.project.gears.len()));
             if let Some((msg, at)) = &self.status {
                 if at.elapsed() < Duration::from_secs(6) {
                     ui.separator();
@@ -1106,10 +1567,16 @@ impl GearCraftApp {
             self.fit_pending = true;
         }
         if key(Key::M) {
-            self.add_gear(false);
+            self.add_gear(Link::Mesh, false);
+        }
+        if key(Key::B) {
+            self.add_gear(Link::Belt, true);
         }
         if key(Key::A) {
-            self.add_gear(true);
+            self.add_gear(Link::Axle, false);
+        }
+        if key(Key::P) {
+            self.add_gear(Link::Axle, true);
         }
         if key(Key::Delete) {
             self.delete_selected();
@@ -1206,12 +1673,7 @@ impl GearCraftApp {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let name = self
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into());
+        let name = self.doc_name();
         let title = format!("{}{name} — GearCraft", if self.dirty { "• " } else { "" });
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1236,12 +1698,14 @@ impl eframe::App for GearCraftApp {
             ctx.request_repaint();
         }
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
+        egui::Panel::top("menu")
+            .exact_size(chrome::APP_BAR_HEIGHT)
+            .frame(chrome::app_bar_frame())
+            .show_separator_line(false)
+            .show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::top("ribbon")
+            .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::same(6)))
+            .show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("tree").resizable(true).default_size(220.0).min_size(160.0).show(ui, |ui| self.tree(ui));
         egui::Panel::right("props")
@@ -1370,5 +1834,39 @@ fn fmt_period(rpm: f64) -> String {
         format!("{:.3} h", secs / 3600.0)
     } else {
         format!("{:.3} days", secs / 86400.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    /// Renders the window offscreen to GEARCRAFT_SHOT (a PNG path) so the
+    /// layout can be looked at without opening a window. Skipped unless set.
+    #[test]
+    fn screenshot() {
+        let Ok(out) = std::env::var("GEARCRAFT_SHOT") else { return };
+        let file = std::env::var("GEARCRAFT_SHOT_FILE").ok().map(PathBuf::from);
+        let dark = std::env::var("GEARCRAFT_SHOT_LIGHT").is_err();
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(1400.0, 860.0))
+            .with_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light })
+            .wgpu()
+            .build_eframe(|cc| GearCraftApp::new(cc, file));
+        for _ in 0..4 {
+            harness.step();
+        }
+        if let Some(a) = std::env::var("GEARCRAFT_SHOT_ANGLE").ok().and_then(|a| a.parse::<f64>().ok()) {
+            harness.state_mut().driver_angle = a.to_radians();
+            harness.step();
+        }
+        if let Ok(ws) = std::env::var("GEARCRAFT_SHOT_MENU") {
+            harness.get_by_label(&ws).click();
+            for _ in 0..4 {
+                harness.step();
+            }
+        }
+        harness.render().unwrap().save(out).unwrap();
     }
 }

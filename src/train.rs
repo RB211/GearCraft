@@ -1,9 +1,11 @@
-//! The project: a gear train as a list of gears, each either fixed in space
-//! (a root), meshing with an earlier gear, or sharing an earlier gear's
-//! axle (a compound gear). Parents always come before their children in
-//! `gears`, so the train can be solved in one pass and can never loop.
+//! The project: a gear train as a list of gears and timing pulleys, each
+//! either fixed in space (a root), meshing with an earlier gear, belted to
+//! an earlier pulley, or sharing an earlier gear's axle (a compound).
+//! Parents always come before their children in `gears`, so the train can
+//! be solved in one pass and can never loop.
 
-use crate::gear::{self, GearParams, MeshInfo, ToothStandard};
+use crate::gear::{self, GearParams, Issue, MeshInfo, ToothStandard};
+use crate::pulley::{self, BeltSection};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
@@ -16,15 +18,36 @@ pub enum Placement {
     Mesh { parent: u64, angle: f64 },
     /// On the same arbor as `parent`, turning with it; `phase` in degrees.
     Axle { parent: u64, phase: f64 },
+    /// A pulley driven from pulley `parent` by an open belt of
+    /// `belt_teeth` teeth; the belt sets the centre distance along
+    /// `angle`. `target` is the centre distance last asked for (0 if
+    /// none), kept to show how close the chosen belt came.
+    Belt {
+        parent: u64,
+        angle: f64,
+        belt_teeth: u32,
+        #[serde(default)]
+        target: f64,
+    },
 }
 
 impl Placement {
     pub fn parent(&self) -> Option<u64> {
         match *self {
             Placement::Root { .. } => None,
-            Placement::Mesh { parent, .. } | Placement::Axle { parent, .. } => Some(parent),
+            Placement::Mesh { parent, .. } | Placement::Axle { parent, .. } | Placement::Belt { parent, .. } => {
+                Some(parent)
+            }
         }
     }
+}
+
+/// How a new gear is attached to its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    Mesh,
+    Axle,
+    Belt,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +105,22 @@ impl PitchUnit {
     pub fn decimals(self) -> usize {
         if self.is_inch() { 4 } else { 3 }
     }
+    /// A sensible fresh pulley: XL, the section most often stocked, with
+    /// a 3/8 in belt.
+    pub fn starter_pulley(self, teeth: u32) -> GearParams {
+        let width = BeltSection::Xl.width_near(9.5);
+        let mut p = GearParams {
+            teeth,
+            belt: Some(BeltSection::Xl),
+            belt_width: width.width,
+            face_width: width.unflanged,
+            bore: if self.is_inch() { 0.25 * 25.4 } else { 6.0 },
+            ..Default::default()
+        };
+        p.apply_standard();
+        p
+    }
+
     /// A sensible fresh gear in this system.
     pub fn starter(self, teeth: u32) -> GearParams {
         match self {
@@ -127,7 +166,47 @@ pub struct Solved {
     /// Rotation of the local outline when the driver is at angle 0.
     pub phase: f64,
     pub mesh: Option<MeshInfo>,
+    pub belt: Option<BeltInfo>,
     pub depth: usize,
+}
+
+/// How a belted pulley pair sits.
+#[derive(Clone, Debug)]
+pub struct BeltInfo {
+    pub center: f64,
+    /// Belt pitch length, mm.
+    pub length: f64,
+    pub teeth: u32,
+    /// ISO 5296 designation, if the belt is a standard length.
+    pub designation: Option<String>,
+    /// Wrap on the smaller pulley, radians, and the teeth engaged there.
+    pub wrap: f64,
+    pub teeth_in_mesh: f64,
+    /// The belt cannot reach round both pulleys.
+    pub too_short: bool,
+    /// Not two pulleys of the same section.
+    pub mismatch: bool,
+}
+
+impl BeltInfo {
+    pub fn issues(&self) -> Vec<Issue> {
+        let mut out = Vec::new();
+        if self.mismatch {
+            out.push(Issue::error("A belt needs a pulley at each end, both for the same belt section."));
+            return out;
+        }
+        if self.too_short {
+            out.push(Issue::error("The belt is too short to go round both pulleys."));
+            return out;
+        }
+        if self.teeth_in_mesh < 6.0 {
+            out.push(Issue::warn(format!(
+                "Only {:.1} teeth engaged on the smaller pulley; belts want 6 or more.",
+                self.teeth_in_mesh
+            )));
+        }
+        out
+    }
 }
 
 impl Project {
@@ -136,7 +215,7 @@ impl Project {
         let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit };
         let a = p.add_root(unit.starter(20), 0.0, 0.0);
         let wheel = GearParams { bore: unit.starter(40).bore * 1.25, ..unit.starter(40) };
-        p.add_child(a, wheel, false);
+        p.add_child(a, wheel, Link::Mesh);
         p
     }
 
@@ -144,7 +223,8 @@ impl Project {
     /// pitch of the new system, with that system's usual tooth standard.
     /// Gears with custom rack proportions keep them.
     pub fn convert_to(&mut self, unit: PitchUnit) {
-        for g in &mut self.gears {
+        // Pulleys keep their belt section: its pitch is fixed either way.
+        for g in self.gears.iter_mut().filter(|g| !g.params.is_pulley()) {
             let p = &mut g.params;
             let custom = p.standard == ToothStandard::Custom;
             match unit {
@@ -210,27 +290,25 @@ impl Project {
         id
     }
 
-    /// Add a gear meshing with (or on the axle of) `parent`, inserted after
-    /// the parent's subtree so the list keeps reading like the train.
-    pub fn add_child(&mut self, parent: u64, mut params: GearParams, on_axle: bool) -> u64 {
+    /// Add a gear or pulley attached to `parent`, inserted after the
+    /// parent's subtree so the list keeps reading like the train.
+    pub fn add_child(&mut self, parent: u64, mut params: GearParams, link: Link) -> u64 {
         let Some(pi) = self.index_of(parent) else { return 0 };
         let pp = self.gears[pi].params.clone();
-        params.module = pp.module;
-        params.pressure_angle = pp.pressure_angle;
-        let placement = if on_axle {
-            Placement::Axle { parent, phase: 0.0 }
-        } else {
-            // Point away from the parent's own parent so a chain grows
-            // outward instead of folding back on itself.
+        // Point away from the parent's own parent so a chain grows outward
+        // instead of folding back on itself, and clear of its siblings.
+        let direction = || {
             let angle = match &self.gears[pi].placement {
-                Placement::Mesh { angle, .. } => *angle,
+                Placement::Mesh { angle, .. } | Placement::Belt { angle, .. } => *angle,
                 _ => 0.0,
             };
             let taken: Vec<f64> = self
                 .gears
                 .iter()
                 .filter_map(|g| match g.placement {
-                    Placement::Mesh { parent: p, angle } if p == parent => Some(angle),
+                    Placement::Mesh { parent: p, angle } | Placement::Belt { parent: p, angle, .. } if p == parent => {
+                        Some(angle)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -238,12 +316,31 @@ impl Project {
             while taken.iter().any(|t| ((t - a + 540.0) % 360.0 - 180.0).abs() < 30.0) {
                 a += 60.0;
             }
-            Placement::Mesh { parent, angle: a % 360.0 }
+            a % 360.0
+        };
+        let placement = match link {
+            Link::Axle => Placement::Axle { parent, phase: 0.0 },
+            Link::Mesh => {
+                params.module = pp.module;
+                params.pressure_angle = pp.pressure_angle;
+                Placement::Mesh { parent, angle: direction() }
+            }
+            Link::Belt => {
+                params.belt = pp.belt.or(params.belt);
+                params.belt_width = pp.belt_width;
+                params.apply_standard();
+                let section = params.belt.unwrap_or(BeltSection::Xl);
+                let (rp, rc) = (pp.pitch_radius(), params.pitch_radius());
+                let belt_teeth = pulley::belt_for_center(section, rp, rc, starting_center(&pp, &params), true)
+                    .map(|(t, _)| t)
+                    .unwrap_or(100);
+                Placement::Belt { parent, angle: direction(), belt_teeth, target: 0.0 }
+            }
         };
         let id = self.fresh_id();
         let name = self.fresh_name();
         let at = self.subtree_end(pi);
-        self.gears.insert(at, Gear { id, name, params, placement, match_parent: !on_axle });
+        self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle });
         id
     }
 
@@ -292,6 +389,16 @@ impl Project {
                 match self.gears[..i].iter().position(|g| g.id == p) {
                     Some(pi) => {
                         let meshes = matches!(self.gears[i].placement, Placement::Mesh { .. });
+                        let belted = matches!(self.gears[i].placement, Placement::Belt { .. });
+                        if belted && self.gears[i].match_parent && self.gears[pi].params.is_pulley() {
+                            let (belt, width) = (self.gears[pi].params.belt, self.gears[pi].params.belt_width);
+                            let c = &mut self.gears[i].params;
+                            if c.belt != belt || c.belt_width != width {
+                                c.face_width = belt.map(|b| b.width_near(width).unflanged).unwrap_or(c.face_width);
+                            }
+                            c.belt = belt;
+                            c.belt_width = width;
+                        }
                         if meshes && self.gears[i].match_parent {
                             let src = self.gears[pi].params.clone();
                             let dst = &mut self.gears[i].params;
@@ -330,22 +437,78 @@ impl Project {
                         ratio: -ps.ratio * zp / zc,
                         phase,
                         mesh: Some(mi),
+                        belt: None,
+                        depth: ps.depth + 1,
+                    }
+                }
+                (Placement::Belt { angle, belt_teeth, .. }, Some(pi)) => {
+                    let pg = &self.gears[pi];
+                    let ps = &out[pi];
+                    let bi = belt_info(&pg.params, &g.params, *belt_teeth);
+                    let beta = angle.to_radians();
+                    let (zp, zc) = (pg.params.teeth as f64, g.params.teeth as f64);
+                    let center = [ps.center[0] + bi.center * beta.cos(), ps.center[1] + bi.center * beta.sin()];
+                    // Turn this pulley so its grooves take the belt teeth
+                    // that the parent's grooves put on the belt.
+                    let (rp, rc) = (pg.params.pitch_radius(), g.params.pitch_radius());
+                    let phase = match pulley::BeltLoop::new(ps.center, rp, center, rc) {
+                        Some(lp) if !bi.too_short && !bi.mismatch => {
+                            let s0 = lp.s_on_first(ps.phase + pulley::groove_angle(pg.params.teeth));
+                            lp.angle_on_second(s0) - pulley::groove_angle(g.params.teeth)
+                        }
+                        _ => 0.0,
+                    };
+                    Solved {
+                        center,
+                        // An open belt turns both pulleys the same way.
+                        ratio: ps.ratio * zp / zc,
+                        phase,
+                        mesh: None,
+                        belt: Some(bi),
                         depth: ps.depth + 1,
                     }
                 }
                 (Placement::Axle { phase, .. }, Some(pi)) => {
                     let ps = &out[pi];
-                    Solved { center: ps.center, ratio: ps.ratio, phase: ps.phase + phase.to_radians(), mesh: None, depth: ps.depth + 1 }
+                    Solved {
+                        center: ps.center,
+                        ratio: ps.ratio,
+                        phase: ps.phase + phase.to_radians(),
+                        mesh: None,
+                        belt: None,
+                        depth: ps.depth + 1,
+                    }
                 }
-                (Placement::Root { x, y, phase }, _) => {
-                    Solved { center: [*x, *y], ratio: 1.0, phase: phase.to_radians(), mesh: None, depth: 0 }
-                }
+                (Placement::Root { x, y, phase }, _) => Solved {
+                    center: [*x, *y],
+                    ratio: 1.0,
+                    phase: phase.to_radians(),
+                    mesh: None,
+                    belt: None,
+                    depth: 0,
+                },
                 // Unreachable after normalize(); draw it at the origin.
-                (_, None) => Solved { center: [0.0, 0.0], ratio: 1.0, phase: 0.0, mesh: None, depth: 0 },
+                (_, None) => Solved { center: [0.0, 0.0], ratio: 1.0, phase: 0.0, mesh: None, belt: None, depth: 0 },
             };
             out.push(s);
         }
         out
+    }
+
+    /// Change a belted pulley's belt to the one whose centre distance comes
+    /// closest to `target` (standard lengths only if `standard_only`); the
+    /// pulley then moves to where that belt puts it.
+    pub fn fit_belt(&mut self, id: u64, target: f64, standard_only: bool) -> Option<(u32, f64)> {
+        let i = self.index_of(id)?;
+        let pi = self.gears[i].placement.parent().and_then(|p| self.index_of(p))?;
+        let (pp, cp) = (&self.gears[pi].params, &self.gears[i].params);
+        let section = cp.belt.filter(|s| pp.belt == Some(*s))?;
+        let found = pulley::belt_for_center(section, pp.pitch_radius(), cp.pitch_radius(), target, standard_only)?;
+        if let Placement::Belt { belt_teeth, target: t, .. } = &mut self.gears[i].placement {
+            *belt_teeth = found.0;
+            *t = target;
+        }
+        Some(found)
     }
 
     /// Pairs of gears whose tip circles overlap without meshing or sharing
@@ -373,6 +536,35 @@ impl Project {
     }
 }
 
+/// Where a new belt drive starts: about a pulley diameter of daylight
+/// between the two.
+pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
+    a.tip_radius() + b.tip_radius() + 2.0 * a.pitch_radius().max(b.pitch_radius())
+}
+
+fn belt_info(a: &GearParams, b: &GearParams, belt_teeth: u32) -> BeltInfo {
+    let section = a.belt.filter(|s| b.belt == Some(*s));
+    let mismatch = section.is_none();
+    let pitch = section.or(a.belt).or(b.belt).map(|s| s.pitch()).unwrap_or(PI * a.module);
+    let (ra, rb) = (a.pitch_radius(), b.pitch_radius());
+    let length = belt_teeth as f64 * pitch;
+    let solved = pulley::center_distance(ra, rb, length);
+    // Too short: park the pulley just clear so it is still visible.
+    let center = solved.unwrap_or(a.tip_radius() + b.tip_radius() + pitch);
+    let wrap = pulley::small_wrap(ra, rb, center);
+    let small = if ra <= rb { a.teeth } else { b.teeth };
+    BeltInfo {
+        center,
+        length,
+        teeth: belt_teeth,
+        designation: section.and_then(|s| s.designation(belt_teeth)),
+        wrap,
+        teeth_in_mesh: small as f64 * wrap / (2.0 * PI),
+        too_short: solved.is_none(),
+        mismatch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,9 +582,9 @@ mod tests {
     fn compound_train_ratio_multiplies() {
         let mut p = Project::empty();
         let a = p.add_root(GearParams { teeth: 10, ..Default::default() }, 0.0, 0.0);
-        let b = p.add_child(a, GearParams { teeth: 60, ..Default::default() }, false);
-        let c = p.add_child(b, GearParams { teeth: 8, ..Default::default() }, true);
-        let _d = p.add_child(c, GearParams { teeth: 64, ..Default::default() }, false);
+        let b = p.add_child(a, GearParams { teeth: 60, ..Default::default() }, Link::Mesh);
+        let c = p.add_child(b, GearParams { teeth: 8, ..Default::default() }, Link::Axle);
+        let _d = p.add_child(c, GearParams { teeth: 64, ..Default::default() }, Link::Mesh);
         let s = p.solve();
         assert!((s[3].ratio - 10.0 / 60.0 * 8.0 / 64.0).abs() < 1e-12);
     }
@@ -420,7 +612,7 @@ mod tests {
         let mut p = Project::empty();
         let pa = GearParams { teeth: za, profile_shift: xa, backlash: 0.05, ..Default::default() };
         let a = p.add_root(pa, 0.0, 0.0);
-        let b = p.add_child(a, GearParams { teeth: zb, profile_shift: xb, backlash: 0.05, ..Default::default() }, false);
+        let b = p.add_child(a, GearParams { teeth: zb, profile_shift: xb, backlash: 0.05, ..Default::default() }, Link::Mesh);
         if let Placement::Mesh { angle, .. } = &mut p.gears[1].placement {
             *angle = dir;
         }
@@ -457,10 +649,56 @@ mod tests {
     }
 
     #[test]
+    fn belted_pulleys_turn_together_at_tooth_ratio() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::DiametralPitch.starter_pulley(20), 0.0, 0.0);
+        let b = p.add_child(a, PitchUnit::DiametralPitch.starter_pulley(40), Link::Belt);
+        p.normalize();
+        let s = p.solve();
+        let bi = s[1].belt.as_ref().unwrap();
+        assert!(bi.designation.is_some(), "starts on a standard belt");
+        assert!((s[1].ratio - 0.5).abs() < 1e-12, "same direction, 20:40");
+        let c = s[1].center[0].hypot(s[1].center[1]);
+        let (ra, rb) = (p.gears[0].params.pitch_radius(), p.gears[1].params.pitch_radius());
+        assert!((pulley::belt_length(ra, rb, c) - bi.length).abs() < 1e-6);
+        assert!(bi.issues().is_empty(), "{:?}", bi.issues());
+
+        // Ask for 150 mm: the nearest standard XL belt, and the pulley moves.
+        let (teeth, got) = p.fit_belt(b, 150.0, true).unwrap();
+        assert!(BeltSection::Xl.designation(teeth).is_some());
+        let s = p.solve();
+        assert!((s[1].center[0].hypot(s[1].center[1]) - got).abs() < 1e-9);
+        assert!((got - 150.0).abs() < 5.08, "within half a belt pitch step");
+
+        // The driven pulley's grooves sit under belt teeth: a groove centre
+        // on pulley 2 maps to a whole number of pitches from one on pulley 1.
+        let s = p.solve();
+        let (pa, pb) = (&p.gears[0].params, &p.gears[1].params);
+        let lp = pulley::BeltLoop::new(s[0].center, pa.pitch_radius(), s[1].center, pb.pitch_radius()).unwrap();
+        let s1 = lp.s_on_first(s[0].phase + pulley::groove_angle(pa.teeth));
+        let groove2 = s[1].phase + pulley::groove_angle(pb.teeth);
+        let s2 = lp.angle_on_second(s1);
+        let k = (groove2 - s2) / (2.0 * PI / pb.teeth as f64);
+        assert!((k - k.round()).abs() < 1e-9, "{k}");
+        let len = lp.len();
+        assert!((len - s[1].belt.as_ref().unwrap().length).abs() < 1e-6, "{len}");
+    }
+
+    #[test]
+    fn belt_to_a_gear_is_flagged() {
+        let mut p = Project::empty();
+        let a = p.add_root(GearParams::default(), 0.0, 0.0);
+        p.add_child(a, PitchUnit::Module.starter_pulley(20), Link::Belt);
+        p.normalize();
+        let s = p.solve();
+        assert!(s[1].belt.as_ref().unwrap().mismatch);
+    }
+
+    #[test]
     fn remove_takes_the_subtree() {
         let mut p = Project::default();
         let first = p.gears[1].id;
-        p.add_child(first, GearParams::default(), true);
+        p.add_child(first, GearParams::default(), Link::Axle);
         p.remove(first);
         assert_eq!(p.gears.len(), 1);
     }
