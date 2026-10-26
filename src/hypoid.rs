@@ -564,6 +564,10 @@ pub struct Blank {
     /// Cone distances of the toe and heel.
     pub inner: f64,
     pub outer: f64,
+    /// A throated worm wheel's tip (its pitch cone flat, a cylinder): the
+    /// torus round the worm's axis, as (centre distance, torus radius,
+    /// height of the worm's axis). The face cone is then the rim.
+    pub throat: Option<[f64; 3]>,
 }
 
 impl Blank {
@@ -586,12 +590,23 @@ impl Blank {
         self.inside(rz, 0.0, 0.0)
     }
 
-    /// Depth of the face cone on the section at cone distance s.
+    /// Depth of the face cone (or throat) on the section at cone distance s.
     pub fn tip(&self, s: f64) -> f64 {
         let (g, n) = ([self.pitch.sin(), self.pitch.cos()], [self.pitch.cos(), -self.pitch.sin()]);
         let na = [self.face_angle.cos(), -self.face_angle.sin()];
         let base = [s * g[0] - self.face_point[0], s * g[1] - self.face_point[1]];
-        -(base[0] * na[0] + base[1] * na[1]) / (n[0] * na[0] + n[1] * na[1])
+        let rim = -(base[0] * na[0] + base[1] * na[1]) / (n[0] * na[0] + n[1] * na[1]);
+        match self.throat {
+            Some([a, rt, zw]) if (s - zw).abs() < rt => rim.min(a - (rt * rt - (s - zw) * (s - zw)).sqrt()),
+            _ => rim,
+        }
+    }
+
+    /// A radius to turn azimuths into lengths on the section at s: the
+    /// pitch cone's, or on a cylinder (pitch angle 0), the tip's.
+    pub fn arc_radius(&self, s: f64) -> f64 {
+        let r = s * self.pitch.sin();
+        if r > 1e-9 { r } else { self.face_point[0] }
     }
 }
 
@@ -617,6 +632,7 @@ impl Design {
             face_angle: self.ring_face_angle(),
             inner: self.ring_inner,
             outer: self.ring_outer,
+            throat: None,
         }
     }
 
@@ -657,6 +673,7 @@ impl Design {
             face_angle: self.pinion_face_angle(),
             inner: lo - pad,
             outer: hi + pad,
+            throat: None,
         }
     }
 
@@ -736,6 +753,14 @@ impl Member {
         section_point(self.blank.pitch, s, t, phi)
     }
 
+    /// Millimetres per radian of azimuth on section k, for laying its end
+    /// face out flat: the pitch radius there, or on a cylinder the middle
+    /// of the teeth.
+    pub fn arc_scale(&self, k: usize) -> f64 {
+        let r = self.stations[k] * self.blank.pitch.sin();
+        if r > 1e-9 { r } else { (self.t_root[k] + self.t_tip[k]) / 2.0 }
+    }
+
     /// Heights of the toe and heel flat faces, and their radii.
     pub fn hub_faces(&self) -> [(f64, f64); 2] {
         let k = self.stations.len() - 1;
@@ -761,18 +786,19 @@ impl Member {
 pub const PROFILE_POINTS: usize = 32;
 pub const SECTIONS: usize = 11;
 
-/// What a gear's sections are solved from: `gap(s, t, φ)` is positive in
-/// the tooth space and negative in the tooth.
-fn build_member(
+/// What a gear's `sections` sections are solved from: `gap(s, t, φ)` is
+/// positive in the tooth space and negative in the tooth.
+pub(crate) fn build_member(
     teeth: u32,
     blank: Blank,
     bore: f64,
     hub: [f64; 2],
+    sections: usize,
     gap: &(dyn Fn(f64, f64, f64) -> f64 + Sync),
 ) -> Result<Member, String> {
     let pitch = TAU / teeth as f64;
     let stations: Vec<f64> =
-        (0..SECTIONS).map(|k| blank.inner + (blank.outer - blank.inner) * k as f64 / (SECTIONS - 1) as f64).collect();
+        (0..sections).map(|k| blank.inner + (blank.outer - blank.inner) * k as f64 / (sections - 1) as f64).collect();
     let results: Vec<Result<(f64, f64, Vec<[f64; 2]>, Vec<[f64; 2]>), String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = stations.iter().map(|&s| scope.spawn(move || section(s, pitch, &blank, gap))).collect();
         handles.into_iter().map(|h| h.join().unwrap_or(Err("section failed".into()))).collect()
@@ -798,9 +824,9 @@ fn build_member(
     // Each section finds its own slot, which can be a pitch away from its
     // neighbour's: shift sections by whole pitches so tooth 0 runs
     // continuously across the face, anchored on the middle section.
-    let mid = SECTIONS / 2;
+    let mid = sections / 2;
     let centre = |m: &Member, k: usize| m.right[k][PROFILE_POINTS / 2][1];
-    for order in [(mid + 1..SECTIONS).collect::<Vec<_>>(), (0..mid).rev().collect()] {
+    for order in [(mid + 1..sections).collect::<Vec<_>>(), (0..mid).rev().collect()] {
         for k in order {
             let prev = if k > mid { k - 1 } else { k + 1 };
             let shift = ((centre(&m, prev) - centre(&m, k)) / pitch).round() * pitch;
@@ -811,7 +837,7 @@ fn build_member(
             }
         }
     }
-    let k = SECTIONS - 1;
+    let k = sections - 1;
     m.hub = [m.t_root[0] - hub[0], m.t_root[k] - hub[1]];
     Ok(m)
 }
@@ -859,7 +885,7 @@ fn clear_tips(mut blank: Blank, pitch: f64, land: f64, gap: &(dyn Fn(f64, f64, f
 }
 
 /// Maximise f on [a, b] by golden section.
-fn golden(f: &dyn Fn(f64) -> f64, mut a: f64, mut b: f64, iters: usize) -> (f64, f64) {
+pub(crate) fn golden(f: &dyn Fn(f64) -> f64, mut a: f64, mut b: f64, iters: usize) -> (f64, f64) {
     let k = 0.5 * (5f64.sqrt() - 1.0);
     let (mut c, mut d) = (b - k * (b - a), a + k * (b - a));
     let (mut fc, mut fd) = (f(c), f(d));
@@ -939,7 +965,7 @@ fn section(
 ) -> Result<(f64, f64, Vec<[f64; 2]>, Vec<[f64; 2]>), String> {
     let t_tip = blank.tip(s);
     // Work in (depth, arc along the pitch circle) so both axes are mm.
-    let rs = s * blank.pitch.sin();
+    let rs = blank.arc_radius(s);
     let f = |p: [f64; 2]| gap(s, p[0], p[1] / rs);
     let scale = pitch * rs;
     // Tooth and space middles at the tip, from a scan round one pitch.
@@ -1084,7 +1110,7 @@ impl Design {
         let blank = self.ring_blank();
         let gap = |s: f64, t: f64, phi: f64| self.any_slot(section_point(blank.pitch, s, t, phi), 0.0);
         let h = self.depth;
-        let mut m = build_member(self.spec.ring_teeth, blank, self.spec.ring_bore, [1.5 * h, 0.5 * h], &gap)?;
+        let mut m = build_member(self.spec.ring_teeth, blank, self.spec.ring_bore, [1.5 * h, 0.5 * h], SECTIONS, &gap)?;
         // Near a face gear the toe and heel faces come level, or cross:
         // keep the back (heel) face at least half a tooth depth behind the
         // front.
@@ -1132,7 +1158,7 @@ impl Design {
         let h = self.depth;
         // The usual least top land for bevel gears: a quarter module.
         let blank = clear_tips(blank, TAU / zp, 0.25 * self.spec.module, &gap);
-        let mut m = build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], &gap)?;
+        let mut m = build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], SECTIONS, &gap)?;
         // A slender pinion (a bevel worm's) has little below its roots:
         // keep the hub circles clear of the bore and off the axis.
         let (sg, cg) = m.blank.pitch.sin_cos();

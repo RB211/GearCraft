@@ -13,6 +13,7 @@
 use crate::bevel::{Bevel, BevelGeom};
 use crate::hypoid::Role;
 use crate::pulley::{self, BeltSection};
+use crate::worm;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
 
@@ -64,6 +65,13 @@ pub struct GearParams {
     /// starts.
     #[serde(default)]
     pub worm: bool,
+    /// Set for half of a cylindrical worm drive. The pair's geometry lives
+    /// on the wheel's placement; the wheel's `module` (the worm's axial
+    /// module), `pressure_angle` (normal), `face_width` and `backlash` set
+    /// the teeth, and the worm's `teeth` are its starts and its
+    /// `face_width` its threaded length.
+    #[serde(default)]
+    pub worm_drive: Option<worm::Role>,
 }
 
 impl Default for GearParams {
@@ -85,6 +93,7 @@ impl Default for GearParams {
             bevel: None,
             hypoid: None,
             worm: false,
+            worm_drive: None,
         }
     }
 }
@@ -232,6 +241,15 @@ impl GearParams {
     pub fn is_hypoid(&self) -> bool {
         self.hypoid.is_some()
     }
+    /// Teeth generated as a pair, off the UI thread: hypoid and spiral
+    /// bevel sets, bevel worms and worm drives.
+    pub fn is_generated(&self) -> bool {
+        self.hypoid.is_some() || self.worm_drive.is_some()
+    }
+    /// A worm's thread count is its starts, kept to the worm's own range.
+    pub fn is_worm_thread(&self) -> bool {
+        (self.worm && self.hypoid == Some(Role::Pinion)) || self.worm_drive == Some(worm::Role::Worm)
+    }
     /// Outside radius (a pulley's lies the pitch-line differential inside
     /// its pitch circle).
     pub fn tip_radius(&self) -> f64 {
@@ -239,6 +257,12 @@ impl GearParams {
         match self.hypoid {
             Some(Role::Ring) => return self.pitch_radius() + self.module,
             Some(Role::Pinion) => return 1.6 * self.pitch_radius() + 2.0 * self.module,
+            None => {}
+        }
+        // The worm's diameter is on its wheel's placement: this is typical.
+        match self.worm_drive {
+            Some(worm::Role::Worm) => return worm::default_diameter(self.module) / 2.0 + self.module,
+            Some(worm::Role::Wheel) => return self.pitch_radius() + 1.5 * self.module,
             None => {}
         }
         if let Some(g) = self.bevel.and_then(|_| BevelGeom::new(self)) {
@@ -283,6 +307,9 @@ impl GearParams {
         if self.is_hypoid() {
             return self.module > 0.0 && self.teeth >= 3;
         }
+        if self.worm_drive.is_some() {
+            return self.module > 0.0 && self.teeth >= 1;
+        }
         if self.is_bevel() {
             return BevelGeom::new(self).is_some();
         }
@@ -300,8 +327,8 @@ impl GearParams {
     /// Problems with this gear; `len` formats a length in mm for display.
     pub fn issues(&self, len: impl Fn(f64) -> String) -> Vec<Issue> {
         let mut out = Vec::new();
-        if self.is_hypoid() {
-            // Checked as a pair, with the ring gear's placement.
+        if self.is_generated() {
+            // Checked as a pair, with the ring gear's or wheel's placement.
             return out;
         }
         if self.is_bevel() {

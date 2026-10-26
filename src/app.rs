@@ -2,6 +2,7 @@ use crate::bevel::BevelGeom;
 use crate::chrome::{self, Icon};
 use crate::hypoid::{self, Member, Role};
 use crate::view3d;
+use crate::worm;
 use crate::export::{self, place};
 use crate::mesh;
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
@@ -21,10 +22,11 @@ use std::time::{Duration, Instant};
 const FILE_EXT: &str = "gearcraft";
 
 
-/// A hypoid set's teeth, generated off the UI thread. The last good
-/// solids stay on show while a new spec is being generated.
-struct HypoidJob {
-    spec: hypoid::Spec,
+/// A generated pair's teeth (a hypoid set, bevel worm or worm drive),
+/// made off the UI thread. The last good solids stay on show while a new
+/// spec is being generated.
+struct PairJob {
+    spec: train::PairSpec,
     rx: Option<mpsc::Receiver<Result<(Member, Member), String>>>,
     members: Option<Arc<(Member, Member)>>,
     error: Option<String>,
@@ -95,11 +97,12 @@ enum Workspace {
     Spur,
     Bevel,
     Worm,
+    BevelWorm,
     Pulleys,
 }
 
 impl Workspace {
-    const ALL: [Workspace; 4] = [Workspace::Spur, Workspace::Bevel, Workspace::Worm, Workspace::Pulleys];
+    const ALL: [Workspace; 5] = [Workspace::Spur, Workspace::Bevel, Workspace::Worm, Workspace::BevelWorm, Workspace::Pulleys];
     /// On the roadmap, listed so the menu shows where they will go.
     const PLANNED: [&str; 4] = ["Internal & Planetary", "Helical", "Clock Wheels", "Escapements"];
 
@@ -107,7 +110,8 @@ impl Workspace {
         match self {
             Workspace::Spur => "Spur Gears",
             Workspace::Bevel => "Bevel Gears",
-            Workspace::Worm => "Bevel Worms",
+            Workspace::Worm => "Worm Drives",
+            Workspace::BevelWorm => "Bevel Worms",
             Workspace::Pulleys => "Timing Pulleys",
         }
     }
@@ -116,7 +120,8 @@ impl Workspace {
         match self {
             Workspace::Spur => "⚙",
             Workspace::Bevel => "🔻",
-            Workspace::Worm => "🌀",
+            Workspace::Worm => "🐛",
+            Workspace::BevelWorm => "🌀",
             Workspace::Pulleys => "🔗",
         }
     }
@@ -125,7 +130,8 @@ impl Workspace {
         match self {
             Workspace::Spur => Icon::Gear,
             Workspace::Bevel => Icon::Bevel,
-            Workspace::Worm => Icon::Worm,
+            Workspace::Worm => Icon::WormDrive,
+            Workspace::BevelWorm => Icon::Worm,
             Workspace::Pulleys => Icon::Pulley,
         }
     }
@@ -134,7 +140,8 @@ impl Workspace {
         match self {
             Workspace::Spur => "Involute spur gears: meshing pairs, compound trains",
             Workspace::Bevel => "Straight bevel gears with spherical involute teeth, at any shaft angle",
-            Workspace::Worm => "A 3 to 7-start conical worm driving a wheel, its shaft meeting or passing the wheel's axis",
+            Workspace::Worm => "A cylindrical worm of 1 to 6 starts turning a wheel at right angles, for big reductions",
+            Workspace::BevelWorm => "A 3 to 7-start conical worm driving a wheel, its shaft meeting or passing the wheel's axis",
             Workspace::Pulleys => "MXL to XXH timing pulleys and the belts between them",
         }
     }
@@ -142,14 +149,16 @@ impl Workspace {
     /// Whether the parts have a flat plan view and outline (bevel gears
     /// and worms leave the plane).
     fn flat(self) -> bool {
-        !matches!(self, Workspace::Bevel | Workspace::Worm)
+        !matches!(self, Workspace::Bevel | Workspace::Worm | Workspace::BevelWorm)
     }
 
     fn of(params: &GearParams) -> Self {
         if params.is_pulley() {
             Workspace::Pulleys
-        } else if params.worm {
+        } else if params.worm_drive.is_some() {
             Workspace::Worm
+        } else if params.worm {
+            Workspace::BevelWorm
         } else if params.is_bevel() || params.is_hypoid() {
             Workspace::Bevel
         } else {
@@ -175,8 +184,8 @@ pub struct GearCraftApp {
     dirty: bool,
     selected: Option<u64>,
     cache: HashMap<u64, Cached>,
-    /// Hypoid sets by ring gear id.
-    hypoid: HashMap<u64, HypoidJob>,
+    /// Generated pairs by ring gear or wheel id.
+    pairs: HashMap<u64, PairJob>,
     view: View,
     fit_pending: bool,
     /// Keep re-fitting when the canvas resizes until the user pans or zooms.
@@ -194,6 +203,13 @@ pub struct GearCraftApp {
     unit_switch: Option<PitchUnit>,
     /// Belt fitting picks from the ISO 5296 lengths only.
     belt_standard_only: bool,
+    /// The Ratio section's target for each pair, keyed by the driven part.
+    ratio_target: HashMap<u64, f64>,
+    /// The most teeth "Size to ratio" may give a gear.
+    ratio_max_teeth: u32,
+    /// What the last sizing did: the driven part, the pair's teeth then
+    /// (driving, driven), and the message, shown while those still hold.
+    ratio_result: Option<(u64, u32, u32, String)>,
     workspace: Workspace,
     /// What was selected in each workspace, restored on switching back.
     workspace_selection: HashMap<Workspace, u64>,
@@ -219,7 +235,7 @@ impl GearCraftApp {
             path: None,
             dirty: false,
             cache: HashMap::new(),
-            hypoid: HashMap::new(),
+            pairs: HashMap::new(),
             view: View { center: [0.0, 0.0], scale: 4.0 },
             fit_pending: true,
             auto_fit: true,
@@ -234,6 +250,9 @@ impl GearCraftApp {
             file_dialog: None,
             unit_switch: None,
             belt_standard_only: true,
+            ratio_target: HashMap::new(),
+            ratio_max_teeth: 120,
+            ratio_result: None,
             workspace: Workspace::Spur,
             workspace_selection: HashMap::new(),
             three_d: false,
@@ -419,7 +438,7 @@ impl GearCraftApp {
     fn export(&mut self, whole_train: bool, ext: &str) {
         let only = if whole_train { None } else { self.selected };
         // Teeth already generated for the current settings are reused.
-        let cached = |id: u64| self.hypoid.get(&id).filter(|j| j.rx.is_none()).and_then(|j| j.members.clone());
+        let cached = |id: u64| self.pairs.get(&id).filter(|j| j.rx.is_none()).and_then(|j| j.members.clone());
         if matches!(ext, "stl" | "3mf" | "obj") {
             let parts = mesh::parts(&self.project, self.driver_angle, only, |g| self.shown(g), cached);
             let first = parts.first().map(|p| p.name.as_str());
@@ -434,7 +453,7 @@ impl GearCraftApp {
         } else {
             Vec::new()
         };
-        let solid_only = only.and_then(|id| self.project.get(id)).is_some_and(|g| g.params.is_hypoid());
+        let solid_only = only.and_then(|id| self.project.get(id)).is_some_and(|g| g.params.is_generated());
         if (!bevels.is_empty() || solid_only) && ext != "step" {
             self.flash("DXF and SVG are flat outlines: export bevel gears as STEP or a mesh.");
             return;
@@ -511,7 +530,7 @@ impl GearCraftApp {
         // A meshing gear or belted pulley starts as a copy so the pair is
         // 1:1 until edited; a compound is usually a fraction of its wheel.
         let params = match link {
-            Link::Mesh | Link::Belt | Link::Bevel | Link::Hypoid => pp.clone(),
+            Link::Mesh | Link::Belt | Link::Bevel | Link::Hypoid | Link::Worm => pp.clone(),
             Link::Axle => match (pulley, pp.belt) {
                 (true, Some(b)) => GearParams { teeth: (pp.teeth / 2).max(b.min_teeth()), ..pp.clone() },
                 (true, None) => GearParams { bore: pp.bore, ..unit.starter_pulley(20) },
@@ -566,6 +585,16 @@ impl GearCraftApp {
         let unit = self.project.pitch_unit;
         let worm = self.project.add_root(unit.starter_worm(Role::Pinion), x, 0.0);
         let wheel = self.project.add_child(worm, unit.starter_worm(Role::Ring), Link::Hypoid);
+        self.project.normalize();
+        self.selected = Some(wheel);
+    }
+
+    /// A worm drive: a single-start worm turning a 30-tooth wheel.
+    fn add_worm_drive(&mut self) {
+        let x = self.clear_x();
+        let unit = self.project.pitch_unit;
+        let w = self.project.add_root(unit.starter_worm_drive(worm::Role::Worm), x, 0.0);
+        let wheel = self.project.add_child(w, unit.starter_worm_drive(worm::Role::Wheel), Link::Worm);
         self.project.normalize();
         self.selected = Some(wheel);
     }
@@ -657,9 +686,9 @@ impl GearCraftApp {
     fn refresh_cache(&mut self, ctx: &egui::Context) {
         let ids: Vec<u64> = self.project.gears.iter().map(|g| g.id).collect();
         self.cache.retain(|id, _| ids.contains(id));
-        self.refresh_hypoids(ctx);
+        self.refresh_pairs(ctx);
         for g in &self.project.gears {
-            if g.params.is_hypoid() || self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
+            if g.params.is_generated() || self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
                 continue;
             }
             if let Some(geom) = BevelGeom::new(&g.params).filter(|_| g.params.is_buildable()) {
@@ -682,15 +711,15 @@ impl GearCraftApp {
         }
     }
 
-    /// Start generating any hypoid set whose spec changed, and pick up
-    /// finished ones.
-    fn refresh_hypoids(&mut self, ctx: &egui::Context) {
+    /// Start generating any pair whose spec changed, and pick up finished
+    /// ones.
+    fn refresh_pairs(&mut self, ctx: &egui::Context) {
         let mut live = Vec::new();
         for ring in &self.project.gears {
             let Some(pinion) = ring.placement.parent().and_then(|p| self.project.get(p)) else { continue };
-            let Some(spec) = train::hypoid_spec(&pinion.params, &ring.params, &ring.placement) else { continue };
+            let Some(spec) = train::pair_spec(&pinion.params, &ring.params, &ring.placement) else { continue };
             live.push(ring.id);
-            let job = self.hypoid.entry(ring.id).or_insert_with(|| HypoidJob {
+            let job = self.pairs.entry(ring.id).or_insert_with(|| PairJob {
                 spec: spec.clone(),
                 rx: None,
                 members: None,
@@ -700,11 +729,7 @@ impl GearCraftApp {
                 let (tx, rx) = mpsc::channel();
                 let (sp, ctx) = (spec.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let r = sp
-                        .design()
-                        .ok_or_else(|| "These settings have no hypoid solution.".to_string())
-                        .and_then(|d| Ok((d.pinion()?, d.ring()?)));
-                    let _ = tx.send(r);
+                    let _ = tx.send(sp.generate());
                     ctx.request_repaint();
                 });
                 job.spec = spec;
@@ -738,25 +763,28 @@ impl GearCraftApp {
                 }
             }
         }
-        self.hypoid.retain(|id, _| live.contains(id));
+        self.pairs.retain(|id, _| live.contains(id));
     }
 
-    /// Whether any hypoid set is still being generated.
-    fn hypoid_pending(&self) -> bool {
-        self.hypoid.values().any(|j| j.rx.is_some())
+    /// Whether any pair is still being generated.
+    fn pair_pending(&self) -> bool {
+        self.pairs.values().any(|j| j.rx.is_some())
     }
 
-    /// The hypoid set a gear belongs to: its ring gear's index.
-    fn hypoid_ring(&self, idx: usize) -> Option<usize> {
+    /// The generated pair a part belongs to: its ring gear's or wheel's
+    /// index.
+    fn pair_driven(&self, idx: usize) -> Option<usize> {
         let g = &self.project.gears[idx];
-        match g.params.hypoid? {
-            Role::Ring => Some(idx),
-            Role::Pinion => self
-                .project
-                .gears
-                .iter()
-                .position(|r| matches!(r.placement, Placement::Hypoid { parent, .. } if parent == g.id)),
+        if !g.params.is_generated() {
+            return None;
         }
+        if matches!(g.placement, Placement::Hypoid { .. } | Placement::Worm { .. }) {
+            return Some(idx);
+        }
+        self.project
+            .gears
+            .iter()
+            .position(|r| matches!(r.placement, Placement::Hypoid { parent, .. } | Placement::Worm { parent, .. } if parent == g.id))
     }
 
     // ---- view ------------------------------------------------------------
@@ -861,7 +889,7 @@ impl GearCraftApp {
                             self.drag = Some(Drag::Move(id, [w[0] - c[0], w[1] - c[1]]));
                         }
                         Placement::Mesh { .. } | Placement::Belt { .. } => self.drag = Some(Drag::Swing(id)),
-                        Placement::Axle { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } => {}
+                        Placement::Axle { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } | Placement::Worm { .. } => {}
                     }
                 }
             }
@@ -930,7 +958,8 @@ impl GearCraftApp {
                 match self.workspace {
                     Workspace::Spur => "No gears yet. Use \"New Train\" to place one.",
                     Workspace::Bevel => "No bevel gears yet. Use \"New Pair\" to place one.",
-                    Workspace::Worm => "No bevel worms yet. Use \"Worm Set\" to place one.",
+                    Workspace::Worm => "No worm drives yet. Use \"Worm Drive\" to place one.",
+                    Workspace::BevelWorm => "No bevel worms yet. Use \"Worm Set\" to place one.",
                     Workspace::Pulleys => "No pulleys yet. Use \"New Pulley\" to place one.",
                 },
                 FontId::proportional(16.0),
@@ -1069,8 +1098,8 @@ impl GearCraftApp {
                 Some(b) => (b.front_face().0, b.back(b.tip) * b.tip.cos()),
                 None => (0.0, g.params.face_width),
             };
-            // Hypoid teeth are only known once generated.
-            if let Some(c) = self.cache.get(&g.id).filter(|_| g.params.is_hypoid()) {
+            // Generated teeth are only known once made.
+            if let Some(c) = self.cache.get(&g.id).filter(|_| g.params.is_generated()) {
                 r = c.solid.verts.iter().map(|v| v[0].hypot(v[1])).fold(1.0, f64::max);
                 z0 = c.solid.verts.iter().map(|v| v[2]).fold(f64::MAX, f64::min);
                 z1 = c.solid.verts.iter().map(|v| v[2]).fold(f64::MIN, f64::max);
@@ -1173,11 +1202,11 @@ impl GearCraftApp {
             painter.image(t.id(), rect, uv, Color32::WHITE);
         }
 
-        if self.hypoid_pending() {
+        if self.pair_pending() {
             painter.text(
                 rect.left_top() + Vec2::new(10.0, 8.0),
                 Align2::LEFT_TOP,
-                "⏳ Generating hypoid teeth…",
+                "⏳ Generating teeth…",
                 FontId::proportional(13.0),
                 visuals.weak_text_color(),
             );
@@ -1419,6 +1448,11 @@ impl GearCraftApp {
                         }
                     }
                     Workspace::Worm => {
+                        if ui.button("New worm drive").clicked() {
+                            self.add_worm_drive();
+                        }
+                    }
+                    Workspace::BevelWorm => {
                         if ui.button("New bevel worm set").clicked() {
                             self.add_worm_pair();
                         }
@@ -1531,6 +1565,14 @@ impl GearCraftApp {
                 }
             }),
             Workspace::Worm => chrome::group(ui, "Create", |ui| {
+                if big(ui, Icon::WormDrive, "Worm Drive", false, true)
+                    .on_hover_text("A single-start worm turning a 30-tooth wheel at right angles: 30 : 1")
+                    .clicked()
+                {
+                    self.add_worm_drive();
+                }
+            }),
+            Workspace::BevelWorm => chrome::group(ui, "Create", |ui| {
                 if big(ui, Icon::Worm, "Worm Set", false, true)
                     .on_hover_text("A 3-start conical worm driving a 30-tooth wheel, the shafts meeting at right angles")
                     .clicked()
@@ -1620,7 +1662,7 @@ impl GearCraftApp {
                     Placement::Mesh { .. } => ("⚙", "meshes"),
                     Placement::Axle { .. } => ("◎", "same axle"),
                     Placement::Belt { .. } => ("🔗", "belt"),
-                    Placement::Bevel { .. } | Placement::Hypoid { .. } => ("⚙", "meshes"),
+                    Placement::Bevel { .. } | Placement::Hypoid { .. } | Placement::Worm { .. } => ("⚙", "meshes"),
                 };
                 ui.horizontal(|ui| {
                     ui.add_space(s.depth.min(12) as f32 * 14.0);
@@ -1677,11 +1719,18 @@ impl GearCraftApp {
             .filter(|g| g.params.hypoid == Some(Role::Pinion) && g.params.worm == worm)
             .map(|g| (g.id, g.name.clone()))
             .collect();
-        let hypoid_ring = self.hypoid_ring(idx);
-        let hypoid_design = hypoid_ring.and_then(|r| solved[r].hypoid.clone());
+        let earlier_worms: Vec<(u64, String)> = self.project.gears[..idx]
+            .iter()
+            .filter(|g| g.params.worm_drive == Some(worm::Role::Worm))
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        let pair_driven = self.pair_driven(idx);
+        let hypoid_design = pair_driven.and_then(|r| solved[r].hypoid.clone());
+        let worm_design = pair_driven.and_then(|r| solved[r].worm.clone());
         let hypoid_cutter = hypoid_design.as_ref().map(|d| d.cutter.radius);
-        let hypoid_state = hypoid_ring.map(|r| {
-            let job = self.hypoid.get(&self.project.gears[r].id);
+        // Whether the pair's teeth are being generated, and why they failed.
+        let pair_state = pair_driven.map(|r| {
+            let job = self.pairs.get(&self.project.gears[r].id);
             (job.is_some_and(|j| j.rx.is_some()), job.and_then(|j| j.error.clone()))
         });
         let earlier_pulleys: Vec<(u64, String)> = self.project.gears[..idx]
@@ -1692,6 +1741,25 @@ impl GearCraftApp {
         // Belt fits need the whole project, so they run after the panel.
         let mut fit_req: Option<f64> = None;
         let mut fit_start = false;
+        let pair = self.project.ratio_pair(idx).map(|(a, b)| {
+            let (ga, gb) = (&self.project.gears[a], &self.project.gears[b]);
+            RatioPair {
+                driven: gb.id,
+                partner: self.project.gears[if b == idx { a } else { b }].name.clone(),
+                drives: a == idx,
+                teeth: (ga.params.teeth, gb.params.teeth),
+                worm: ga.params.is_worm_thread(),
+                belt_center: solved[b].belt.as_ref().map(|bi| bi.center),
+            }
+        });
+        let mut ratio_target = pair.as_ref().map(|pr| {
+            let now = pr.teeth.1 as f64 / pr.teeth.0 as f64;
+            self.ratio_target.get(&pr.driven).copied().unwrap_or(now)
+        });
+        let ratio_note = pair.as_ref().and_then(|pr| {
+            self.ratio_result.as_ref().filter(|r| (r.0, r.1, r.2) == (pr.driven, pr.teeth.0, pr.teeth.1)).map(|r| r.3.clone())
+        });
+        let mut ratio_req: Option<f64> = None;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let g = &mut self.project.gears[idx];
@@ -1700,6 +1768,50 @@ impl GearCraftApp {
                 ui.text_edit_singleline(&mut g.name);
             });
             ui.add_space(6.0);
+
+            if let (Some(pr), Some(target)) = (&pair, &mut ratio_target) {
+                section(ui, "Ratio", |ui| {
+                    egui::Grid::new("ratio").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label(if pr.drives { "Drives" } else { "Driven by" });
+                        ui.label(&pr.partner);
+                        ui.end_row();
+                        let (za, zb) = pr.teeth;
+                        let teeth = match (pr.worm, za) {
+                            (true, 1) => format!("{zb} teeth : 1 start"),
+                            (true, _) => format!("{zb} teeth : {za} starts"),
+                            _ => format!("{zb} : {za} teeth"),
+                        };
+                        ui.label("Pair ratio");
+                        ui.label(RichText::new(format!("{:.4} : 1  ·  {teeth}", zb as f64 / za as f64)).monospace())
+                            .on_hover_text("Turns of the driving part for one turn of the driven one: driven teeth over driving teeth.");
+                        ui.end_row();
+                        ui.label("Target");
+                        ui.add(egui::DragValue::new(target).range(0.01..=1000.0).speed(0.01).max_decimals(4).suffix(" : 1"))
+                            .on_hover_text("The pair ratio you want, driven : driving.");
+                        ui.end_row();
+                        ui.label("Max teeth");
+                        ui.add(egui::DragValue::new(&mut self.ratio_max_teeth).range(10..=400))
+                            .on_hover_text("The most teeth either part may get. A worm keeps to its own range of starts.");
+                        ui.end_row();
+                        ui.label("");
+                        if ui
+                            .button("Size to ratio")
+                            .on_hover_text(
+                                "Pick tooth counts for both parts that come nearest the target, with no undercut, \
+                                 keeping the pair close to its present size. A part that also turns another \
+                                 keeps its teeth.",
+                            )
+                            .clicked()
+                        {
+                            ratio_req = Some(*target);
+                        }
+                        ui.end_row();
+                    });
+                    if let Some(note) = &ratio_note {
+                        ui.label(RichText::new(note).weak());
+                    }
+                });
+            }
 
             if let Some(mut belt) = g.params.belt {
                 let locked = g.match_parent && matches!(g.placement, Placement::Belt { .. });
@@ -1759,6 +1871,48 @@ impl GearCraftApp {
                             .weak()
                             .small(),
                     );
+                });
+            } else if let Some(role) = g.params.worm_drive {
+                section(ui, "Teeth", |ui| {
+                    egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        if role == worm::Role::Worm {
+                            ui.label("Starts");
+                            ui.horizontal(|ui| {
+                                for z in worm::STARTS {
+                                    ui.selectable_value(&mut g.params.teeth, z, z.to_string());
+                                }
+                            })
+                            .response
+                            .on_hover_text("The worm's threads. Each start turns the wheel a tooth further per turn of the worm.");
+                            ui.end_row();
+                            return;
+                        }
+                        ui.label("Teeth");
+                        ui.add(egui::DragValue::new(&mut g.params.teeth).range(10..=400).speed(0.2));
+                        ui.end_row();
+                        ui.label(if unit.is_inch() { "Diametral pitch (axial)" } else { "Module (axial)" });
+                        ui.horizontal(|ui| pitch_input(ui, &mut g.params.module, unit))
+                            .response
+                            .on_hover_text("The worm's axial pitch over π, which is also the wheel's module across its face.");
+                        ui.end_row();
+                        ui.label("Pressure angle");
+                        ui.horizontal(|ui| {
+                            for pa in [14.5, 20.0, 25.0] {
+                                ui.selectable_value(&mut g.params.pressure_angle, pa, format!("{pa}°"));
+                            }
+                            ui.add(egui::DragValue::new(&mut g.params.pressure_angle).range(10.0..=30.0).speed(0.1).suffix("°"));
+                        })
+                        .response
+                        .on_hover_text("Normal to the threads. 20° is usual.");
+                        ui.end_row();
+                        ui.label("Backlash");
+                        len_drag(ui, &mut g.params.backlash, unit, 0.0..=5.0, 0.002)
+                            .on_hover_text("Thinning of the wheel's teeth on its pitch circle.");
+                        ui.end_row();
+                    });
+                    if role == worm::Role::Worm {
+                        ui.label(RichText::new("Module, pressure angle and backlash are set on the wheel.").weak().small());
+                    }
                 });
             } else if let Some(role) = g.params.hypoid {
                 section(ui, "Teeth", |ui| {
@@ -1898,10 +2052,15 @@ impl GearCraftApp {
                     len_drag(ui, &mut g.params.bore, unit, 0.0..=10000.0, 0.1);
                     ui.end_row();
                     if g.params.hypoid != Some(Role::Pinion) {
-                        ui.label("Face width");
+                        let thread = g.params.worm_drive == Some(worm::Role::Worm);
+                        ui.label(if thread { "Thread length" } else { "Face width" });
                         let r = len_drag(ui, &mut g.params.face_width, unit, 0.0..=10000.0, 0.1);
                         if g.params.is_bevel() || g.params.is_hypoid() {
                             r.on_hover_text("Along the cone, from the back (large) end towards the apex.");
+                        } else if thread {
+                            r.on_hover_text("The threaded length of the worm; its middle meets the wheel.");
+                        } else if g.params.worm_drive.is_some() {
+                            r.on_hover_text("A throated wheel's face is usually about ¾ of the worm's outside diameter.");
                         }
                         ui.end_row();
                     }
@@ -1911,15 +2070,15 @@ impl GearCraftApp {
             section(ui, "Placement", |ui| {
                 let kind = match g.placement {
                     Placement::Root { .. } => 0,
-                    Placement::Mesh { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } => 1,
+                    Placement::Mesh { .. } | Placement::Bevel { .. } | Placement::Hypoid { .. } | Placement::Worm { .. } => 1,
                     Placement::Axle { .. } => 2,
                     Placement::Belt { .. } => 3,
                 };
                 let is_pulley = g.params.is_pulley();
                 let is_bevel = g.params.is_bevel();
                 // A ring gear stays with its pinion; a pinion is fixed or on a shaft.
-                let is_ring = g.params.hypoid == Some(Role::Ring);
-                let is_pinion = g.params.hypoid == Some(Role::Pinion);
+                let is_ring = g.params.hypoid == Some(Role::Ring) || g.params.worm_drive == Some(worm::Role::Wheel);
+                let is_pinion = g.params.hypoid == Some(Role::Pinion) || g.params.worm_drive == Some(worm::Role::Worm);
                 let mut new_kind = kind;
                 if !is_ring { ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut new_kind, 0, "Fixed");
@@ -1938,7 +2097,10 @@ impl GearCraftApp {
                 if new_kind != kind {
                     let parent = g.placement.parent().or(earlier.last().map(|e| e.0)).unwrap_or(0);
                     let angle = match g.placement {
-                        Placement::Mesh { angle, .. } | Placement::Bevel { angle, .. } | Placement::Hypoid { angle, .. } => angle,
+                        Placement::Mesh { angle, .. }
+                        | Placement::Bevel { angle, .. }
+                        | Placement::Hypoid { angle, .. }
+                        | Placement::Worm { angle, .. } => angle,
                         _ => 0.0,
                     };
                     g.placement = match new_kind {
@@ -2108,6 +2270,31 @@ impl GearCraftApp {
                             .on_hover_text(if worm { "Turns the wheel round the worm's shaft." } else { "Turns the ring gear round the pinion's shaft." });
                         ui.end_row();
                     }
+                    Placement::Worm { parent, angle, diameter, throated, left_hand } => {
+                        ui.label("Worm");
+                        parent_combo(ui, parent, &earlier_worms);
+                        ui.end_row();
+                        ui.label("Worm pitch Ø");
+                        len_drag(ui, diameter, unit, 1.0..=10000.0, 0.1).on_hover_text(
+                            "Bigger makes a stiffer worm with a flatter lead angle: more likely to self-lock, \
+                             but less efficient. About 10 modules is usual.",
+                        );
+                        ui.end_row();
+                        ui.label("Wheel");
+                        ui.checkbox(throated, "Throated").on_hover_text(
+                            "Teeth hollowed to wrap round the worm, cut as a hob cuts them, for line contact \
+                             and real load. Off: a straight helical wheel, simpler to make, touching the worm \
+                             at a point: for light duty.",
+                        );
+                        ui.end_row();
+                        ui.label("Hand");
+                        ui.checkbox(left_hand, "Left hand").on_hover_text("Wind the threads and teeth left-handed; right-handed is usual.");
+                        ui.end_row();
+                        ui.label("Direction");
+                        ui.add(egui::DragValue::new(angle).speed(0.5).range(-360.0..=360.0).suffix("°"))
+                            .on_hover_text("Turns the wheel round the worm's shaft.");
+                        ui.end_row();
+                    }
                     Placement::Axle { parent, phase } => {
                         ui.label("Shares axle with");
                         parent_combo(ui, parent, &earlier);
@@ -2139,9 +2326,9 @@ impl GearCraftApp {
             };
             let fmt = |v: f64| len(v, unit);
             let mut issues = p.issues(fmt);
-            match &hypoid_state {
+            match &pair_state {
                 Some((_, Some(e))) => issues.push(Issue { level: Level::Error, text: e.clone() }),
-                Some(_) if hypoid_design.is_none() => {
+                Some(_) if p.is_hypoid() && hypoid_design.is_none() => {
                     let what = if p.worm { "bevel worm" } else { "hypoid" };
                     issues.push(Issue { level: Level::Error, text: format!("These settings have no {what} solution.") })
                 }
@@ -2153,7 +2340,26 @@ impl GearCraftApp {
                         "No ring gear: add one with Hypoid Set, or point a ring gear at this pinion.".into()
                     },
                 }),
+                None if p.worm_drive == Some(worm::Role::Worm) => issues.push(Issue {
+                    level: Level::Warning,
+                    text: "No wheel: add a drive with Worm Drive, or point a wheel at this worm.".into(),
+                }),
                 _ => {}
+            }
+            if let Some(d) = &worm_design {
+                let m = d.spec.module;
+                let (z1, z2) = (d.spec.starts as f64, d.spec.teeth as f64);
+                // DIN 3975's least threaded length.
+                let least = if z1 <= 2.0 { 11.0 + 0.06 * z2 } else { 12.5 + 0.09 * z2 } * m;
+                if d.spec.length < least - 1e-6 {
+                    issues.push(Issue::warn(format!(
+                        "The worm is shorter than DIN 3975 asks for ({}): the end teeth lose contact early.",
+                        fmt(least)
+                    )));
+                }
+                if d.spec.throated && d.spec.face > 2.0 * d.worm_tip {
+                    issues.push(Issue::warn("The wheel's face is wider than the worm: its ends barely mesh."));
+                }
             }
             if let Some(d) = hypoid_design.as_ref().filter(|_| p.worm) {
                 if d.face_contact_ratio() < 1.0 {
@@ -2169,8 +2375,49 @@ impl GearCraftApp {
                 if !p.is_buildable() {
                     return;
                 }
+                if let Some(role) = p.worm_drive {
+                    if pair_state.as_ref().is_some_and(|s| s.0) {
+                        ui.label(RichText::new("⏳ Generating teeth…").weak());
+                    }
+                    let Some(d) = &worm_design else { return };
+                    let deg = |a: f64| format!("{:.3}°", a.to_degrees());
+                    let hand = if d.spec.left_hand { "left hand" } else { "right hand" };
+                    // Friction 0.05, a hardened, ground worm on a bronze wheel
+                    // running in oil.
+                    let rho = (0.05 / d.spec.pressure_angle.to_radians().cos()).atan();
+                    let efficiency = d.lead_angle.tan() / (d.lead_angle + rho).tan();
+                    egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        if role == worm::Role::Worm {
+                            value_row(ui, "Lead angle", format!("{}, {hand}", deg(d.lead_angle)));
+                            value_row(ui, "Axial pitch", fmt(d.axial_pitch));
+                            value_row(ui, "Lead", fmt(d.lead));
+                            value_row(ui, "Pitch Ø", fmt(2.0 * d.worm_radius));
+                            value_row(ui, "Outside Ø", fmt(2.0 * d.worm_tip));
+                            value_row(ui, "Root Ø", fmt(2.0 * d.worm_root));
+                            value_row(ui, "Diameter quotient", format!("{:.3}", 2.0 * d.worm_radius / d.spec.module));
+                        } else {
+                            value_row(ui, "Helix angle", format!("{}, {hand}", deg(d.lead_angle)));
+                            value_row(ui, "Pitch Ø", fmt(2.0 * d.wheel_radius));
+                            if d.spec.throated {
+                                value_row(ui, "Throat Ø", fmt(2.0 * d.wheel_throat));
+                                value_row(ui, "Outside Ø", fmt(2.0 * d.wheel_rim));
+                            } else {
+                                value_row(ui, "Outside Ø", fmt(2.0 * d.wheel_throat));
+                            }
+                            value_row(ui, "Root Ø", fmt(2.0 * d.wheel_root));
+                        }
+                        value_row(ui, "Centre distance", fmt(d.center));
+                        value_row(ui, "Ratio", format!("{:.4} : 1", d.spec.teeth as f64 / d.spec.starts as f64));
+                        value_row(ui, "Efficiency (approx.)", format!("{:.0} %", 100.0 * efficiency));
+                        ui.label("Self-locking");
+                        ui.label(RichText::new(if d.lead_angle < 5f64.to_radians() { "likely" } else { "no" }).monospace())
+                            .on_hover_text("Under about 5° of lead angle friction usually stops the wheel driving the worm back; don't rely on it as a brake.");
+                        ui.end_row();
+                    });
+                    return;
+                }
                 if let Some(role) = p.hypoid {
-                    if hypoid_state.as_ref().is_some_and(|s| s.0) {
+                    if pair_state.as_ref().is_some_and(|s| s.0) {
                         ui.label(RichText::new("⏳ Generating teeth…").weak());
                     }
                     let Some(d) = &hypoid_design else { return };
@@ -2321,6 +2568,32 @@ impl GearCraftApp {
             }
         });
 
+        if let (Some(pr), Some(t)) = (&pair, ratio_target) {
+            self.ratio_target.insert(pr.driven, t);
+        }
+        if let (Some(pr), Some(t)) = (&pair, ratio_req) {
+            match self.project.size_pair_to_ratio(idx, t, self.ratio_max_teeth) {
+                Ok(r) => {
+                    // A belt keeps the pulleys about as far apart as they were.
+                    if let Some(c) = pr.belt_center {
+                        self.project.fit_belt(pr.driven, c, self.belt_standard_only);
+                    }
+                    let got = r.driven as f64 / r.driving as f64;
+                    let off = (got / t - 1.0) * 100.0;
+                    let mut note = if off.abs() < 1e-9 {
+                        format!("Exact: {} : {}", r.driven, r.driving)
+                    } else {
+                        format!("Nearest within the limits: {got:.4} : 1, {off:+.2} % off")
+                    };
+                    if let Some(h) = r.held {
+                        note += &format!(". {h} kept its teeth, as it also turns another part");
+                    }
+                    self.ratio_result = Some((pr.driven, r.driving, r.driven, note + "."));
+                }
+                Err(e) => self.flash(e),
+            }
+        }
+
         let g = &self.project.gears[idx];
         let id = g.id;
         if fit_start {
@@ -2355,7 +2628,8 @@ impl GearCraftApp {
             ui.label(match self.workspace {
                 Workspace::Spur => format!("{n} gears"),
                 Workspace::Bevel => format!("{n} bevel gears"),
-                Workspace::Worm => format!("{n} worm parts"),
+                Workspace::Worm => format!("{n} worm drive parts"),
+                Workspace::BevelWorm => format!("{n} bevel worm parts"),
                 Workspace::Pulleys => format!("{n} pulleys"),
             });
             if let Some((msg, at)) = &self.status {
@@ -2419,7 +2693,7 @@ impl GearCraftApp {
                     self.add_bevel(Link::Axle);
                 }
             }
-            Workspace::Worm => {}
+            Workspace::Worm | Workspace::BevelWorm => {}
             Workspace::Pulleys => {
                 if key(Key::B) {
                     self.add_gear(Link::Belt, true);
@@ -2670,6 +2944,18 @@ fn pitch_input(ui: &mut Ui, module: &mut f64, unit: PitchUnit) {
     }
 }
 
+/// The pair the Ratio section is about, read before the panel borrows the
+/// project.
+struct RatioPair {
+    driven: u64,
+    partner: String,
+    drives: bool,
+    /// (driving, driven)
+    teeth: (u32, u32),
+    worm: bool,
+    belt_center: Option<f64>,
+}
+
 fn fmt_ratio(r: f64) -> String {
     if r == 0.0 {
         return "0".into();
@@ -2791,7 +3077,36 @@ mod tests {
             app.three_d = true;
             harness.step();
             let start = Instant::now();
-            while harness.state().hypoid_pending() && start.elapsed() < Duration::from_secs(120) {
+            while harness.state().pair_pending() && start.elapsed() < Duration::from_secs(120) {
+                std::thread::sleep(Duration::from_millis(100));
+                harness.step();
+            }
+            harness.state_mut().fit_pending = true;
+            harness.step();
+            harness.step();
+        }
+        if std::env::var("GEARCRAFT_SHOT_WORMDRIVE").is_ok() {
+            let app = harness.state_mut();
+            app.switch_workspace(Workspace::Worm);
+            if app.first_shown().is_none() {
+                app.add_worm_drive();
+            }
+            // GEARCRAFT_SHOT_WORMDRIVE=worm selects the worm, =straight
+            // makes the wheel a straight one.
+            let how = std::env::var("GEARCRAFT_SHOT_WORMDRIVE").unwrap_or_default();
+            if how == "worm" {
+                app.selected = app.first_shown();
+            }
+            if how == "straight" {
+                for g in &mut app.project.gears {
+                    if let Placement::Worm { throated, .. } = &mut g.placement {
+                        *throated = false;
+                    }
+                }
+            }
+            harness.step();
+            let start = Instant::now();
+            while harness.state().pair_pending() && start.elapsed() < Duration::from_secs(120) {
                 std::thread::sleep(Duration::from_millis(100));
                 harness.step();
             }
@@ -2801,7 +3116,7 @@ mod tests {
         }
         if std::env::var("GEARCRAFT_SHOT_WORM").is_ok() {
             let app = harness.state_mut();
-            app.switch_workspace(Workspace::Worm);
+            app.switch_workspace(Workspace::BevelWorm);
             if app.first_shown().is_none() {
                 app.add_worm_pair();
             }
@@ -2811,7 +3126,7 @@ mod tests {
             }
             harness.step();
             let start = Instant::now();
-            while harness.state().hypoid_pending() && start.elapsed() < Duration::from_secs(120) {
+            while harness.state().pair_pending() && start.elapsed() < Duration::from_secs(120) {
                 std::thread::sleep(Duration::from_millis(100));
                 harness.step();
             }

@@ -8,8 +8,10 @@ use crate::gear::{self, GearParams, Issue, MeshInfo, ToothStandard};
 use crate::bevel::{self, Bevel, BevelGeom};
 use crate::hypoid::{self, Design, Role};
 use crate::pulley::{self, BeltSection};
+use crate::worm;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+use std::ops::RangeInclusive;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Placement {
@@ -51,9 +53,25 @@ pub enum Placement {
         #[serde(default)]
         cutter_radius: f64,
     },
+    /// The wheel of a cylindrical worm drive turned by worm `parent`: its
+    /// axis square to the worm's, `diameter` the worm's pitch diameter.
+    /// `angle` turns the wheel round the worm's axis.
+    Worm {
+        parent: u64,
+        angle: f64,
+        diameter: f64,
+        throated: bool,
+        left_hand: bool,
+    },
 }
 
 impl Placement {
+    /// Whether this part turns against its parent (meshing or belted) rather
+    /// than sitting fixed or sharing its axle.
+    pub fn meshes(&self) -> bool {
+        !matches!(self, Placement::Root { .. } | Placement::Axle { .. })
+    }
+
     pub fn parent(&self) -> Option<u64> {
         match *self {
             Placement::Root { .. } => None,
@@ -61,7 +79,8 @@ impl Placement {
             | Placement::Axle { parent, .. }
             | Placement::Belt { parent, .. }
             | Placement::Bevel { parent, .. }
-            | Placement::Hypoid { parent, .. } => Some(parent),
+            | Placement::Hypoid { parent, .. }
+            | Placement::Worm { parent, .. } => Some(parent),
         }
     }
 }
@@ -74,6 +93,7 @@ pub enum Link {
     Belt,
     Bevel,
     Hypoid,
+    Worm,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -180,6 +200,21 @@ impl PitchUnit {
         GearParams { module: m, bore, face_width: face, hypoid: Some(role), worm: true, ..p }
     }
 
+    /// Half of a worm drive: a single-start worm and a 30-tooth wheel.
+    /// The worm is solid, as it is usually cut on its shaft; it is about
+    /// as long as DIN 3975 asks for, the wheel's face three quarters of the
+    /// worm's outside diameter.
+    pub fn starter_worm_drive(self, role: worm::Role) -> GearParams {
+        let m: f64 = if self.is_inch() { 25.4 / 12.0 } else { 2.0 };
+        let wheel_teeth = 30.0;
+        let p = self.starter(if role == worm::Role::Worm { 1 } else { 30 });
+        let (face, bore) = match role {
+            worm::Role::Worm => (((11.0 + 0.06 * wheel_teeth) * m).round(), 0.0),
+            worm::Role::Wheel => ((0.75 * (worm::default_diameter(m) + 2.0 * m)).round(), p.bore),
+        };
+        GearParams { module: m, face_width: face, bore, worm_drive: Some(role), ..p }
+    }
+
     /// A sensible fresh gear in this system.
     pub fn starter(self, teeth: u32) -> GearParams {
         match self {
@@ -234,6 +269,8 @@ pub struct Solved {
     pub frame: Frame3,
     /// A hypoid ring gear's solved pair design.
     pub hypoid: Option<Box<Design>>,
+    /// A worm wheel's solved drive.
+    pub worm: Option<Box<worm::Design>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -295,6 +332,65 @@ pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement
         pinion_bore: pinion.bore,
         ring_bore: ring.bore,
     })
+}
+
+/// The worm drive made by worm `worm` and wheel `wheel` placed by
+/// `placement` (a Placement::Worm).
+pub fn worm_spec(worm: &GearParams, wheel: &GearParams, placement: &Placement) -> Option<worm::Spec> {
+    let Placement::Worm { diameter, throated, left_hand, .. } = *placement else {
+        return None;
+    };
+    Some(worm::Spec {
+        starts: worm.teeth,
+        teeth: wheel.teeth,
+        module: wheel.module,
+        pressure_angle: wheel.pressure_angle,
+        addendum: wheel.addendum,
+        dedendum: wheel.dedendum,
+        root_fillet: wheel.root_fillet,
+        diameter,
+        length: worm.face_width,
+        face: wheel.face_width,
+        throated,
+        left_hand,
+        backlash: wheel.backlash,
+        worm_bore: worm.bore,
+        wheel_bore: wheel.bore,
+    })
+}
+
+/// A pair whose teeth are generated together: a hypoid or spiral bevel
+/// set (bevel worms included), or a worm drive.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PairSpec {
+    Hypoid(hypoid::Spec),
+    Worm(worm::Spec),
+}
+
+impl PairSpec {
+    /// The driver's teeth (pinion or worm), then the driven's.
+    pub fn generate(&self) -> Result<(hypoid::Member, hypoid::Member), String> {
+        match self {
+            PairSpec::Hypoid(sp) => {
+                let d = sp.design().ok_or_else(|| "These settings have no hypoid solution.".to_string())?;
+                Ok((d.pinion()?, d.ring()?))
+            }
+            PairSpec::Worm(sp) => {
+                let d = sp.design()?;
+                Ok((d.worm()?, d.wheel()?))
+            }
+        }
+    }
+}
+
+/// The generated pair a ring gear or wheel `driven`, placed by
+/// `placement`, makes with its driver.
+pub fn pair_spec(driver: &GearParams, driven: &GearParams, placement: &Placement) -> Option<PairSpec> {
+    match placement {
+        Placement::Hypoid { .. } => hypoid_spec(driver, driven, placement).map(PairSpec::Hypoid),
+        Placement::Worm { .. } => worm_spec(driver, driven, placement).map(PairSpec::Worm),
+        _ => None,
+    }
 }
 
 /// Along its own axis, where a part starts and ends relative to its frame
@@ -489,6 +585,18 @@ impl Project {
                     cutter_radius: 0.0,
                 }
             }
+            Link::Worm => {
+                params.worm_drive = Some(worm::Role::Wheel);
+                params.bevel = None;
+                params.hypoid = None;
+                Placement::Worm {
+                    parent,
+                    angle: 0.0,
+                    diameter: worm::default_diameter(params.module),
+                    throated: true,
+                    left_hand: false,
+                }
+            }
             Link::Belt => {
                 params.belt = pp.belt.or(params.belt);
                 params.belt_width = pp.belt_width;
@@ -599,6 +707,19 @@ impl Project {
                             dst.worm = src.worm;
                             self.gears[i].params.hypoid = Some(Role::Ring);
                         }
+                        if matches!(self.gears[i].placement, Placement::Worm { .. }) {
+                            // The wheel sets the drive's teeth.
+                            let src = self.gears[i].params.clone();
+                            let dst = &mut self.gears[pi].params;
+                            dst.module = src.module;
+                            dst.pressure_angle = src.pressure_angle;
+                            dst.standard = src.standard;
+                            dst.addendum = src.addendum;
+                            dst.dedendum = src.dedendum;
+                            dst.root_fillet = src.root_fillet;
+                            dst.worm_drive = Some(worm::Role::Worm);
+                            self.gears[i].params.worm_drive = Some(worm::Role::Wheel);
+                        }
                         let belted = matches!(self.gears[i].placement, Placement::Belt { .. });
                         if belted && self.gears[i].match_parent && self.gears[pi].params.is_pulley() {
                             let (belt, width) = (self.gears[pi].params.belt, self.gears[pi].params.belt_width);
@@ -652,6 +773,7 @@ impl Project {
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
                         hypoid: None,
+                        worm: None,
                     }
                 }
                 (Placement::Belt { angle, belt_teeth, .. }, Some(pi)) => {
@@ -682,6 +804,7 @@ impl Project {
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
                         hypoid: None,
+                        worm: None,
                     }
                 }
                 (Placement::Bevel { angle, .. }, Some(pi)) => {
@@ -713,6 +836,7 @@ impl Project {
                         z: f.origin[2],
                         frame,
                         hypoid: None,
+                        worm: None,
                     }
                 }
                 (Placement::Hypoid { angle, .. }, Some(pi)) => {
@@ -745,6 +869,7 @@ impl Project {
                                 z: origin[2],
                                 frame,
                                 hypoid: Some(Box::new(d)),
+                                worm: None,
                             }
                         }
                         None => Solved {
@@ -757,6 +882,51 @@ impl Project {
                             z: f.origin[2],
                             frame: f,
                             hypoid: None,
+                            worm: None,
+                        },
+                    }
+                }
+                (Placement::Worm { angle, .. }, Some(pi)) => {
+                    let pg = &self.gears[pi];
+                    let ps = &out[pi];
+                    let f = ps.frame;
+                    let design = worm_spec(&pg.params, &g.params, &g.placement).and_then(|sp| sp.design().ok());
+                    match design {
+                        Some(d) => {
+                            // Across the worm's axis towards azimuth β, at the
+                            // middle of its threads; the wheel's axis square
+                            // to both, the worm at azimuth π on the wheel.
+                            let beta = angle.to_radians();
+                            let (sb, cb) = beta.sin_cos();
+                            let x = f.turn([cb, sb, 0.0]);
+                            let z = f.turn([sb, -cb, 0.0]);
+                            let centre = f.apply([d.center * cb, d.center * sb, pg.params.face_width / 2.0]);
+                            let origin: [f64; 3] = std::array::from_fn(|k| centre[k] - z[k] * g.params.face_width / 2.0);
+                            let k = d.ratio();
+                            Solved {
+                                center: [origin[0], origin[1]],
+                                ratio: k * ps.ratio,
+                                phase: k * (ps.phase - beta),
+                                mesh: None,
+                                belt: None,
+                                depth: ps.depth + 1,
+                                z: origin[2],
+                                frame: Frame3 { origin, x, y: f.z, z },
+                                hypoid: None,
+                                worm: Some(Box::new(d)),
+                            }
+                        }
+                        None => Solved {
+                            center: ps.center,
+                            ratio: ps.ratio,
+                            phase: 0.0,
+                            mesh: None,
+                            belt: None,
+                            depth: ps.depth + 1,
+                            z: f.origin[2],
+                            frame: f,
+                            hypoid: None,
+                            worm: None,
                         },
                     }
                 }
@@ -772,6 +942,7 @@ impl Project {
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
                         hypoid: None,
+                        worm: None,
                     }
                 }
                 (Placement::Root { x, y, phase }, _) => Solved {
@@ -784,6 +955,7 @@ impl Project {
                     z: 0.0,
                     frame: Frame3::at([0.0; 3]),
                     hypoid: None,
+                    worm: None,
                 },
                 // Unreachable after normalize(); draw it at the origin.
                 (_, None) => {
@@ -797,12 +969,13 @@ impl Project {
                         z: 0.0,
                         frame: Frame3::at([0.0; 3]),
                         hypoid: None,
+                        worm: None,
                     }
                 }
             };
             let mut s = s;
             match (&g.placement, parent) {
-                (Placement::Bevel { .. } | Placement::Hypoid { .. }, _) => {}
+                (Placement::Bevel { .. } | Placement::Hypoid { .. } | Placement::Worm { .. }, _) => {}
                 (Placement::Axle { .. }, Some(pi)) => {
                     // Stacked along the parent's shaft: this part starts
                     // where the parent ends.
@@ -823,6 +996,57 @@ impl Project {
             out.push(s);
         }
         out
+    }
+
+    /// The pair a part's ratio is quoted for, as (driving, driven) indices:
+    /// the part it meshes with or is belted to and itself, or, for a part
+    /// placed on its own, the first part placed against it.
+    pub fn ratio_pair(&self, i: usize) -> Option<(usize, usize)> {
+        let g = &self.gears[i];
+        if g.placement.meshes() {
+            return Some((self.index_of(g.placement.parent()?)?, i));
+        }
+        let c = self.gears.iter().position(|c| c.placement.meshes() && c.placement.parent() == Some(g.id))?;
+        Some((i, c))
+    }
+
+    /// How many parts a part meshes with or is belted to.
+    fn mates(&self, i: usize) -> usize {
+        let g = &self.gears[i];
+        let children = self.gears.iter().filter(|c| c.placement.meshes() && c.placement.parent() == Some(g.id)).count();
+        children + g.placement.meshes() as usize
+    }
+
+    /// Give the pair `ratio_pair(i)` the tooth counts that come nearest
+    /// `target` (driven : driving), at most `max_teeth` each. A part that
+    /// also meshes with another keeps its teeth, so the train's other
+    /// ratios stand.
+    pub fn size_pair_to_ratio(&mut self, i: usize, target: f64, max_teeth: u32) -> Result<Resized, String> {
+        let (a, b) = self.ratio_pair(i).ok_or("This part has no partner to set a ratio with.")?;
+        if !(target > 0.0 && target.is_finite()) {
+            return Err("The ratio must be more than 0.".into());
+        }
+        let range = |k: usize| {
+            let p = &self.gears[k].params;
+            let (lo, hi) = tooth_range(p);
+            if self.mates(k) > 1 {
+                return p.teeth..=p.teeth;
+            }
+            // The worm's starts and a hypoid pinion's teeth have their own cap.
+            let hi = if p.is_worm_thread() { hi } else { hi.min(max_teeth) };
+            lo..=hi.max(lo)
+        };
+        let (ra, rb) = (range(a), range(b));
+        if self.mates(a) > 1 && self.mates(b) > 1 {
+            return Err("Both gears mesh with other parts too: changing either would change those ratios.".into());
+        }
+        let now = (self.gears[a].params.teeth, self.gears[b].params.teeth);
+        let (za, zb) = teeth_for_ratio(target, ra, rb, now).ok_or("No tooth counts fit the limits.")?;
+        self.gears[a].params.teeth = za;
+        self.gears[b].params.teeth = zb;
+        self.normalize();
+        let held = [a, b].into_iter().find(|&k| self.mates(k) > 1).map(|k| self.gears[k].name.clone());
+        Ok(Resized { driving: za, driven: zb, held })
     }
 
     /// Change a belted pulley's belt to the one whose centre distance comes
@@ -848,7 +1072,7 @@ impl Project {
         for i in 0..self.gears.len() {
             for j in i + 1..self.gears.len() {
                 let (a, b) = (&self.gears[i], &self.gears[j]);
-                if a.params.is_bevel() || b.params.is_bevel() || a.params.is_hypoid() || b.params.is_hypoid() {
+                if a.params.is_bevel() || b.params.is_bevel() || a.params.is_generated() || b.params.is_generated() {
                     continue;
                 }
                 let related = |x: &Gear, y: &Gear| matches!(x.placement, Placement::Mesh { parent, .. } if parent == y.id);
@@ -869,6 +1093,64 @@ impl Project {
     }
 }
 
+/// What `size_pair_to_ratio` did: the pair's new teeth, and the part that
+/// kept its teeth because it meshes with another.
+pub struct Resized {
+    pub driving: u32,
+    pub driven: u32,
+    pub held: Option<String>,
+}
+
+/// The fewest and most teeth a part of this kind can take. A spur gear
+/// stops at undercut (or where it is now, if it is already below), a
+/// worm at its starts.
+fn tooth_range(p: &GearParams) -> (u32, u32) {
+    match p.worm_drive {
+        Some(worm::Role::Worm) => return (*worm::STARTS.start(), *worm::STARTS.end()),
+        Some(worm::Role::Wheel) => return (20, 400),
+        None => {}
+    }
+    match (p.hypoid, p.worm) {
+        (Some(Role::Pinion), true) => return (3, 7),
+        (Some(Role::Pinion), false) => return (5, 60),
+        (Some(Role::Ring), _) => return (10, 400),
+        (None, _) => {}
+    }
+    if let Some(b) = p.belt {
+        return (b.min_teeth(), 400);
+    }
+    if p.is_bevel() {
+        return (10, 400);
+    }
+    let sin = p.pressure_angle.to_radians().sin();
+    let clean = (2.0 * (p.addendum - p.profile_shift) / (sin * sin)).ceil().max(6.0) as u32;
+    (clean.min(p.teeth.max(6)), 400)
+}
+
+/// Tooth counts (driving, driven) in the given ranges whose ratio
+/// driven / driving comes nearest `target`; of equally near ones, the
+/// pair closest in size to `now`.
+pub fn teeth_for_ratio(target: f64, a: RangeInclusive<u32>, b: RangeInclusive<u32>, now: (u32, u32)) -> Option<(u32, u32)> {
+    let size = |za: u32, zb: u32| (za as f64 + zb as f64 - (now.0 + now.1) as f64).abs() + 1e-3 * (za as f64 - now.0 as f64).abs();
+    let mut best: Option<((u32, u32), f64, f64)> = None;
+    for za in a {
+        let ideal = target * za as f64;
+        for zb in [ideal.floor(), ideal.ceil()] {
+            let zb = (zb.max(0.0) as u32).clamp(*b.start(), *b.end());
+            let err = ((zb as f64 / za as f64) / target - 1.0).abs();
+            let sz = size(za, zb);
+            let better = match best {
+                None => true,
+                Some((_, e, s)) => err < e - 1e-12 || (err <= e + 1e-12 && sz < s),
+            };
+            if better {
+                best = Some(((za, zb), err, sz));
+            }
+        }
+    }
+    best.map(|b| b.0)
+}
+
 /// Where a new belt drive starts: about a pulley diameter of daylight
 /// between the two.
 pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
@@ -876,6 +1158,11 @@ pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
 }
 
 fn kind_name(params: &GearParams) -> &'static str {
+    match params.worm_drive {
+        Some(worm::Role::Worm) => return "Worm",
+        Some(worm::Role::Wheel) => return "Worm wheel",
+        None => {}
+    }
     match (params.hypoid, params.worm) {
         (Some(Role::Pinion), false) => return "Pinion",
         (Some(Role::Ring), false) => return "Ring gear",
@@ -1138,6 +1425,71 @@ mod tests {
         let names: Vec<&str> = p.gears.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["Worm 1", "Worm wheel 1"]);
         assert!(p.gears[0].params.worm, "the wheel sets the pair's kind");
+    }
+
+    #[test]
+    fn teeth_for_ratio_finds_exact_pairs_near_the_current_size() {
+        assert_eq!(teeth_for_ratio(2.5, 12..=100, 12..=100, (20, 40)), Some((18, 45)));
+        assert_eq!(teeth_for_ratio(2.5, 12..=100, 12..=100, (40, 60)), Some((28, 70)));
+        // A worm: 3 to 7 starts, one wheel tooth per unit of ratio.
+        assert_eq!(teeth_for_ratio(12.0, 3..=7, 10..=200, (3, 30)), Some((3, 36)));
+        // Out of reach: the nearest the limits allow.
+        assert_eq!(teeth_for_ratio(20.0, 12..=100, 12..=100, (20, 40)), Some((12, 100)));
+        // A held gear keeps its teeth.
+        assert_eq!(teeth_for_ratio(3.0, 17..=17, 12..=100, (17, 30)), Some((17, 51)));
+    }
+
+    #[test]
+    fn sizing_to_a_ratio_keeps_gears_that_mesh_elsewhere() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter(20), 0.0, 0.0);
+        let b = p.add_child(a, PitchUnit::Module.starter(30), Link::Mesh);
+        let r = p.size_pair_to_ratio(1, 3.0, 120).unwrap();
+        assert_eq!((p.gears[0].params.teeth, p.gears[1].params.teeth), (r.driving, r.driven));
+        assert_eq!(r.driven, 3 * r.driving);
+        assert!(r.held.is_none());
+        // The root's own pair is the same one.
+        assert_eq!(p.ratio_pair(0), Some((0, 1)));
+        // Once b drives a third gear, b holds its teeth for the a-b pair.
+        p.add_child(b, PitchUnit::Module.starter(25), Link::Mesh);
+        let held = p.gears[1].params.teeth;
+        let r = p.size_pair_to_ratio(1, 2.0, 120).unwrap();
+        assert_eq!(r.driven, held);
+        assert_eq!(r.held.as_deref(), Some(p.gears[1].name.as_str()));
+        // A middle gear of three meshes on both sides: nothing to change.
+        p.add_child(a, PitchUnit::Module.starter(25), Link::Mesh);
+        assert!(p.size_pair_to_ratio(1, 2.0, 120).is_err());
+    }
+
+    #[test]
+    fn worm_sets_size_to_a_ratio_with_their_starts() {
+        let mut p = Project::empty();
+        let w = p.add_root(PitchUnit::Module.starter_worm(Role::Pinion), 0.0, 0.0);
+        p.add_child(w, PitchUnit::Module.starter_worm(Role::Ring), Link::Hypoid);
+        let r = p.size_pair_to_ratio(1, 9.5, 120).unwrap();
+        assert_eq!((r.driving, r.driven), (4, 38));
+        assert!(p.solve()[1].hypoid.is_some());
+    }
+
+    #[test]
+    fn worm_drives_are_named_and_sized_by_their_starts() {
+        let mut p = Project::empty();
+        let w = p.add_root(PitchUnit::Module.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+        p.add_child(w, PitchUnit::Module.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        p.normalize();
+        let names: Vec<&str> = p.gears.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Worm 1", "Worm wheel 1"]);
+        let s = p.solve();
+        assert!((s[1].ratio.abs() - 1.0 / 30.0).abs() < 1e-12);
+        // The wheel's axis is square to the worm's, a centre distance off.
+        let d = s[1].worm.as_ref().unwrap();
+        assert!(v_dot(s[1].frame.z, s[0].frame.z).abs() < 1e-12);
+        assert!((d.center - 40.0).abs() < 1e-12);
+        let r = p.size_pair_to_ratio(1, 40.0, 120).unwrap();
+        assert_eq!((r.driving, r.driven), (1, 40));
+        // Exact with 2 starts or 4: 4 keeps the wheel nearer its size.
+        let r = p.size_pair_to_ratio(1, 12.5, 120).unwrap();
+        assert_eq!((r.driving, r.driven), (4, 50));
     }
 
     #[test]

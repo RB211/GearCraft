@@ -261,7 +261,7 @@ pub fn hypoid_solid(m: &Member) -> Solid {
     for (e, k) in [(0usize, 0usize), (1, last)] {
         let st = m.stations[k];
         let ht = m.hub[e];
-        let scale = st * sg;
+        let scale = m.arc_scale(k);
         let base = m.right[k][0][1];
         let mut poly: Vec<[f64; 2]> = vec![[base, ht]];
         poly.extend(m.right[k].iter().map(|&[t, phi]| [phi, t]));

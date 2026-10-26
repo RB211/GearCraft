@@ -1006,6 +1006,57 @@ mod tests {
     }
 
     #[test]
+    fn worm_drives_are_closed() {
+        use crate::train::{Link, PitchUnit, Placement};
+        use crate::worm::Role;
+        let u = PitchUnit::Module;
+        for (starts, throated) in [(1, true), (3, false)] {
+            let mut p = Project::empty();
+            let w = p.add_root(crate::gear::GearParams { teeth: starts, ..u.starter_worm_drive(Role::Worm) }, 0.0, 0.0);
+            p.add_child(w, u.starter_worm_drive(Role::Wheel), Link::Worm);
+            if let Placement::Worm { throated: t, .. } = &mut p.gears[1].placement {
+                *t = throated;
+            }
+            p.normalize();
+            let parts = export::hypoids(&p, 0.2, None, |_| true, |_| None);
+            assert_eq!(parts.len(), 2);
+            let text = step(&[], &[], &parts, "t");
+            assert_closed(&text);
+            assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 2, "{starts} starts");
+        }
+    }
+
+    /// `GEARCRAFT_WORM_STEP=dir cargo test write_worm_samples` writes worm
+    /// drives (and their projects) for checking in a CAD program: a
+    /// single-start worm with a throated wheel, and a 3-start left-hand one
+    /// with a straight wheel.
+    #[test]
+    fn write_worm_samples() {
+        use crate::train::{Link, PitchUnit, Placement};
+        use crate::worm::Role;
+        let Ok(dir) = std::env::var("GEARCRAFT_WORM_STEP") else { return };
+        let dir = std::path::Path::new(&dir);
+        let u = PitchUnit::Module;
+        for (name, starts, throated) in [("worm1", 1, true), ("worm3", 3, false)] {
+            let mut p = Project::empty();
+            let w = p.add_root(crate::gear::GearParams { teeth: starts, ..u.starter_worm_drive(Role::Worm) }, 0.0, 0.0);
+            p.add_child(w, u.starter_worm_drive(Role::Wheel), Link::Worm);
+            if let Placement::Worm { throated: t, left_hand, .. } = &mut p.gears[1].placement {
+                (*t, *left_hand) = (throated, !throated);
+            }
+            p.gears[1].params.backlash = 0.1;
+            p.normalize();
+            std::fs::write(dir.join(format!("{name}.gearcraft")), serde_json::to_string_pretty(&p).unwrap()).unwrap();
+            for (i, g) in p.gears.iter().enumerate() {
+                let one = export::hypoids(&p, 0.0, Some(g.id), |_| true, |_| None);
+                std::fs::write(dir.join(format!("{name}_{i}.step")), step(&[], &[], &one, "w")).unwrap();
+            }
+            let all = export::hypoids(&p, 0.3, None, |_| true, |_| None);
+            std::fs::write(dir.join(format!("{name}_pair.step")), step(&[], &[], &all, "pair")).unwrap();
+        }
+    }
+
+    #[test]
     fn hypoid_gears_are_closed() {
         let parts = export::hypoids(&hypoid_project(), 0.2, None, |_| true, |_| None);
         assert_eq!(parts.len(), 2);

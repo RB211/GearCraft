@@ -7,7 +7,7 @@
 
 use crate::bevel::BevelGeom;
 use crate::gear;
-use crate::hypoid::{Member, Role};
+use crate::hypoid::Member;
 use crate::train::{self, Frame3, Gear, Placement, Project};
 use std::sync::Arc;
 use std::fmt::Write;
@@ -164,7 +164,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .gears
         .iter()
         .zip(&solved)
-        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && !g.params.is_bevel() && !g.params.is_hypoid())
+        .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && !g.params.is_bevel() && !g.params.is_generated())
         .filter_map(|(g, s)| {
             let prof = gear::tooth_profile(&g.params)?;
             let (center, rot) = if only.is_none() { (s.center, s.phase + s.ratio * driver_angle) } else { ([0.0, 0.0], 0.0) };
@@ -216,10 +216,10 @@ pub struct HypoidPart {
     pub rot: f64,
 }
 
-/// The hypoid gears to export, placed as `shapes` places the others.
-/// `cached` hands over a set's teeth if they are already generated (by
-/// ring gear id); otherwise they are generated here. Sets that have no
-/// solution are left out.
+/// The hypoid gears and worm drives to export, placed as `shapes` places
+/// the others. `cached` hands over a pair's teeth if they are already
+/// generated (by ring gear or wheel id); otherwise they are generated here.
+/// Pairs that have no solution are left out.
 pub fn hypoids(
     project: &Project,
     driver_angle: f64,
@@ -230,7 +230,7 @@ pub fn hypoids(
     let solved = project.solve();
     let mut out = Vec::new();
     for ring in &project.gears {
-        let Placement::Hypoid { parent, .. } = ring.placement else { continue };
+        let (Placement::Hypoid { parent, .. } | Placement::Worm { parent, .. }) = ring.placement else { continue };
         let Some(pi) = project.index_of(parent) else { continue };
         let pinion = &project.gears[pi];
         let wanted: Vec<(&Gear, usize)> = [(pinion, 0), (ring, 1)]
@@ -240,10 +240,8 @@ pub fn hypoids(
         if wanted.is_empty() {
             continue;
         }
-        let pair = cached(ring.id).or_else(|| {
-            let d = train::hypoid_spec(&pinion.params, &ring.params, &ring.placement)?.design()?;
-            Some(Arc::new((d.pinion().ok()?, d.ring().ok()?)))
-        });
+        let pair = cached(ring.id)
+            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement)?.generate().ok()?)));
         let Some(pair) = pair else { continue };
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };
@@ -251,7 +249,6 @@ pub fn hypoids(
             let (frame, rot) =
                 if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) };
             let member = if which == 0 { pair.0.clone() } else { pair.1.clone() };
-            debug_assert_eq!(g.params.hypoid, Some(if which == 0 { Role::Pinion } else { Role::Ring }));
             out.push(HypoidPart { name: g.name.clone(), member, frame, rot });
         }
     }

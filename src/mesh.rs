@@ -193,7 +193,13 @@ impl Mesh {
     /// so triangles under max²/8 are not split further: every split
     /// halves two triangles, which bounds the splitting.
     fn curved_polygon(&mut self, idx: &[u32], flat: impl Fn(V3) -> [f64; 2], lift: impl Fn([f64; 2]) -> V3, max: f64, out: V3) {
-        let mut pts: Vec<[f64; 2]> = idx.iter().map(|&i| flat(self.verts[i as usize])).collect();
+        let pts: Vec<[f64; 2]> = idx.iter().map(|&i| flat(self.verts[i as usize])).collect();
+        self.curved_polygon_at(idx, pts, lift, max, out);
+    }
+
+    /// As `curved_polygon`, with the flat point of each corner given, so a
+    /// vertex can stand at two corners (a seam the polygon is cut along).
+    fn curved_polygon_at(&mut self, idx: &[u32], mut pts: Vec<[f64; 2]>, lift: impl Fn([f64; 2]) -> V3, max: f64, out: V3) {
         let mut tris = ear_clip(&pts);
         let key = |a: usize, b: usize| (a.min(b), a.max(b));
         let mut by_edge: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
@@ -526,7 +532,12 @@ fn hypoid(mb: &Member) -> Mesh {
     let mut hub_loops = [Vec::new(), Vec::new()];
     for (e, (a, k)) in [(0, 0), (nu - 1, ns - 1)].into_iter().enumerate() {
         let (zh, rh) = faces[e];
-        let arc = (circle_segments(rh) / z).max(4);
+        let mut arc = (circle_segments(rh) / z).max(4);
+        // A single start is cut down its middle (see below): an even count
+        // puts a foot there.
+        if z == 1 {
+            arc += arc % 2;
+        }
         let seam_phi = |t: usize| mb.right[k][0][1] + t as f64 * pitch;
         let feet: Vec<Vec<u32>> = (0..z)
             .map(|t| {
@@ -550,16 +561,39 @@ fn hypoid(mb: &Member) -> Mesh {
             let sign = if e == 0 { -1.0 } else { 1.0 };
             let out = [sign * sg * centre.cos(), sign * sg * centre.sin(), sign * cg];
             let st = mb.stations[k];
-            m.curved_polygon(
-                &idx,
-                |q| {
-                    let phi = centre + (q[1].atan2(q[0]) - centre + PI).rem_euclid(TAU) - PI;
-                    [phi * st * sg, q[0].hypot(q[1]) * cg - q[2] * sg]
-                },
-                |f| mb.point(st, f[1], f[0] / (st * sg)),
-                END_EDGE,
-                out,
-            );
+            let scale = mb.arc_scale(k);
+            // On a cylinder (a worm drive) the end is a plane, clipped as it
+            // lies, so the hub circle keeps its true bend. A single-start
+            // worm's one tooth goes the whole way round, its seam at both
+            // ends, so it is cut in two from the middle of the tip down to
+            // the hub. A cone's end is laid out flat by azimuth and depth.
+            let plane = sg.abs() < 1e-12;
+            let mut last = centre - pitch / 2.0;
+            let pts: Vec<[f64; 2]> = idx
+                .iter()
+                .map(|&i| {
+                    let q = m.verts[i as usize];
+                    if plane {
+                        return [q[0], q[1]];
+                    }
+                    let a = q[1].atan2(q[0]);
+                    last += (a - last + PI).rem_euclid(TAU) - PI;
+                    [last * scale, q[0].hypot(q[1]) * cg - q[2] * sg]
+                })
+                .collect();
+            let lift = |f: [f64; 2]| if plane { [f[0], f[1], st] } else { mb.point(st, f[1], f[0] / scale) };
+            if z == 1 {
+                let tip_mid = 1 + right[t][a].len() + (tips[t][a].len() - 1) / 2 - 1;
+                let foot_mid = idx.len() - arc / 2;
+                let mut first: Vec<usize> = (0..=tip_mid).collect();
+                first.extend(foot_mid..idx.len());
+                for part in [first, (tip_mid..=foot_mid).collect()] {
+                    let (ix, pt): (Vec<u32>, Vec<[f64; 2]>) = part.into_iter().map(|j| (idx[j], pts[j])).unzip();
+                    m.curved_polygon_at(&ix, pt, lift, END_EDGE, out);
+                }
+            } else {
+                m.curved_polygon_at(&idx, pts, lift, END_EDGE, out);
+            }
             hub_loops[e].extend(&feet[t]);
         }
     }
@@ -602,7 +636,7 @@ pub fn parts(
     };
     let mut out = Vec::new();
     for (i, g) in project.gears.iter().enumerate() {
-        if !(only.is_none_or(|id| id == g.id) && keep(g)) || g.params.is_hypoid() || !g.params.is_buildable() {
+        if !(only.is_none_or(|id| id == g.id) && keep(g)) || g.params.is_generated() || !g.params.is_buildable() {
             continue;
         }
         let mesh = match BevelGeom::new(&g.params) {
@@ -615,7 +649,7 @@ pub fn parts(
         }
     }
     for ring in &project.gears {
-        let Placement::Hypoid { parent, .. } = ring.placement else { continue };
+        let (Placement::Hypoid { parent, .. } | Placement::Worm { parent, .. }) = ring.placement else { continue };
         let Some(pi) = project.index_of(parent) else { continue };
         let pinion = &project.gears[pi];
         let wanted: Vec<(&Gear, usize)> =
@@ -623,10 +657,8 @@ pub fn parts(
         if wanted.is_empty() {
             continue;
         }
-        let pair = cached(ring.id).or_else(|| {
-            let d = train::hypoid_spec(&pinion.params, &ring.params, &ring.placement)?.design()?;
-            Some(Arc::new((d.pinion().ok()?, d.ring().ok()?)))
-        });
+        let pair = cached(ring.id)
+            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement)?.generate().ok()?)));
         let Some(pair) = pair else { continue };
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };
@@ -786,6 +818,7 @@ mod tests {
     use super::*;
     use crate::hypoid::Role;
     use crate::train::{Link, PitchUnit};
+    use crate::worm;
     use std::collections::HashMap;
 
     /// Each edge used once in each direction: closed, manifold and wound
@@ -822,6 +855,16 @@ mod tests {
         // A 3-start bevel worm, its threads wrapping far round.
         let w = p.add_root(GearParams { teeth: 3, ..u.starter_worm(Role::Pinion) }, -300.0, 0.0);
         p.add_child(w, u.starter_worm(Role::Ring), Link::Hypoid);
+        // Worm drives: a single-start worm (its one thread goes the whole
+        // way round each end) with a throated wheel, and a bored 2-start
+        // left-hand worm with a straight wheel.
+        let w = p.add_root(u.starter_worm_drive(worm::Role::Worm), -300.0, -300.0);
+        p.add_child(w, u.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        let w = p.add_root(GearParams { teeth: 2, bore: 6.0, ..u.starter_worm_drive(worm::Role::Worm) }, -600.0, -300.0);
+        let wheel = p.add_child(w, u.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        if let Some(Placement::Worm { throated, left_hand, .. }) = p.gears.iter_mut().find(|g| g.id == wheel).map(|g| &mut g.placement) {
+            (*throated, *left_hand) = (false, true);
+        }
         p.normalize();
         p
     }

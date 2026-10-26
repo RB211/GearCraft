@@ -15,6 +15,7 @@ mod pulley;
 mod step;
 mod train;
 mod view3d;
+mod worm;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--version" || a == "-V") {

@@ -154,6 +154,8 @@ pub enum Icon<'a> {
     Bevel,
     /// A conical worm lying on its side.
     Worm,
+    /// A straight worm lying across the top of its wheel.
+    WormDrive,
 }
 
 /// A bevel gear in perspective: a cone frustum with its teeth running
@@ -203,6 +205,23 @@ fn worm_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
     painter.add(Shape::convex_polygon(face, color, Stroke::NONE));
 }
 
+/// A worm drive: a straight worm lying across the top of its wheel, its
+/// threads slanting over it.
+fn worm_drive_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
+    gear_mark(painter, c + vec2(0.0, 5.0), 7.5, color);
+    let (x0, x1, y0, y1) = (-12.0f32, 12.0f32, -11.0f32, -4.0f32);
+    let at = |x: f32, y: f32| c + vec2(x, y);
+    let body = vec![at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)];
+    painter.add(Shape::convex_polygon(body, color.gamma_multiply(0.5), Stroke::NONE));
+    let (lean, width) = (2.5, 1.8);
+    let mut x = x0 + 0.5;
+    while x + lean + width <= x1 {
+        let quad = vec![at(x, y0), at(x + width, y0), at(x + lean + width, y1), at(x + lean, y1)];
+        painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+        x += 4.0;
+    }
+}
+
 /// A belt drive: small and large pulley joined by the belt's straight runs.
 fn pulley_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
     let (c1, r1) = (c + vec2(-7.0, 2.0), 4.5);
@@ -234,6 +253,7 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, at: Pos2, color: Color32) {
         Icon::Pulley => pulley_mark(painter, at, color),
         Icon::Bevel => bevel_mark(painter, at, color),
         Icon::Worm => worm_mark(painter, at, color),
+        Icon::WormDrive => worm_drive_mark(painter, at, color),
     }
 }
 
