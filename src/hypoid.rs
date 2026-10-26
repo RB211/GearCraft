@@ -791,8 +791,9 @@ fn build_member(
 }
 
 /// Lower a face cone until the generating body no longer reaches the tooth
-/// tops anywhere along the face (its raised root sets the clearance).
-fn clear_tips(mut blank: Blank, pitch: f64, gap: &(dyn Fn(f64, f64, f64) -> f64 + Sync)) -> Blank {
+/// tops anywhere along the face (its raised root sets the clearance),
+/// leaving a top land at least `land` wide.
+fn clear_tips(mut blank: Blank, pitch: f64, land: f64, gap: &(dyn Fn(f64, f64, f64) -> f64 + Sync)) -> Blank {
     for _ in 0..3 {
         let b = blank;
         let overlap = |k: usize| {
@@ -804,7 +805,9 @@ fn clear_tips(mut blank: Blank, pitch: f64, gap: &(dyn Fn(f64, f64, f64) -> f64 
                 .map(|i| pitch * i as f64 / n as f64)
                 .min_by(|x, y| gap(s, tip, *x).total_cmp(&gap(s, tip, *y)))
                 .unwrap_or(0.0);
-            let touched = |t: f64| (-3..=3).any(|i| gap(s, t, mid + pitch * i as f64 / 18.0) >= 0.0);
+            // The land across the middle, as an azimuth at this depth.
+            let half = |t: f64| land / 2.0 / (s * b.pitch.sin() + t * b.pitch.cos());
+            let touched = |t: f64| (-2..=2).any(|i| gap(s, t, mid + half(t) * i as f64 / 2.0) >= 0.0);
             if !touched(tip) {
                 return 0.0;
             }
@@ -1092,7 +1095,8 @@ impl Design {
                 .fold(f64::MIN, f64::max)
         };
         let h = self.depth;
-        let blank = clear_tips(blank, TAU / zp, &gap);
+        // The usual least top land for bevel gears: a quarter module.
+        let blank = clear_tips(blank, TAU / zp, 0.25 * self.spec.module, &gap);
         build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], &gap)
     }
 }

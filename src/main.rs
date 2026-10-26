@@ -10,6 +10,7 @@ mod chrome;
 mod export;
 mod gear;
 mod hypoid;
+mod mesh;
 mod pulley;
 mod step;
 mod train;
@@ -43,7 +44,7 @@ fn main() -> eframe::Result {
     eframe::run_native("GearCraft", options, Box::new(move |cc| Ok(Box::new(app::GearCraftApp::new(cc, file)))))
 }
 
-/// `gearcraft [project] --export out.dxf|out.svg`: write the train without
+/// `gearcraft [project] --export out.dxf|svg|step|stl|3mf|obj`: write the train without
 /// opening a window.
 fn headless_export(file: Option<std::path::PathBuf>, out: &std::path::Path) -> eframe::Result {
     let mut project = match &file {
@@ -54,6 +55,12 @@ fn headless_export(file: Option<std::path::PathBuf>, out: &std::path::Path) -> e
         None => train::Project::default(),
     };
     project.normalize();
+    let ext = out.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "stl" | "3mf" | "obj") {
+        let parts = mesh::parts(&project, 0.0, None, |_| true, |_| None);
+        mesh::write(out, &parts).unwrap_or_else(|e| fail(&format!("{}: {e}", out.display())));
+        return Ok(());
+    }
     let shapes = export::shapes(&project, 0.0, None, |_| true);
     let bevels = export::bevels(&project, 0.0, None, |_| true);
     let hypoids = export::hypoids(&project, 0.0, None, |_| true, |_| None);

@@ -561,14 +561,16 @@ fn chord_params(rows: &[Vec<[f64; 3]>]) -> Vec<f64> {
 /// A bicubic B-spline surface through a grid of points [u][v]: its
 /// control net and knots. Rows along u share `u_params`, so two patches
 /// built from the same row of points share that boundary exactly.
-struct Patch {
+pub(crate) struct Patch {
     net: Vec<Vec<[f64; 3]>>,
     uk: Vec<f64>,
     vk: Vec<f64>,
+    /// Where the data rows sit along v.
+    pub(crate) vp: Vec<f64>,
 }
 
 impl Patch {
-    fn through(data: &[Vec<[f64; 3]>], u_params: &[f64]) -> Patch {
+    pub(crate) fn through(data: &[Vec<[f64; 3]>], u_params: &[f64]) -> Patch {
         let v_params = chord_params(data);
         let (uk, vk) = (interp_knots(u_params), interp_knots(&v_params));
         let rows: Vec<Vec<[f64; 3]>> = data.iter().map(|r| interpolate(r, &v_params, &vk)).collect();
@@ -576,7 +578,20 @@ impl Patch {
         let cols: Vec<Vec<[f64; 3]>> =
             (0..nv).map(|j| interpolate(&rows.iter().map(|r| r[j]).collect::<Vec<_>>(), u_params, &uk)).collect();
         let net = (0..rows.len()).map(|i| cols.iter().map(|c| c[i]).collect()).collect();
-        Patch { net, uk, vk }
+        Patch { net, uk, vk, vp: v_params }
+    }
+
+    pub(crate) fn eval(&self, u: f64, v: f64) -> [f64; 3] {
+        let (bu, bv) = (basis(&self.uk, u), basis(&self.vk, v));
+        let mut out = [0.0; 3];
+        for (i, row) in self.net.iter().enumerate() {
+            for (j, q) in row.iter().enumerate() {
+                for d in 0..3 {
+                    out[d] += bu[i] * bv[j] * q[d];
+                }
+            }
+        }
+        out
     }
 
     /// du × dv near the middle of the patch.
@@ -643,6 +658,27 @@ fn spline_surface(w: &mut Writer, p: &Patch) -> usize {
     ))
 }
 
+/// Points across the tip land on each section.
+pub(crate) const TIP_POINTS: usize = 5;
+
+/// A hypoid tooth's surfaces as grids of points [section][across]: its
+/// right flank and left flank (seam to tip) and the tip land between.
+pub(crate) fn tooth_data(m: &Member, tooth: usize) -> [Vec<Vec<[f64; 3]>>; 3] {
+    let rot = tooth as f64 * m.pitch();
+    let tip = (0..m.stations.len())
+        .map(|k| {
+            let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
+            (0..TIP_POINTS)
+                .map(|i| {
+                    let f = i as f64 / (TIP_POINTS - 1) as f64;
+                    m.point(m.stations[k], a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f + rot)
+                })
+                .collect()
+        })
+        .collect();
+    [m.flank(false, tooth), tip, m.flank(true, tooth)]
+}
+
 /// A hypoid gear or pinion as a MANIFOLD_SOLID_BREP, in its own frame
 /// (pitch apex at the origin, axis +z) and placed by `w.place`. Each
 /// flank and tip land is a bicubic B-spline through the generated
@@ -659,7 +695,6 @@ fn hypoid_brep(w: &mut Writer, m: &Member, name: &str) -> Option<usize> {
     let ns = m.stations.len();
     let last = ns - 1;
     let u_params: Vec<f64> = (0..ns).map(|k| k as f64 / last as f64).collect();
-    let tip_n = 5;
     let gamma = m.blank.pitch;
     let (sg, cg) = gamma.sin_cos();
     let e_phi = |phi: f64, sign: f64| [-sign * phi.sin(), sign * phi.cos(), 0.0];
@@ -668,19 +703,7 @@ fn hypoid_brep(w: &mut Writer, m: &Member, name: &str) -> Option<usize> {
     let mut patches: Vec<[(Patch, bool); 3]> = Vec::with_capacity(z);
     for tooth in 0..z {
         let rot = tooth as f64 * pitch;
-        let right = m.flank(false, tooth);
-        let left = m.flank(true, tooth);
-        let tip: Vec<Vec<[f64; 3]>> = (0..ns)
-            .map(|k| {
-                let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
-                (0..tip_n)
-                    .map(|i| {
-                        let f = i as f64 / (tip_n - 1) as f64;
-                        m.point(m.stations[k], a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f + rot)
-                    })
-                    .collect()
-            })
-            .collect();
+        let [right, tip, left] = tooth_data(m, tooth);
         let mid = ns / 2;
         let phi_of = |side: &Vec<Vec<[f64; 2]>>| side[mid][side[mid].len() / 2][1] + rot;
         let tip_phi = (m.right[mid].last().unwrap()[1] + m.left[mid].last().unwrap()[1]) / 2.0 + rot;
@@ -1047,19 +1070,6 @@ mod cloud {
         [x[0] * c - x[1] * s, x[0] * s + x[1] * c, x[2]]
     }
 
-    fn eval(p: &Patch, u: f64, v: f64) -> [f64; 3] {
-        let (bu, bv) = (basis(&p.uk, u), basis(&p.vk, v));
-        let mut out = [0.0; 3];
-        for (i, row) in p.net.iter().enumerate() {
-            for (j, q) in row.iter().enumerate() {
-                for d in 0..3 {
-                    out[d] += bu[i] * bv[j] * q[d];
-                }
-            }
-        }
-        out
-    }
-
     /// Tooth 0's flank surfaces, as written to STEP, sampled densely.
     fn cloud(m: &Member) -> Vec<[f64; 3]> {
         let ns = m.stations.len();
@@ -1069,7 +1079,7 @@ mod cloud {
             let p = Patch::through(&m.flank(left, 0), &up);
             for i in 0..=50 {
                 for j in 0..=80 {
-                    pts.push(eval(&p, i as f64 / 50.0, j as f64 / 80.0));
+                    pts.push(p.eval(i as f64 / 50.0, j as f64 / 80.0));
                 }
             }
         }

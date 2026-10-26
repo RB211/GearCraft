@@ -3,6 +3,7 @@ use crate::chrome::{self, Icon};
 use crate::hypoid::{self, Member, Role};
 use crate::view3d;
 use crate::export::{self, place};
+use crate::mesh;
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
 use crate::train::{self, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
@@ -13,7 +14,7 @@ use eframe::egui::{
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -328,13 +329,20 @@ impl GearCraftApp {
         }
     }
 
-    /// Export as `ext` (dxf, svg or step).
+    /// Export as `ext`: dxf or svg outlines, a step solid, or an stl, 3mf
+    /// or obj mesh.
     fn export(&mut self, whole_train: bool, ext: &str) {
         let only = if whole_train { None } else { self.selected };
-        let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
-        let bevels = export::bevels(&self.project, self.driver_angle, only, |g| self.shown(g));
         // Teeth already generated for the current settings are reused.
         let cached = |id: u64| self.hypoid.get(&id).filter(|j| j.rx.is_none()).and_then(|j| j.members.clone());
+        if matches!(ext, "stl" | "3mf" | "obj") {
+            let parts = mesh::parts(&self.project, self.driver_angle, only, |g| self.shown(g), cached);
+            let first = parts.first().map(|p| p.name.as_str());
+            self.save_export(whole_train, first, ext, |path| mesh::write(path, &parts));
+            return;
+        }
+        let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
+        let bevels = export::bevels(&self.project, self.driver_angle, only, |g| self.shown(g));
         let hypoids = if ext == "step" {
             export::hypoids(&self.project, self.driver_angle, only, |g| self.shown(g), cached)
         } else {
@@ -342,10 +350,25 @@ impl GearCraftApp {
         };
         let solid_only = only.and_then(|id| self.project.get(id)).is_some_and(|g| g.params.is_hypoid());
         if (!bevels.is_empty() || solid_only) && ext != "step" {
-            self.flash("DXF and SVG are flat outlines: export bevel gears as STEP.");
+            self.flash("DXF and SVG are flat outlines: export bevel gears as STEP or a mesh.");
             return;
         }
         let first = shapes.first().map(|s| &s.name).or(bevels.first().map(|b| &b.name)).or(hypoids.first().map(|h| &h.name));
+        let inch = self.project.pitch_unit.is_inch();
+        self.save_export(whole_train, first.map(String::as_str), ext, |path| {
+            export::write(path, &shapes, &bevels, &hypoids, inch)
+        });
+    }
+
+    /// Ask where to put an export, named after the project for the whole
+    /// train or after the part, `first`, for one, and write it there.
+    fn save_export(
+        &mut self,
+        whole_train: bool,
+        first: Option<&str>,
+        ext: &str,
+        write: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) {
         let Some(first) = first else {
             self.flash("Nothing to export");
             return;
@@ -364,7 +387,7 @@ impl GearCraftApp {
         if path.extension().is_none() {
             path.set_extension(ext);
         }
-        match export::write(&path, &shapes, &bevels, &hypoids, self.project.pitch_unit.is_inch()) {
+        match write(&path) {
             Ok(()) => self.flash(format!("Exported {}", path.display())),
             Err(e) => self.flash(format!("Could not write {}: {e}", path.display())),
         }
@@ -1248,17 +1271,18 @@ impl GearCraftApp {
                     let has_sel = self.selected.is_some();
                     // Bevel gears have no flat outline to draw.
                     let flat = self.workspace != Workspace::Bevel;
-                    let why = "Bevel gears export as STEP only";
-                    for (ext, label) in [("step", "STEP (3D solid)"), ("dxf", "DXF"), ("svg", "SVG")] {
-                        let ok = ext == "step" || flat;
+                    let why = "Bevel gears export as STEP or a mesh only";
+                    let solid = [("stl", "STL (mesh)"), ("3mf", "3MF (mesh)"), ("obj", "OBJ (mesh)")];
+                    for (ext, label) in [("step", "STEP (3D solid)")].into_iter().chain(solid).chain([("dxf", "DXF"), ("svg", "SVG")]) {
+                        let ok = !matches!(ext, "dxf" | "svg") || flat;
                         let r = ui.add_enabled(has_sel && ok, egui::Button::new(format!("Selected part as {label}…")));
-                        if r.on_disabled_hover_text(why).clicked() {
+                        if r.on_disabled_hover_text(if ok { "Select a part first" } else { why }).clicked() {
                             self.export(false, ext);
                         }
                     }
                     ui.separator();
-                    for (ext, label) in [("step", "STEP (3D solids)"), ("dxf", "DXF"), ("svg", "SVG")] {
-                        let ok = ext == "step" || flat;
+                    for (ext, label) in [("step", "STEP (3D solids)")].into_iter().chain(solid).chain([("dxf", "DXF"), ("svg", "SVG")]) {
+                        let ok = !matches!(ext, "dxf" | "svg") || flat;
                         let r = ui.add_enabled(ok, egui::Button::new(format!("Whole train as {label}…")));
                         if r.on_disabled_hover_text(why).clicked() {
                             self.export(true, ext);
