@@ -12,7 +12,7 @@ use eframe::egui::{
     Vec2,
 };
 use std::collections::HashMap;
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -72,17 +72,34 @@ enum Pending {
     Quit,
 }
 
+/// What a file dialog's path is for.
+enum PathFor {
+    Open,
+    /// Save the project there, then carry on with what was waiting on it.
+    Save(Option<Pending>),
+    /// Write an export there, gathered when it was asked for, as `ext`.
+    Export(String, Box<dyn FnOnce(&Path) -> std::io::Result<()>>),
+}
+
+/// A file dialog, open on a thread of its own: waiting for it on the UI
+/// thread stalls the window until the desktop calls it unresponsive.
+struct FileDialogJob {
+    rx: mpsc::Receiver<Option<PathBuf>>,
+    what: PathFor,
+}
+
 /// What the ribbon is set up to make. Each kind of gear gets its own
 /// workspace and tools; a project can still mix them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Workspace {
     Spur,
     Bevel,
+    Worm,
     Pulleys,
 }
 
 impl Workspace {
-    const ALL: [Workspace; 3] = [Workspace::Spur, Workspace::Bevel, Workspace::Pulleys];
+    const ALL: [Workspace; 4] = [Workspace::Spur, Workspace::Bevel, Workspace::Worm, Workspace::Pulleys];
     /// On the roadmap, listed so the menu shows where they will go.
     const PLANNED: [&str; 4] = ["Internal & Planetary", "Helical", "Clock Wheels", "Escapements"];
 
@@ -90,6 +107,7 @@ impl Workspace {
         match self {
             Workspace::Spur => "Spur Gears",
             Workspace::Bevel => "Bevel Gears",
+            Workspace::Worm => "Bevel Worms",
             Workspace::Pulleys => "Timing Pulleys",
         }
     }
@@ -98,6 +116,7 @@ impl Workspace {
         match self {
             Workspace::Spur => "⚙",
             Workspace::Bevel => "🔻",
+            Workspace::Worm => "🌀",
             Workspace::Pulleys => "🔗",
         }
     }
@@ -106,6 +125,7 @@ impl Workspace {
         match self {
             Workspace::Spur => Icon::Gear,
             Workspace::Bevel => Icon::Bevel,
+            Workspace::Worm => Icon::Worm,
             Workspace::Pulleys => Icon::Pulley,
         }
     }
@@ -114,13 +134,22 @@ impl Workspace {
         match self {
             Workspace::Spur => "Involute spur gears: meshing pairs, compound trains",
             Workspace::Bevel => "Straight bevel gears with spherical involute teeth, at any shaft angle",
+            Workspace::Worm => "A 3 to 7-start conical worm driving a wheel, its shaft meeting or passing the wheel's axis",
             Workspace::Pulleys => "MXL to XXH timing pulleys and the belts between them",
         }
+    }
+
+    /// Whether the parts have a flat plan view and outline (bevel gears
+    /// and worms leave the plane).
+    fn flat(self) -> bool {
+        !matches!(self, Workspace::Bevel | Workspace::Worm)
     }
 
     fn of(params: &GearParams) -> Self {
         if params.is_pulley() {
             Workspace::Pulleys
+        } else if params.worm {
+            Workspace::Worm
         } else if params.is_bevel() || params.is_hypoid() {
             Workspace::Bevel
         } else {
@@ -160,6 +189,7 @@ pub struct GearCraftApp {
     cursor: Option<[f64; 2]>,
     status: Option<(String, Instant)>,
     pending: Option<Pending>,
+    file_dialog: Option<FileDialogJob>,
     /// Asking whether to convert the gears for a Metric/Inch switch.
     unit_switch: Option<PitchUnit>,
     /// Belt fitting picks from the ISO 5296 lengths only.
@@ -201,6 +231,7 @@ impl GearCraftApp {
             cursor: None,
             status: None,
             pending: None,
+            file_dialog: None,
             unit_switch: None,
             belt_standard_only: true,
             workspace: Workspace::Spur,
@@ -231,7 +262,7 @@ impl GearCraftApp {
 
     /// Bevel gears only make sense in 3D: their axes leave the plane.
     fn in_3d(&self) -> bool {
-        self.three_d || self.workspace == Workspace::Bevel
+        self.three_d || !self.workspace.flat()
     }
 
     fn first_shown(&self) -> Option<u64> {
@@ -291,29 +322,83 @@ impl GearCraftApp {
         }
     }
 
-    fn open_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("GearCraft project", &[FILE_EXT]).pick_file() {
-            self.load(p);
+    /// Open a file dialog filtered to `label` (`ext`): to save, offering
+    /// `name`, or to pick a file. The path comes back to
+    /// `poll_file_dialog`, which uses it for `what`.
+    fn ask_path(&mut self, label: &str, ext: &str, name: Option<String>, what: PathFor) {
+        if self.file_dialog.is_some() {
+            self.flash("A file dialog is already open");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (label, ext) = (label.to_owned(), ext.to_owned());
+        std::thread::spawn(move || {
+            let dialog = rfd::FileDialog::new().add_filter(&label, &[&ext]);
+            let path = match name {
+                Some(name) => dialog.set_file_name(name).save_file(),
+                None => dialog.pick_file(),
+            };
+            let _ = tx.send(path);
+        });
+        self.file_dialog = Some(FileDialogJob { rx, what });
+    }
+
+    /// Carry out a file dialog's job once it has an answer.
+    fn poll_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.file_dialog else { return };
+        let path = match job.rx.try_recv() {
+            Ok(path) => path,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let Some(job) = self.file_dialog.take() else { return };
+        // None: the dialog was cancelled.
+        let Some(mut path) = path else { return };
+        match job.what {
+            PathFor::Open => self.load(path),
+            PathFor::Save(then) => {
+                if path.extension().is_none() {
+                    path.set_extension(FILE_EXT);
+                }
+                if self.write_project(path) {
+                    if let Some(what) = then {
+                        self.perform(ctx, what);
+                    }
+                }
+            }
+            PathFor::Export(ext, write) => {
+                if path.extension().is_none() {
+                    path.set_extension(ext);
+                }
+                match write(&path) {
+                    Ok(()) => self.flash(format!("Exported {}", path.display())),
+                    Err(e) => self.flash(format!("Could not write {}: {e}", path.display())),
+                }
+            }
         }
     }
 
-    fn save(&mut self, save_as: bool) -> bool {
-        let path = match (&self.path, save_as) {
-            (Some(p), false) => p.clone(),
+    fn open_dialog(&mut self) {
+        self.ask_path("GearCraft project", FILE_EXT, None, PathFor::Open);
+    }
+
+    /// Save to the project's file, asking where first if it has none (or
+    /// for Save As); `then` follows once it is saved. True only if it was
+    /// saved here and now, without asking.
+    fn save(&mut self, save_as: bool, then: Option<Pending>) -> bool {
+        match (&self.path, save_as) {
+            (Some(p), false) => self.write_project(p.clone()),
             _ => {
-                let Some(mut p) = rfd::FileDialog::new()
-                    .add_filter("GearCraft project", &[FILE_EXT])
-                    .set_file_name(format!("train.{FILE_EXT}"))
-                    .save_file()
-                else {
-                    return false;
-                };
-                if p.extension().is_none() {
-                    p.set_extension(FILE_EXT);
-                }
-                p
+                self.ask_path("GearCraft project", FILE_EXT, Some(format!("train.{FILE_EXT}")), PathFor::Save(then));
+                false
             }
-        };
+        }
+    }
+
+    fn write_project(&mut self, path: PathBuf) -> bool {
         let text = serde_json::to_string_pretty(&self.project).expect("project serialises");
         match std::fs::write(&path, text) {
             Ok(()) => {
@@ -338,7 +423,8 @@ impl GearCraftApp {
         if matches!(ext, "stl" | "3mf" | "obj") {
             let parts = mesh::parts(&self.project, self.driver_angle, only, |g| self.shown(g), cached);
             let first = parts.first().map(|p| p.name.as_str());
-            self.save_export(whole_train, first, ext, |path| mesh::write(path, &parts));
+            let first = first.map(str::to_owned);
+            self.save_export(whole_train, first, ext, Box::new(move |path| mesh::write(path, &parts)));
             return;
         }
         let shapes = export::shapes(&self.project, self.driver_angle, only, |g| self.shown(g));
@@ -354,10 +440,9 @@ impl GearCraftApp {
             return;
         }
         let first = shapes.first().map(|s| &s.name).or(bevels.first().map(|b| &b.name)).or(hypoids.first().map(|h| &h.name));
+        let first = first.cloned();
         let inch = self.project.pitch_unit.is_inch();
-        self.save_export(whole_train, first.map(String::as_str), ext, |path| {
-            export::write(path, &shapes, &bevels, &hypoids, inch)
-        });
+        self.save_export(whole_train, first, ext, Box::new(move |path| export::write(path, &shapes, &bevels, &hypoids, inch)));
     }
 
     /// Ask where to put an export, named after the project for the whole
@@ -365,9 +450,9 @@ impl GearCraftApp {
     fn save_export(
         &mut self,
         whole_train: bool,
-        first: Option<&str>,
+        first: Option<String>,
         ext: &str,
-        write: impl FnOnce(&Path) -> std::io::Result<()>,
+        write: Box<dyn FnOnce(&Path) -> std::io::Result<()>>,
     ) {
         let Some(first) = first else {
             self.flash("Nothing to export");
@@ -379,18 +464,7 @@ impl GearCraftApp {
         } else {
             first.replace(' ', "_")
         };
-        let Some(mut path) =
-            rfd::FileDialog::new().add_filter(&label, &[ext]).set_file_name(format!("{stem}.{ext}")).save_file()
-        else {
-            return;
-        };
-        if path.extension().is_none() {
-            path.set_extension(ext);
-        }
-        match write(&path) {
-            Ok(()) => self.flash(format!("Exported {}", path.display())),
-            Err(e) => self.flash(format!("Could not write {}: {e}", path.display())),
-        }
+        self.ask_path(&label, ext, Some(format!("{stem}.{ext}")), PathFor::Export(ext.to_owned(), write));
     }
 
     /// Run a New/Open/Quit, or ask first if there are unsaved changes.
@@ -483,6 +557,17 @@ impl GearCraftApp {
         let ring = self.project.add_child(pinion, unit.starter_hypoid(Role::Ring), Link::Hypoid);
         self.project.normalize();
         self.selected = Some(ring);
+    }
+
+    /// A bevel worm set: a 3-start worm driving a 30-tooth wheel, the
+    /// shafts meeting at right angles.
+    fn add_worm_pair(&mut self) {
+        let x = self.clear_x();
+        let unit = self.project.pitch_unit;
+        let worm = self.project.add_root(unit.starter_worm(Role::Pinion), x, 0.0);
+        let wheel = self.project.add_child(worm, unit.starter_worm(Role::Ring), Link::Hypoid);
+        self.project.normalize();
+        self.selected = Some(wheel);
     }
 
     /// Where a new train can go, clear of the parts on show.
@@ -845,6 +930,7 @@ impl GearCraftApp {
                 match self.workspace {
                     Workspace::Spur => "No gears yet. Use \"New Train\" to place one.",
                     Workspace::Bevel => "No bevel gears yet. Use \"New Pair\" to place one.",
+                    Workspace::Worm => "No bevel worms yet. Use \"Worm Set\" to place one.",
                     Workspace::Pulleys => "No pulleys yet. Use \"New Pulley\" to place one.",
                 },
                 FontId::proportional(16.0),
@@ -1261,17 +1347,17 @@ impl GearCraftApp {
                     self.request(&ctx, Pending::Open);
                 }
                 if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
-                    self.save(false);
+                    self.save(false, None);
                 }
                 if ui.add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S")).clicked() {
-                    self.save(true);
+                    self.save(true, None);
                 }
                 ui.separator();
                 ui.menu_button("Export", |ui| {
                     let has_sel = self.selected.is_some();
-                    // Bevel gears have no flat outline to draw.
-                    let flat = self.workspace != Workspace::Bevel;
-                    let why = "Bevel gears export as STEP or a mesh only";
+                    // Bevel gears and worms have no flat outline to draw.
+                    let flat = self.workspace.flat();
+                    let why = "Bevel gears and worms export as STEP or a mesh only";
                     let solid = [("stl", "STL (mesh)"), ("3mf", "3MF (mesh)"), ("obj", "OBJ (mesh)")];
                     for (ext, label) in [("step", "STEP (3D solid)")].into_iter().chain(solid).chain([("dxf", "DXF"), ("svg", "SVG")]) {
                         let ok = !matches!(ext, "dxf" | "svg") || flat;
@@ -1332,6 +1418,11 @@ impl GearCraftApp {
                             self.add_hypoid_pair();
                         }
                     }
+                    Workspace::Worm => {
+                        if ui.button("New bevel worm set").clicked() {
+                            self.add_worm_pair();
+                        }
+                    }
                     Workspace::Pulleys => {
                         if ui.add_enabled(has_sel, egui::Button::new("Add belt drive").shortcut_text("B")).clicked() {
                             self.add_gear(Link::Belt, true);
@@ -1361,7 +1452,7 @@ impl GearCraftApp {
             });
             chrome::bar_separator(ui);
             if chrome::bar_icon(ui, "💾", "Save (Ctrl+S)", true) {
-                self.save(false);
+                self.save(false, None);
             }
             if chrome::bar_icon(ui, "⟲", "Undo (Ctrl+Z)", !self.undo.is_empty()) {
                 self.undo();
@@ -1439,6 +1530,14 @@ impl GearCraftApp {
                     self.add_hypoid_pair();
                 }
             }),
+            Workspace::Worm => chrome::group(ui, "Create", |ui| {
+                if big(ui, Icon::Worm, "Worm Set", false, true)
+                    .on_hover_text("A 3-start conical worm driving a 30-tooth wheel, the shafts meeting at right angles")
+                    .clicked()
+                {
+                    self.add_worm_pair();
+                }
+            }),
             Workspace::Pulleys => chrome::group(ui, "Create", |ui| {
                 if big(ui, Icon::Pulley, "Belt Drive", false, true).on_hover_text("Add a pulley driven by a belt from the selected pulley (B)").clicked() {
                     self.add_gear(Link::Belt, true);
@@ -1485,9 +1584,9 @@ impl GearCraftApp {
             });
         });
         chrome::group(ui, "View", |ui| {
-            let plan_ok = self.workspace != Workspace::Bevel;
+            let plan_ok = self.workspace.flat();
             for (three_d, label, hint) in [(false, "2D", "Plan view"), (true, "3D", "Solids of their face width; drag to orbit")] {
-                let hint = if plan_ok || three_d { hint } else { "Bevel gears are shown in 3D only" };
+                let hint = if plan_ok || three_d { hint } else { "Bevel gears and worms are shown in 3D only" };
                 if big(ui, Icon::Text(label), if three_d { "Solid" } else { "Plan" }, self.in_3d() == three_d, plan_ok || three_d)
                     .on_hover_text(hint)
                     .clicked()
@@ -1572,9 +1671,10 @@ impl GearCraftApp {
             })
             .collect();
         let s = solved[idx].clone();
+        let worm = self.project.gears[idx].params.worm;
         let earlier_pinions: Vec<(u64, String)> = self.project.gears[..idx]
             .iter()
-            .filter(|g| g.params.hypoid == Some(Role::Pinion))
+            .filter(|g| g.params.hypoid == Some(Role::Pinion) && g.params.worm == worm)
             .map(|g| (g.id, g.name.clone()))
             .collect();
         let hypoid_ring = self.hypoid_ring(idx);
@@ -1663,9 +1763,20 @@ impl GearCraftApp {
             } else if let Some(role) = g.params.hypoid {
                 section(ui, "Teeth", |ui| {
                     egui::Grid::new("teeth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label("Teeth");
-                        let range = if role == Role::Pinion { 5..=60 } else { 10..=200 };
-                        ui.add(egui::DragValue::new(&mut g.params.teeth).range(range).speed(0.2));
+                        if worm && role == Role::Pinion {
+                            ui.label("Starts");
+                            ui.horizontal(|ui| {
+                                for z in 3..=7 {
+                                    ui.selectable_value(&mut g.params.teeth, z, z.to_string());
+                                }
+                            })
+                            .response
+                            .on_hover_text("The worm's threads: its teeth. More starts turn the wheel faster.");
+                        } else {
+                            ui.label("Teeth");
+                            let range = if role == Role::Pinion { 5..=60 } else { 10..=200 };
+                            ui.add(egui::DragValue::new(&mut g.params.teeth).range(range).speed(0.2));
+                        }
                         ui.end_row();
                         if role == Role::Ring {
                             ui.label(if unit.is_inch() { "Diametral pitch (heel)" } else { "Module (heel)" });
@@ -1686,7 +1797,8 @@ impl GearCraftApp {
                         }
                     });
                     if role == Role::Pinion {
-                        ui.label(RichText::new("Tooth size, pressure angle and face width are set on the ring gear.").weak().small());
+                        let on = if worm { "wheel" } else { "ring gear" };
+                        ui.label(RichText::new(format!("Tooth size, pressure angle and face width are set on the {on}.")).weak().small());
                     }
                 });
             } else {
@@ -1936,14 +2048,19 @@ impl GearCraftApp {
                         ui.end_row();
                     }
                     Placement::Hypoid { parent, angle, offset, shaft_angle, spiral, reverse_hand, cutter_radius } => {
-                        ui.label("Pinion");
+                        ui.label(if worm { "Worm" } else { "Pinion" });
                         parent_combo(ui, parent, &earlier_pinions);
                         ui.end_row();
                         ui.label("Shaft offset");
-                        len_drag(ui, offset, unit, -10000.0..=10000.0, 0.1).on_hover_text(
+                        let hint = if worm {
+                            "How far the worm's shaft passes from the wheel's axis. 0: the shafts meet. \
+                             More offset makes a fatter worm, and turns the wheel's teeth straighter, \
+                             so the overlap along the face falls."
+                        } else {
                             "How far the pinion's shaft passes from the ring gear's axis. Positive puts a \
-                             car's pinion below the ring's centre; 0 makes a spiral bevel pair.",
-                        );
+                             car's pinion below the ring's centre; 0 makes a spiral bevel pair."
+                        };
+                        len_drag(ui, offset, unit, -10000.0..=10000.0, 0.1).on_hover_text(hint);
                         ui.end_row();
                         ui.label("Shaft angle");
                         ui.horizontal(|ui| {
@@ -1954,14 +2071,24 @@ impl GearCraftApp {
                         .on_hover_text("Angle between the shafts, seen along the offset.");
                         ui.end_row();
                         ui.label("Spiral angle");
-                        ui.add(egui::DragValue::new(spiral).speed(0.2).range(0.0..=60.0).suffix("°"))
-                            .on_hover_text("The pinion's mean spiral angle. Cars use about 45–50°.");
+                        if worm {
+                            ui.add(egui::DragValue::new(spiral).speed(0.2).range(20.0..=65.0).suffix("°")).on_hover_text(
+                                "The worm's mean spiral angle: 90° less its lead angle. Steeper wraps the \
+                                 threads further round and overlaps more teeth along the face.",
+                            );
+                        } else {
+                            ui.add(egui::DragValue::new(spiral).speed(0.2).range(0.0..=60.0).suffix("°"))
+                                .on_hover_text("The pinion's mean spiral angle. Cars use about 45–50°.");
+                        }
                         ui.end_row();
                         ui.label("Hand");
-                        ui.checkbox(reverse_hand, "Opposite hand").on_hover_text(
+                        let hint = if worm {
+                            "Make the worm right-handed; it is left-handed unless this is ticked."
+                        } else {
                             "Swap the spiral hands from the usual ones for this offset (a left-hand \
-                             pinion with the pinion below centre).",
-                        );
+                             pinion with the pinion below centre)."
+                        };
+                        ui.checkbox(reverse_hand, "Opposite hand").on_hover_text(hint);
                         ui.end_row();
                         ui.label("Cutter radius");
                         let mut auto = *cutter_radius <= 0.0;
@@ -1978,7 +2105,7 @@ impl GearCraftApp {
                         ui.end_row();
                         ui.label("Direction");
                         ui.add(egui::DragValue::new(angle).speed(0.5).range(-360.0..=360.0).suffix("°"))
-                            .on_hover_text("Turns the ring gear round the pinion's shaft.");
+                            .on_hover_text(if worm { "Turns the wheel round the worm's shaft." } else { "Turns the ring gear round the pinion's shaft." });
                         ui.end_row();
                     }
                     Placement::Axle { parent, phase } => {
@@ -2015,13 +2142,28 @@ impl GearCraftApp {
             match &hypoid_state {
                 Some((_, Some(e))) => issues.push(Issue { level: Level::Error, text: e.clone() }),
                 Some(_) if hypoid_design.is_none() => {
-                    issues.push(Issue { level: Level::Error, text: "These settings have no hypoid solution.".into() })
+                    let what = if p.worm { "bevel worm" } else { "hypoid" };
+                    issues.push(Issue { level: Level::Error, text: format!("These settings have no {what} solution.") })
                 }
                 None if p.hypoid == Some(Role::Pinion) => issues.push(Issue {
                     level: Level::Warning,
-                    text: "No ring gear: add one with Hypoid Set, or point a ring gear at this pinion.".into(),
+                    text: if p.worm {
+                        "No wheel: add a set with Worm Set, or point a wheel at this worm.".into()
+                    } else {
+                        "No ring gear: add one with Hypoid Set, or point a ring gear at this pinion.".into()
+                    },
                 }),
                 _ => {}
+            }
+            if let Some(d) = hypoid_design.as_ref().filter(|_| p.worm) {
+                if d.face_contact_ratio() < 1.0 {
+                    issues.push(Issue {
+                        level: Level::Warning,
+                        text: "The teeth overlap less than one pitch along the face, so the drive will be rough: \
+                               raise the spiral angle or the face width."
+                            .into(),
+                    });
+                }
             }
             section(ui, "Dimensions", |ui| {
                 if !p.is_buildable() {
@@ -2045,6 +2187,11 @@ impl GearCraftApp {
                             value_row(ui, "Mean cone distance", fmt(d.ring_cone));
                             value_row(ui, "Addendum / dedendum", format!("{} / {}", fmt(d.ring_addendum), fmt(d.ring_dedendum)));
                         } else {
+                            if p.worm {
+                                value_row(ui, "Starts", d.spec.pinion_teeth.to_string());
+                                value_row(ui, "Mean lead angle", deg(PI / 2.0 - d.pinion_spiral.abs()));
+                                value_row(ui, "Pitch Ø (heel)", fmt(d.spec.module * d.spec.pinion_teeth as f64));
+                            }
                             value_row(ui, "Pitch cone angle", deg(d.pinion_pitch));
                             value_row(ui, "Face cone angle", deg(d.pinion_face_angle()));
                             value_row(ui, "Root cone angle", deg(d.pinion_root_angle()));
@@ -2054,6 +2201,9 @@ impl GearCraftApp {
                             value_row(ui, "Addendum / dedendum", format!("{} / {}", fmt(d.pinion_addendum), fmt(d.pinion_dedendum)));
                         }
                         value_row(ui, "Ratio", format!("{:.4} : 1", d.spec.ring_teeth as f64 / d.spec.pinion_teeth as f64));
+                        if p.worm {
+                            value_row(ui, "Face contact ratio", format!("{:.2}", d.face_contact_ratio()));
+                        }
                         value_row(ui, "Shaft offset", fmt(d.spec.offset));
                         value_row(ui, "Mean normal module", format!("{:.4} mm", d.mn));
                         value_row(ui, "Whole depth", fmt(d.depth + d.clearance));
@@ -2205,6 +2355,7 @@ impl GearCraftApp {
             ui.label(match self.workspace {
                 Workspace::Spur => format!("{n} gears"),
                 Workspace::Bevel => format!("{n} bevel gears"),
+                Workspace::Worm => format!("{n} worm parts"),
                 Workspace::Pulleys => format!("{n} pulleys"),
             });
             if let Some((msg, at)) = &self.status {
@@ -2221,9 +2372,9 @@ impl GearCraftApp {
         let cmd_shift = |k| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k);
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
         if pressed(cmd_shift(Key::S)) {
-            self.save(true);
+            self.save(true, None);
         } else if pressed(cmd(Key::S)) {
-            self.save(false);
+            self.save(false, None);
         }
         if pressed(cmd(Key::O)) {
             self.request(ctx, Pending::Open);
@@ -2268,6 +2419,7 @@ impl GearCraftApp {
                     self.add_bevel(Link::Axle);
                 }
             }
+            Workspace::Worm => {}
             Workspace::Pulleys => {
                 if key(Key::B) {
                     self.add_gear(Link::Belt, true);
@@ -2309,7 +2461,7 @@ impl GearCraftApp {
         match choice {
             Some(0) => {
                 self.pending = None;
-                if self.save(false) {
+                if self.save(false, Some(what)) {
                     self.perform(ctx, what);
                 }
             }
@@ -2384,6 +2536,7 @@ impl GearCraftApp {
 impl eframe::App for GearCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_file_dialog(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(Pending::Quit);
@@ -2636,6 +2789,26 @@ mod tests {
                 app.add_hypoid_pair();
             }
             app.three_d = true;
+            harness.step();
+            let start = Instant::now();
+            while harness.state().hypoid_pending() && start.elapsed() < Duration::from_secs(120) {
+                std::thread::sleep(Duration::from_millis(100));
+                harness.step();
+            }
+            harness.state_mut().fit_pending = true;
+            harness.step();
+            harness.step();
+        }
+        if std::env::var("GEARCRAFT_SHOT_WORM").is_ok() {
+            let app = harness.state_mut();
+            app.switch_workspace(Workspace::Worm);
+            if app.first_shown().is_none() {
+                app.add_worm_pair();
+            }
+            // GEARCRAFT_SHOT_WORM=worm selects the worm rather than the wheel.
+            if std::env::var("GEARCRAFT_SHOT_WORM").as_deref() == Ok("worm") {
+                app.selected = app.first_shown();
+            }
             harness.step();
             let start = Instant::now();
             while harness.state().hypoid_pending() && start.elapsed() < Duration::from_secs(120) {

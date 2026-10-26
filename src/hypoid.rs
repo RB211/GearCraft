@@ -91,6 +91,10 @@ fn unit(a: V3) -> V3 {
 
 // ---- pitch design -----------------------------------------------------------
 
+/// The steepest ring pitch cone, degrees: a bevel worm's wheel comes close
+/// to a face gear.
+const MAX_RING_PITCH: f64 = 89.0;
+
 /// The solved pair, in the design frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Design {
@@ -243,7 +247,9 @@ impl Spec {
         };
         let psi_g = spiral(n, gg);
         let psi_p = spiral(mul(-1.0, n), gp);
-        let r2 = hand * psi_p - self.spiral.to_radians();
+        // A tooth line has no direction: measured modulo 180°, the error
+        // runs on smoothly where the line turns square to the generator.
+        let r2 = (hand * psi_p - self.spiral.to_radians() + PI / 2.0).rem_euclid(PI) - PI / 2.0;
         let rp = norm(cross(d, sub(p, apex)));
         let pinion_pitch = dot(unit(sub(p, apex)), d).clamp(-1.0, 1.0).acos();
         let xp = unit(sub(sub(p, apex), mul(dot(sub(p, apex), d), d)));
@@ -306,51 +312,65 @@ impl Spec {
             }
             return None;
         }
+        // Near a face gear (a bevel worm's wheel) each root has a mirror
+        // image with the ring's cone turned inside out, past 90°: search,
+        // and step, only below the steepest cone `proportions` takes.
+        let steepest = MAX_RING_PITCH.to_radians();
         let f = |x: [f64; 2]| self.trial(x[0], x[1], hand, None).res;
-        // Coarse search, then Newton.
-        let rg = self.ring_outer_radius();
-        let mut best = ([0.0, g0], f64::INFINITY);
-        for i in -12..=12 {
-            for j in -8..=8 {
-                let x = [(self.offset / rg).clamp(-0.9, 0.9) * (0.5 + 0.04 * i as f64), g0 + 0.04 * j as f64];
+        let newton = |mut x: [f64; 2]| -> Option<[f64; 2]> {
+            for _ in 0..60 {
                 let r = f(x);
-                let e = r[0] * r[0] + r[1] * r[1];
-                if e < best.1 {
-                    best = (x, e);
+                if r[0].abs() + r[1].abs() < 1e-13 {
+                    break;
                 }
+                let h = 1e-7;
+                let mut jac = [[0.0; 2]; 2];
+                for k in 0..2 {
+                    let mut xh = x;
+                    xh[k] += h;
+                    let rh = f(xh);
+                    jac[0][k] = (rh[0] - r[0]) / h;
+                    jac[1][k] = (rh[1] - r[1]) / h;
+                }
+                let det = jac[0][0] * jac[1][1] - jac[0][1] * jac[1][0];
+                if det.abs() < 1e-300 {
+                    return None;
+                }
+                let dx = [(r[0] * jac[1][1] - r[1] * jac[0][1]) / det, (jac[0][0] * r[1] - jac[1][0] * r[0]) / det];
+                // Damp long steps.
+                let k = (0.2 / (dx[0].abs() + dx[1].abs())).min(1.0);
+                x = [x[0] - k * dx[0], (x[1] - k * dx[1]).min(steepest)];
+            }
+            Some(x)
+        };
+        // Polish the best points of a coarse search until one converges.
+        let rg = self.ring_outer_radius();
+        // A small offset leaves the root within a hair of the rolling cone,
+        // where the spiral swings fast: look closely there too.
+        let near = [-0.02, -0.01, -0.005, -0.002, -0.001, -0.0005, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02];
+        let cones: Vec<f64> = (-8..=8).map(|j| 0.04 * j as f64).chain(near).map(|d| g0 + d).collect();
+        let mut seeds: Vec<([f64; 2], f64)> = Vec::new();
+        for i in -12..=16 {
+            for &gam in &cones {
+                let x = [(self.offset / rg).clamp(-0.9, 0.9) * (0.5 + 0.04 * i as f64), gam];
+                if x[1] >= steepest {
+                    continue;
+                }
+                let r = f(x);
+                seeds.push((x, r[0] * r[0] + r[1] * r[1]));
             }
         }
-        let mut x = best.0;
-        for _ in 0..60 {
-            let r = f(x);
-            if r[0].abs() + r[1].abs() < 1e-13 {
-                break;
-            }
-            let h = 1e-7;
-            let mut jac = [[0.0; 2]; 2];
-            for k in 0..2 {
-                let mut xh = x;
-                xh[k] += h;
-                let rh = f(xh);
-                jac[0][k] = (rh[0] - r[0]) / h;
-                jac[1][k] = (rh[1] - r[1]) / h;
-            }
-            let det = jac[0][0] * jac[1][1] - jac[0][1] * jac[1][0];
-            if det.abs() < 1e-300 {
-                return None;
-            }
-            let dx = [(r[0] * jac[1][1] - r[1] * jac[0][1]) / det, (jac[0][0] * r[1] - jac[1][0] * r[0]) / det];
-            // Damp long steps.
-            let k = (0.2 / (dx[0].abs() + dx[1].abs())).min(1.0);
-            x = [x[0] - k * dx[0], x[1] - k * dx[1]];
-        }
-        let tr = self.trial(x[0], x[1], hand, None);
-        (tr.res[0].abs() + tr.res[1].abs() < 1e-9).then_some(tr.design).flatten()
+        seeds.sort_by(|a, b| a.1.total_cmp(&b.1));
+        seeds.iter().take(12).find_map(|&(x0, _)| {
+            let x = newton(x0)?;
+            let tr = self.trial(x[0], x[1], hand, None);
+            (tr.res[0].abs() + tr.res[1].abs() < 1e-9 && x[1] < steepest).then_some(tr.design).flatten()
+        })
     }
 
     /// Solve the pair: pitch cones, proportions and the ring's cutter.
     pub fn design(&self) -> Option<Design> {
-        if self.pinion_teeth < 5 || self.ring_teeth < self.pinion_teeth || self.module <= 0.0 || self.face <= 0.0 {
+        if self.pinion_teeth < 3 || self.ring_teeth < self.pinion_teeth || self.module <= 0.0 || self.face <= 0.0 {
             return None;
         }
         // The usual hand makes the pinion's spiral angle the larger; with
@@ -431,13 +451,19 @@ impl Design {
             alpha,
             edge,
         };
-        if self.ring_pitch >= 85f64.to_radians() || self.pinion_pitch <= 1f64.to_radians() {
+        if self.ring_pitch >= MAX_RING_PITCH.to_radians() || self.pinion_pitch <= 1f64.to_radians() {
             return None;
         }
         let (lo, hi) = (self.ring_inner - 0.5 * s.face, self.ring_outer + 0.5 * s.face);
         let n = 96;
         self.slot_table = (0..=n).map(|i| lo + (hi - lo) * i as f64 / n as f64).map(|r| (r, self.slot_azimuth(r))).collect();
         Some(())
+    }
+
+    /// Face contact ratio: how far a tooth line advances round the ring
+    /// across the face, in circular pitches at the mean point.
+    pub fn face_contact_ratio(&self) -> f64 {
+        self.spec.face * self.ring_spiral.abs().tan() / (TAU * self.ring_radius / self.spec.ring_teeth as f64)
     }
 
     /// Ring root angle (the cone the cutter's tip plane touches).
@@ -1058,7 +1084,16 @@ impl Design {
         let blank = self.ring_blank();
         let gap = |s: f64, t: f64, phi: f64| self.any_slot(section_point(blank.pitch, s, t, phi), 0.0);
         let h = self.depth;
-        build_member(self.spec.ring_teeth, blank, self.spec.ring_bore, [1.5 * h, 0.5 * h], &gap)
+        let mut m = build_member(self.spec.ring_teeth, blank, self.spec.ring_bore, [1.5 * h, 0.5 * h], &gap)?;
+        // Near a face gear the toe and heel faces come level, or cross:
+        // keep the back (heel) face at least half a tooth depth behind the
+        // front.
+        let [(z_toe, _), (z_heel, _)] = m.hub_faces();
+        let short = z_toe + 0.5 * h - z_heel;
+        if short > 0.0 {
+            m.hub[1] -= short / m.blank.pitch.sin();
+        }
+        Ok(m)
     }
 
     /// The pinion's sections: cut by the rolling ring gear.
@@ -1097,7 +1132,25 @@ impl Design {
         let h = self.depth;
         // The usual least top land for bevel gears: a quarter module.
         let blank = clear_tips(blank, TAU / zp, 0.25 * self.spec.module, &gap);
-        build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], &gap)
+        let mut m = build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], &gap)?;
+        // A slender pinion (a bevel worm's) has little below its roots:
+        // keep the hub circles clear of the bore and off the axis.
+        let (sg, cg) = m.blank.pitch.sin_cos();
+        let rb = self.spec.pinion_bore / 2.0;
+        for (e, k) in [(0, 0), (1, m.stations.len() - 1)] {
+            let s = m.stations[k];
+            let root = s * sg + m.t_root[k] * cg;
+            if root < 0.1 * h {
+                return Err("The pinion's roots reach its axis at the toe: narrow the face or steepen the spiral.".into());
+            }
+            let wall = if rb > 0.0 { rb + 0.25 * h } else { 0.0 };
+            let r = (s * sg + m.hub[e] * cg).max(wall).max(0.5 * root);
+            if r > root - 0.05 * h {
+                return Err("The bore is too big for the pinion: make it smaller.".into());
+            }
+            m.hub[e] = (r - s * sg) / cg;
+        }
+        Ok(m)
     }
 }
 
@@ -1177,20 +1230,19 @@ pub mod tests {
         assert!(norm(sub(mid, d.p)) < 1e-9);
     }
 
-    /// Turn the pair through mesh: pinion flank points never enter the
-    /// ring gear, and some always touch it.
-    #[test]
-    fn pinion_flanks_run_against_the_ring_without_interference() {
-        for offset in [30.0, 0.0] {
-            let d = Spec { offset, ..car() }.design().unwrap();
-            let pinion = d.pinion().unwrap();
-            let ring = d.ring_blank();
-            let k = d.sense * 41.0 / 11.0;
-            let inside = |x: V3| ring.inside([x[0].hypot(x[1]), x[2]], 0.0, 0.0).min(-d.any_slot(x, 0.0));
-            for step in 0..24 {
-                let theta = TAU / 41.0 * step as f64 / 24.0;
+    /// Turn the pair through one ring pitch: at each step, how deep the
+    /// pinion's flanks reach into the ring gear (negative: clear of it).
+    fn deepest_through_mesh(d: &Design) -> Vec<f64> {
+        let pinion = d.pinion().unwrap();
+        let ring = d.ring_blank();
+        let (zp, zg) = (d.spec.pinion_teeth, d.spec.ring_teeth as f64);
+        let k = d.sense * zg / zp as f64;
+        let inside = |x: V3| ring.inside([x[0].hypot(x[1]), x[2]], 0.0, 0.0).min(-d.any_slot(x, 0.0));
+        (0..24)
+            .map(|step| {
+                let theta = TAU / zg * step as f64 / 24.0;
                 let mut deepest = f64::MIN;
-                for tooth in 0..11 {
+                for tooth in 0..zp as usize {
                     for left in [false, true] {
                         for row in pinion.flank(left, tooth) {
                             for q in row {
@@ -1201,8 +1253,48 @@ pub mod tests {
                         }
                     }
                 }
+                deepest
+            })
+            .collect()
+    }
+
+    /// Turn the pair through mesh: pinion flank points never enter the
+    /// ring gear, and some always touch it.
+    #[test]
+    fn pinion_flanks_run_against_the_ring_without_interference() {
+        for offset in [30.0, 0.0] {
+            let d = Spec { offset, ..car() }.design().unwrap();
+            for (step, deepest) in deepest_through_mesh(&d).into_iter().enumerate() {
                 assert!(deepest < 1e-6, "offset {offset}, step {step}: {deepest}");
                 assert!(deepest > -0.05, "offset {offset}, step {step}: no contact ({deepest})");
+            }
+        }
+    }
+
+    /// Bevel worms: 3 to 7 starts on a near-face wheel, the shafts
+    /// meeting or passing a little apart, run in mesh as the car set does,
+    /// with more than a pitch of overlap.
+    #[test]
+    fn bevel_worms_run_against_their_wheels() {
+        for (starts, offset) in [(3, 0.0), (5, 0.0), (7, 0.0), (3, 1.0), (4, 5.0), (6, 10.0), (7, -8.0)] {
+            let spec = Spec {
+                pinion_teeth: starts,
+                ring_teeth: 30,
+                module: 4.0,
+                face: 18.0,
+                offset,
+                spiral: 50.0,
+                backlash: 0.0,
+                pinion_bore: 0.0,
+                ring_bore: 30.0,
+                ..car()
+            };
+            let d = spec.design().unwrap_or_else(|| panic!("{starts} starts, offset {offset}: no design"));
+            assert!(d.face_contact_ratio() > 1.2, "{starts} starts, offset {offset}: {}", d.face_contact_ratio());
+            d.ring().unwrap();
+            for (step, deepest) in deepest_through_mesh(&d).into_iter().enumerate() {
+                assert!(deepest < 1e-6, "{starts} starts, offset {offset}, step {step}: {deepest}");
+                assert!(deepest > -0.05, "{starts} starts, offset {offset}, step {step}: no contact ({deepest})");
             }
         }
     }
@@ -1277,3 +1369,12 @@ pub mod tests {
         }
     }
 }
+
+
+
+
+
+
+
+
+

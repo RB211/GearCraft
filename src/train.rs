@@ -169,6 +169,17 @@ impl PitchUnit {
         }
     }
 
+    /// Half of a bevel worm set: a 3-start worm and a 30-tooth wheel,
+    /// module 4 at the heel. The worm is solid, as it is usually cut on
+    /// its shaft.
+    pub fn starter_worm(self, role: Role) -> GearParams {
+        let m: f64 = if self.is_inch() { 25.4 / 6.0 } else { 4.0 };
+        let p = self.starter(if role == Role::Pinion { 3 } else { 30 });
+        let face = (0.3 * m * 30.0 / 2.0).round();
+        let bore = if role == Role::Pinion { 0.0 } else { 7.5 * m };
+        GearParams { module: m, bore, face_width: face, hypoid: Some(role), worm: true, ..p }
+    }
+
     /// A sensible fresh gear in this system.
     pub fn starter(self, teeth: u32) -> GearParams {
         match self {
@@ -470,9 +481,10 @@ impl Project {
                 Placement::Hypoid {
                     parent,
                     angle: 0.0,
-                    offset: (0.03 * params.module * params.teeth as f64).round() * 5.0,
+                    // A new bevel worm's shafts meet; its threads wrap further.
+                    offset: if params.worm { 0.0 } else { (0.03 * params.module * params.teeth as f64).round() * 5.0 },
                     shaft_angle: 90.0,
-                    spiral: 45.0,
+                    spiral: if params.worm { 50.0 } else { 45.0 },
                     reverse_hand: false,
                     cutter_radius: 0.0,
                 }
@@ -531,7 +543,7 @@ impl Project {
         for i in 0..self.gears.len() {
             let g = &self.gears[i];
             let own = kind_name(&g.params);
-            let is_default = ["Gear", "Pulley", "Bevel", "Pinion", "Ring gear"].iter().filter(|k| **k != own).any(|k| {
+            let is_default = ["Gear", "Pulley", "Bevel", "Pinion", "Ring gear", "Worm", "Worm wheel"].iter().filter(|k| **k != own).any(|k| {
                 g.name.strip_prefix(k).and_then(|n| n.trim().parse::<u32>().ok()).is_some()
             });
             if is_default {
@@ -584,6 +596,7 @@ impl Project {
                             dst.module = src.module;
                             dst.pressure_angle = src.pressure_angle;
                             dst.hypoid = Some(Role::Pinion);
+                            dst.worm = src.worm;
                             self.gears[i].params.hypoid = Some(Role::Ring);
                         }
                         let belted = matches!(self.gears[i].placement, Placement::Belt { .. });
@@ -863,10 +876,12 @@ pub fn starting_center(a: &GearParams, b: &GearParams) -> f64 {
 }
 
 fn kind_name(params: &GearParams) -> &'static str {
-    match params.hypoid {
-        Some(Role::Pinion) => return "Pinion",
-        Some(Role::Ring) => return "Ring gear",
-        None => {}
+    match (params.hypoid, params.worm) {
+        (Some(Role::Pinion), false) => return "Pinion",
+        (Some(Role::Ring), false) => return "Ring gear",
+        (Some(Role::Pinion), true) => return "Worm",
+        (Some(Role::Ring), true) => return "Worm wheel",
+        (None, _) => {}
     }
     if params.is_pulley() {
         "Pulley"
@@ -1109,6 +1124,20 @@ mod tests {
         p.fix_default_names();
         assert_eq!(p.gears[0].name, "Pulley 1");
         assert_eq!(p.gears[1].name, "Motor");
+    }
+
+    #[test]
+    fn bevel_worm_sets_are_named_and_start_with_their_shafts_meeting() {
+        let mut p = Project::empty();
+        let w = p.add_root(PitchUnit::Module.starter_worm(Role::Pinion), 0.0, 0.0);
+        p.add_child(w, PitchUnit::Module.starter_worm(Role::Ring), Link::Hypoid);
+        assert!(matches!(p.gears[1].placement, Placement::Hypoid { offset: 0.0, .. }));
+        // A worm that lost its flag (a hand-edited file).
+        p.gears[0].params.worm = false;
+        p.normalize();
+        let names: Vec<&str> = p.gears.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Worm 1", "Worm wheel 1"]);
+        assert!(p.gears[0].params.worm, "the wheel sets the pair's kind");
     }
 
     #[test]

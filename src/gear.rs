@@ -59,6 +59,11 @@ pub struct GearParams {
     /// `pressure_angle`, `face_width` and `backlash` set the teeth.
     #[serde(default)]
     pub hypoid: Option<Role>,
+    /// Set with `hypoid` on both halves of a bevel worm set: a spiral bevel
+    /// or hypoid pair whose pinion (the worm) has only 3 to 7 teeth, its
+    /// starts.
+    #[serde(default)]
+    pub worm: bool,
 }
 
 impl Default for GearParams {
@@ -79,6 +84,7 @@ impl Default for GearParams {
             belt_width: 0.0,
             bevel: None,
             hypoid: None,
+            worm: false,
         }
     }
 }
@@ -275,7 +281,7 @@ impl GearParams {
 
     pub fn is_buildable(&self) -> bool {
         if self.is_hypoid() {
-            return self.module > 0.0 && self.teeth >= 5;
+            return self.module > 0.0 && self.teeth >= 3;
         }
         if self.is_bevel() {
             return BevelGeom::new(self).is_some();

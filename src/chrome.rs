@@ -152,6 +152,8 @@ pub enum Icon<'a> {
     Pulley,
     /// A mitre pair, side on.
     Bevel,
+    /// A conical worm lying on its side.
+    Worm,
 }
 
 /// A bevel gear in perspective: a cone frustum with its teeth running
@@ -177,6 +179,27 @@ fn bevel_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
         painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
     }
     let face: Vec<Pos2> = (0..24).map(|k| on(top, rt, std::f32::consts::TAU * k as f32 / 24.0)).collect();
+    painter.add(Shape::convex_polygon(face, color, Stroke::NONE));
+}
+
+/// A bevel worm side on: a slender cone, small end left, its threads
+/// slanting across it and its large end face showing.
+fn worm_mark(painter: &egui::Painter, c: Pos2, color: Color32) {
+    let (x0, x1) = (-11.0f32, 10.0f32);
+    let half = |x: f32| 2.5 + 5.0 * (x - x0) / (x1 - x0);
+    let at = |x: f32, y: f32| c + vec2(x, y);
+    let body = vec![at(x0, -half(x0)), at(x1, -half(x1)), at(x1, half(x1)), at(x0, half(x0))];
+    painter.add(Shape::convex_polygon(body, color.gamma_multiply(0.5), Stroke::NONE));
+    // Each thread runs from the top edge down and to the right.
+    let (lean, width) = (3.0, 1.8);
+    let mut x = x0 + 0.5;
+    while x + lean + width <= x1 {
+        let quad = vec![at(x, -half(x)), at(x + width, -half(x + width)), at(x + lean + width, half(x + lean + width)), at(x + lean, half(x + lean))];
+        painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+        x += 4.2;
+    }
+    let face: Vec<Pos2> =
+        (0..20).map(|k| std::f32::consts::TAU * k as f32 / 20.0).map(|a| at(x1 + 1.8 * a.cos(), half(x1) * a.sin())).collect();
     painter.add(Shape::convex_polygon(face, color, Stroke::NONE));
 }
 
@@ -210,6 +233,7 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, at: Pos2, color: Color32) {
         Icon::Gear => gear_mark(painter, at, 11.0, color),
         Icon::Pulley => pulley_mark(painter, at, color),
         Icon::Bevel => bevel_mark(painter, at, color),
+        Icon::Worm => worm_mark(painter, at, color),
     }
 }
 

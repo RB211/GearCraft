@@ -65,19 +65,27 @@ impl Mesh {
     /// One face's triangles, all turned over if they face away from
     /// `out` (taken over the whole face, so a curved face is fine).
     fn face(&mut self, tris: &[[u32; 3]], out: V3) {
+        self.face_by(tris, |_| out);
+    }
+
+    /// As `face`, with the outward direction given at each triangle's
+    /// centre, for a face that wraps far round the axis.
+    fn face_by(&mut self, tris: &[[u32; 3]], out: impl Fn(V3) -> V3) {
         let facing: f64 = tris
             .iter()
             .map(|t| {
                 let [a, b, c] = t.map(|i| self.verts[i as usize]);
-                dot(cross(sub(b, a), sub(c, a)), out)
+                let mid = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+                dot(cross(sub(b, a), sub(c, a)), out(mid))
             })
             .sum();
         let flip = facing < 0.0;
         self.tris.extend(tris.iter().map(|&[a, b, c]| if flip { [a, c, b] } else { [a, b, c] }));
     }
 
-    /// Quads between rows of vertex indices [i][j].
-    fn grid(&mut self, g: &[Vec<u32>], out: V3) {
+    /// Quads between rows of vertex indices [i][j], facing `out` (given
+    /// at each point).
+    fn grid(&mut self, g: &[Vec<u32>], out: impl Fn(V3) -> V3) {
         let mut tris = Vec::new();
         for i in 0..g.len() - 1 {
             for j in 0..g[i].len() - 1 {
@@ -85,7 +93,7 @@ impl Mesh {
                 tris.push([g[i][j], g[i + 1][j + 1], g[i][j + 1]]);
             }
         }
-        self.face(&tris, out);
+        self.face_by(&tris, out);
     }
 
     /// A loop of vertices (azimuth rising) joined to a smaller loop, or
@@ -201,6 +209,8 @@ impl Mesh {
             }
         }
         let mut todo: Vec<(usize, usize)> = by_edge.keys().copied().filter(|&e| len(&pts, e) > max).collect();
+        // In a fixed order, so the same part always meshes the same way.
+        todo.sort_unstable();
         while let Some(e) = todo.pop() {
             // Only inner edges (two triangles) are split.
             let Some(ts) = by_edge.get(&e).cloned().filter(|ts| ts.len() == 2) else { continue };
@@ -500,14 +510,12 @@ fn hypoid(mb: &Member) -> Mesh {
                 row
             })
             .collect();
-        let rot = t as f64 * pitch;
-        let mid = ns / 2;
-        let phi_r = mb.right[mid][mb.right[mid].len() / 2][1] + rot;
-        let phi_l = mb.left[mid][mb.left[mid].len() / 2][1] + rot;
-        let phi_t = (mb.right[mid].last().unwrap()[1] + mb.left[mid].last().unwrap()[1]) / 2.0 + rot;
-        m.grid(&rg, [phi_r.sin(), -phi_r.cos(), 0.0]);
-        m.grid(&lg, [-phi_l.sin(), phi_l.cos(), 0.0]);
-        m.grid(&tg, [cg * phi_t.cos(), cg * phi_t.sin(), -sg]);
+        // Out of the flanks round the axis, and off the cone for the tip: a
+        // worm's teeth wrap far round, so each is taken where it is.
+        let phi = |p: V3| p[1].atan2(p[0]);
+        m.grid(&rg, |p| [phi(p).sin(), -phi(p).cos(), 0.0]);
+        m.grid(&lg, |p| [-phi(p).sin(), phi(p).cos(), 0.0]);
+        m.grid(&tg, |p| [cg * phi(p).cos(), cg * phi(p).sin(), -sg]);
         right.push(rg);
         left.push(lg);
         tips.push(tg);
@@ -811,6 +819,9 @@ mod tests {
         p.add_child(b, u.starter_bevel(40), Link::Bevel);
         let h = p.add_root(u.starter_hypoid(Role::Pinion), 300.0, -300.0);
         p.add_child(h, u.starter_hypoid(Role::Ring), Link::Hypoid);
+        // A 3-start bevel worm, its threads wrapping far round.
+        let w = p.add_root(GearParams { teeth: 3, ..u.starter_worm(Role::Pinion) }, -300.0, 0.0);
+        p.add_child(w, u.starter_worm(Role::Ring), Link::Hypoid);
         p.normalize();
         p
     }
@@ -883,3 +894,4 @@ mod tests {
         }
     }
 }
+
