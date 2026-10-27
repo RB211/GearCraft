@@ -6,7 +6,7 @@
 //! share their boundary vertices rather than meeting at cracks.
 
 use crate::bevel::BevelGeom;
-use crate::export::{fit_arcs, tolerance};
+use crate::export::{alone, fit_arcs, tolerance};
 use crate::gear::{self, GearParams};
 use crate::hypoid::Member;
 use crate::step::{Patch, TIP_POINTS, tooth_data};
@@ -630,9 +630,9 @@ pub fn parts(
     cached: impl Fn(u64) -> Option<Arc<(Member, Member)>>,
 ) -> Vec<Part> {
     let solved = project.solve();
-    let place = |i: usize| {
+    let place = |i: usize, member: Option<&Member>| {
         let s = &solved[i];
-        if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) }
+        if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (alone(&project.gears[i], member), 0.0) }
     };
     let mut out = Vec::new();
     for (i, g) in project.gears.iter().enumerate() {
@@ -644,7 +644,7 @@ pub fn parts(
             None => spur(&g.params),
         };
         if let Some(mesh) = mesh {
-            let (frame, rot) = place(i);
+            let (frame, rot) = place(i, None);
             out.push((i, Part { name: g.name.clone(), mesh: mesh.placed(frame, rot) }));
         }
     }
@@ -663,7 +663,7 @@ pub fn parts(
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };
             let member = if which == 0 { &pair.0 } else { &pair.1 };
-            let (frame, rot) = place(i);
+            let (frame, rot) = place(i, Some(member));
             out.push((i, Part { name: g.name.clone(), mesh: hypoid(member).placed(frame, rot) }));
         }
     }
@@ -877,6 +877,40 @@ mod tests {
         for part in &parts {
             assert_watertight(&part.mesh, &part.name);
         }
+    }
+
+    #[test]
+    fn a_part_alone_sits_on_its_export_origin() {
+        use crate::train::{Datum, ExportOrigin};
+        let u = PitchUnit::Module;
+        let mut p = Project::empty();
+        let spur = p.add_root(u.starter(24), 50.0, 20.0);
+        let bevel = p.add_root(u.starter_bevel(20), 0.0, -200.0);
+        let worm = p.add_root(u.starter_worm_drive(worm::Role::Worm), -300.0, -300.0);
+        p.add_child(worm, u.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        let span = |p: &Project, id: u64, datum: Datum, offset: f64| {
+            let mut p = p.clone();
+            p.gears.iter_mut().find(|g| g.id == id).unwrap().export_origin = ExportOrigin { datum, offset };
+            let part = parts(&p, 0.3, Some(id), |_| true, |_| None).remove(0);
+            let z = part.mesh.verts.iter().map(|v| v[2]);
+            (z.clone().fold(f64::MAX, f64::min), z.fold(f64::MIN, f64::max))
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let fw = p.gears[0].params.face_width;
+        let (lo, hi) = span(&p, spur, Datum::Own, 0.0);
+        assert!(close(lo, 0.0) && close(hi, fw), "{lo} {hi}");
+        let (lo, hi) = span(&p, spur, Datum::Middle, 0.0);
+        assert!(close(lo, -fw / 2.0) && close(hi, fw / 2.0), "{lo} {hi}");
+        let (lo, hi) = span(&p, spur, Datum::Top, 2.5);
+        assert!(close(lo, -fw - 2.5) && close(hi, -2.5), "{lo} {hi}");
+        // A bevel's own origin is its pitch apex, below the teeth; its
+        // flat back face is the top.
+        let (lo, _) = span(&p, bevel, Datum::Own, 0.0);
+        assert!(lo > 0.0, "{lo}");
+        let (_, hi) = span(&p, bevel, Datum::Top, 0.0);
+        assert!(close(hi, 0.0), "{hi}");
+        let (lo, hi) = span(&p, worm, Datum::Middle, 0.0);
+        assert!(close(lo, -hi), "{lo} {hi}");
     }
 
     #[test]

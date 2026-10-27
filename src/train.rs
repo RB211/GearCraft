@@ -55,13 +55,17 @@ pub enum Placement {
     },
     /// The wheel of a cylindrical worm drive turned by worm `parent`: its
     /// axis square to the worm's, `diameter` the worm's pitch diameter.
-    /// `angle` turns the wheel round the worm's axis.
+    /// `angle` turns the wheel round the worm's axis. `friction` is the
+    /// flanks' running friction, which decides whether the wheel can
+    /// drive the worm back.
     Worm {
         parent: u64,
         angle: f64,
         diameter: f64,
         throated: bool,
         left_hand: bool,
+        #[serde(default = "default_friction")]
+        friction: f64,
     },
 }
 
@@ -110,6 +114,42 @@ pub struct Gear {
     /// centred on its partner's face), or from z = 0 for a fixed part.
     #[serde(default)]
     pub axial: f64,
+    /// Where the part's origin goes when it is exported on its own.
+    #[serde(default)]
+    pub export_origin: ExportOrigin,
+}
+
+/// A point on a part's axis, for the origin of a part exported on its
+/// own: a datum, moved `offset` mm along the axis (+Z as exported).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExportOrigin {
+    pub datum: Datum,
+    pub offset: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Datum {
+    /// The part's own origin: a cone gear's pitch apex, or else the
+    /// bottom face.
+    #[default]
+    Own,
+    Bottom,
+    Middle,
+    Top,
+}
+
+impl ExportOrigin {
+    /// Height of the origin in the part's own frame, given the heights of
+    /// its two end faces there (`faces`, low then high).
+    pub fn height(&self, faces: [f64; 2], cone: bool) -> f64 {
+        let base = match self.datum {
+            Datum::Own if cone => 0.0,
+            Datum::Own | Datum::Bottom => faces[0],
+            Datum::Middle => (faces[0] + faces[1]) / 2.0,
+            Datum::Top => faces[1],
+        };
+        base + self.offset
+    }
 }
 
 fn yes() -> bool {
@@ -359,6 +399,10 @@ pub fn worm_spec(worm: &GearParams, wheel: &GearParams, placement: &Placement) -
     })
 }
 
+fn default_friction() -> f64 {
+    worm::DEFAULT_FRICTION
+}
+
 /// A pair whose teeth are generated together: a hypoid or spiral bevel
 /// set (bevel worms included), or a worm drive.
 #[derive(Clone, Debug, PartialEq)]
@@ -521,7 +565,7 @@ impl Project {
     pub fn add_root(&mut self, params: GearParams, x: f64, y: f64) -> u64 {
         let id = self.fresh_id();
         let name = self.fresh_name(&params);
-        self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true, axial: 0.0 });
+        self.gears.push(Gear { id, name, params, placement: Placement::Root { x, y, phase: 0.0 }, match_parent: true, axial: 0.0, export_origin: ExportOrigin::default() });
         id
     }
 
@@ -595,6 +639,7 @@ impl Project {
                     diameter: worm::default_diameter(params.module),
                     throated: true,
                     left_hand: false,
+                    friction: worm::DEFAULT_FRICTION,
                 }
             }
             Link::Belt => {
@@ -612,7 +657,7 @@ impl Project {
         let id = self.fresh_id();
         let name = self.fresh_name(&params);
         let at = self.subtree_end(pi);
-        self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle, axial: 0.0 });
+        self.gears.insert(at, Gear { id, name, params, placement, match_parent: link != Link::Axle, axial: 0.0, export_origin: ExportOrigin::default() });
         id
     }
 
@@ -1047,6 +1092,32 @@ impl Project {
         self.normalize();
         let held = [a, b].into_iter().find(|&k| self.mates(k) > 1).map(|k| self.gears[k].name.clone());
         Ok(Resized { driving: za, driven: zb, held })
+    }
+
+    /// Make the worm drive part `i` belongs to back-drivable at its
+    /// friction (see `worm::Spec::back_drivable`), returning the drive as
+    /// it was and as it is now. The wheel gains teeth to keep the ratio if
+    /// `keep_ratio`, unless it also meshes with another part.
+    pub fn make_back_drivable(&mut self, i: usize, keep_ratio: bool) -> Result<(worm::Spec, worm::Spec), String> {
+        let (k, w) = self.ratio_pair(i).ok_or("This part has no partner.")?;
+        let wheel = &self.gears[w];
+        let Placement::Worm { friction, .. } = wheel.placement else {
+            return Err("Only a worm drive can be made back-drivable.".into());
+        };
+        let old = worm_spec(&self.gears[k].params, &wheel.params, &wheel.placement).ok_or("This is not a worm drive.")?;
+        if self.mates(k) > 1 {
+            return Err("The worm turns another wheel too: changing its starts would change that drive.".into());
+        }
+        let new = old.back_drivable(friction, !keep_ratio || self.mates(w) > 1)?;
+        let worm = &mut self.gears[k].params;
+        worm.teeth = new.starts;
+        worm.face_width = new.length;
+        self.gears[w].params.teeth = new.teeth;
+        if let Placement::Worm { diameter, .. } = &mut self.gears[w].placement {
+            *diameter = new.diameter;
+        }
+        self.normalize();
+        Ok((old, new))
     }
 
     /// Change a belted pulley's belt to the one whose centre distance comes
@@ -1490,6 +1561,30 @@ mod tests {
         // Exact with 2 starts or 4: 4 keeps the wheel nearer its size.
         let r = p.size_pair_to_ratio(1, 12.5, 120).unwrap();
         assert_eq!((r.driving, r.driven), (4, 50));
+    }
+
+    #[test]
+    fn worm_drives_are_made_back_drivable_from_either_part() {
+        for part in [0, 1] {
+            let mut p = Project::empty();
+            let w = p.add_root(PitchUnit::Module.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+            p.add_child(w, PitchUnit::Module.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+            p.normalize();
+            assert_eq!(p.solve()[1].worm.as_ref().unwrap().back_drive(worm::DEFAULT_FRICTION), worm::BackDrive::Running);
+            let (old, new) = p.make_back_drivable(part, true).unwrap();
+            assert_eq!((old.starts, old.teeth), (1, 30));
+            assert_eq!((new.starts, new.teeth), (3, 90));
+            assert_eq!((p.gears[0].params.teeth, p.gears[1].params.teeth), (3, 90));
+            let d = p.solve()[1].worm.clone().unwrap();
+            assert_eq!(d.back_drive(worm::DEFAULT_FRICTION), worm::BackDrive::Free);
+            assert_eq!(d.spec, new);
+        }
+        let mut p = Project::empty();
+        let w = p.add_root(PitchUnit::Module.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+        p.add_child(w, PitchUnit::Module.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        p.normalize();
+        let (_, new) = p.make_back_drivable(1, false).unwrap();
+        assert_eq!((new.starts, new.teeth), (3, 30));
     }
 
     #[test]

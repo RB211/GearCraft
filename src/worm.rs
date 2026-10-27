@@ -99,6 +99,78 @@ pub fn default_diameter(module: f64) -> f64 {
     10.0 * module
 }
 
+/// DIN 3975's least threaded length for a worm, mm.
+pub fn least_length(starts: u32, teeth: u32, module: f64) -> f64 {
+    let z2 = teeth as f64;
+    (if starts <= 2 { 11.0 + 0.06 * z2 } else { 12.5 + 0.09 * z2 }) * module
+}
+
+/// Running friction between the flanks for some usual pairs of materials.
+/// Rough guides: friction falls as the sliding speeds up.
+pub const MATERIALS: [(&str, f64); 5] = [
+    ("Hardened steel on bronze, oiled", 0.05),
+    ("Steel on cast iron, oiled", 0.08),
+    ("Steel on acetal or nylon", 0.15),
+    ("Steel on bronze, dry", 0.2),
+    ("Printed plastic (PLA, PETG), dry", 0.25),
+];
+
+pub const DEFAULT_FRICTION: f64 = 0.05;
+
+/// Friction at rest over friction running: breaking away takes more.
+const BREAKAWAY: f64 = 2.0;
+
+/// The thinnest worm, pitch diameter over module, `back_drivable` makes.
+const LEAST_QUOTIENT: f64 = 8.0;
+
+/// The friction angle across the threads for friction `mu` at normal
+/// pressure angle `pressure_angle` (degrees).
+pub fn friction_angle(mu: f64, pressure_angle: f64) -> f64 {
+    (mu / pressure_angle.to_radians().cos()).atan()
+}
+
+/// The least lead angle `back_drivable` aims for: past the breakaway
+/// friction angle by 5°, and not under 15°.
+pub fn back_drive_lead(mu: f64, pressure_angle: f64) -> f64 {
+    (friction_angle(BREAKAWAY * mu, pressure_angle) + 5f64.to_radians()).max(15f64.to_radians())
+}
+
+/// Whether the wheel can turn the worm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackDrive {
+    /// Friction holds the worm even with the drive running.
+    Locked,
+    /// The wheel keeps a turning worm going, but friction holds one at
+    /// rest (though vibration may let it creep).
+    Running,
+    /// The wheel can start the worm from rest.
+    Free,
+}
+
+impl Design {
+    /// Efficiency with the worm driving, at running friction `mu`.
+    pub fn efficiency(&self, mu: f64) -> f64 {
+        let rho = friction_angle(mu, self.spec.pressure_angle);
+        self.lead_angle.tan() / (self.lead_angle + rho).tan()
+    }
+
+    /// Efficiency with the wheel driving the worm; 0 when it can't.
+    pub fn back_efficiency(&self, mu: f64) -> f64 {
+        let rho = friction_angle(mu, self.spec.pressure_angle);
+        ((self.lead_angle - rho).tan() / self.lead_angle.tan()).max(0.0)
+    }
+
+    pub fn back_drive(&self, mu: f64) -> BackDrive {
+        if self.lead_angle <= friction_angle(mu, self.spec.pressure_angle) {
+            BackDrive::Locked
+        } else if self.lead_angle <= friction_angle(BREAKAWAY * mu, self.spec.pressure_angle) {
+            BackDrive::Running
+        } else {
+            BackDrive::Free
+        }
+    }
+}
+
 impl Spec {
     pub fn design(&self) -> Result<Design, String> {
         let m = self.module;
@@ -151,6 +223,41 @@ impl Spec {
             return Err("The worm's length and the wheel's face width must be more than 0.".into());
         }
         Ok(d)
+    }
+
+    /// This drive made so the wheel can start the worm from rest at
+    /// friction `mu`: the fewest starts (no fewer than now) that reach
+    /// `back_drive_lead` on a worm no thicker than now and not too thin,
+    /// the wheel's teeth multiplied to keep the ratio unless
+    /// `hold_teeth`, and the worm lengthened if DIN 3975 asks. A drive
+    /// that already back-drives comes back as it is.
+    pub fn back_drivable(&self, mu: f64, hold_teeth: bool) -> Result<Spec, String> {
+        let m = self.module;
+        if self.design().is_ok_and(|d| d.back_drive(mu) == BackDrive::Free) {
+            return Ok(self.clone());
+        }
+        let target = back_drive_lead(mu, self.pressure_angle);
+        let ratio = self.teeth as f64 / self.starts as f64;
+        let thinnest = LEAST_QUOTIENT.min(self.diameter / m) * m;
+        for z1 in self.starts.max(*STARTS.start())..=*STARTS.end() {
+            // Rounded down to 0.01 mm, which only steepens the lead.
+            let diameter = (self.diameter.min(z1 as f64 * m / target.tan()) * 100.0).floor() / 100.0;
+            if diameter < thinnest - 0.01 {
+                continue;
+            }
+            let teeth = if hold_teeth { self.teeth } else { (ratio * z1 as f64).round().clamp(20.0, 400.0) as u32 };
+            let length = self.length.max((least_length(z1, teeth, m) * 100.0).ceil() / 100.0);
+            let sp = Spec { starts: z1, teeth, diameter, length, ..self.clone() };
+            if sp.design().is_ok_and(|d| d.back_drive(mu) == BackDrive::Free) {
+                return Ok(sp);
+            }
+        }
+        Err(format!(
+            "Even {} starts can't reach the {:.1}° lead angle this friction needs without making the worm too thin: \
+             choose slicker materials or oil them.",
+            STARTS.end(),
+            target.to_degrees()
+        ))
     }
 }
 
@@ -404,6 +511,41 @@ mod tests {
             }
         }
         deepest
+    }
+
+    #[test]
+    fn back_driving_follows_the_lead_angle() {
+        // 1 start at 10 modules: a 5.7° lead.
+        let d = spec(1, 30, true).design().unwrap();
+        assert_eq!(d.back_drive(0.05), BackDrive::Running);
+        assert_eq!(d.back_drive(0.12), BackDrive::Locked);
+        assert_eq!(d.back_efficiency(0.12), 0.0);
+        assert!(d.efficiency(0.05) > 0.6 && d.efficiency(0.05) < 0.7);
+        assert!(d.back_efficiency(0.05) > 0.0 && d.back_efficiency(0.05) < d.efficiency(0.05));
+        let steep = spec(4, 30, true).design().unwrap();
+        assert_eq!(steep.back_drive(0.05), BackDrive::Free);
+        assert!(steep.efficiency(0.05) > 0.85);
+    }
+
+    #[test]
+    fn back_drivable_drives_add_starts_and_keep_the_ratio() {
+        for (mu, hold) in [(0.05, false), (0.05, true), (0.15, false), (0.25, false)] {
+            let sp = spec(1, 30, true);
+            let got = sp.back_drivable(mu, hold).unwrap();
+            let d = got.design().unwrap();
+            assert_eq!(d.back_drive(mu), BackDrive::Free, "μ {mu}");
+            assert!(d.lead_angle >= back_drive_lead(mu, 20.0) - 1e-9 || got.diameter == sp.diameter);
+            assert!(got.diameter <= sp.diameter && got.diameter >= 16.0 - 0.01);
+            assert!(got.length >= least_length(got.starts, got.teeth, 2.0) - 1e-9);
+            if hold {
+                assert_eq!(got.teeth, 30);
+            } else {
+                assert_eq!(got.teeth, 30 * got.starts);
+            }
+            assert_eq!(got.back_drivable(mu, hold).unwrap(), got);
+        }
+        assert_eq!(spec(1, 30, true).back_drivable(0.05, false).unwrap().starts, 3);
+        assert!(spec(1, 30, true).back_drivable(0.6, false).is_err());
     }
 
     #[test]

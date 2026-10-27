@@ -154,8 +154,30 @@ pub fn place(q: [f64; 2], center: [f64; 2], rot: f64) -> [f64; 2] {
     [center[0] + q[0] * c - q[1] * s, center[1] + q[0] * s + q[1] * c]
 }
 
+/// Heights of a part's two flat end faces along its own axis, low then
+/// high: a spur gear's back and front, a bevel's toe and heel, a generated
+/// part's (`member`) end sections at the hub.
+pub fn faces(p: &gear::GearParams, member: Option<&Member>) -> [f64; 2] {
+    let (lo, hi) = if let Some(m) = member {
+        let z = |s: f64, t: f64| m.point(s, t, 0.0)[2];
+        (z(m.stations[0], m.hub[0]), z(*m.stations.last().unwrap_or(&0.0), m.hub[1]))
+    } else if let Some(b) = BevelGeom::new(p) {
+        (b.front_face().0, b.back_face().0)
+    } else {
+        (0.0, p.face_width)
+    };
+    [lo.min(hi), lo.max(hi)]
+}
+
+/// Where gear `g`, exported on its own, sits: tooth 0 on +X and its axis
+/// on Z, with the point its export origin picks at the origin.
+pub fn alone(g: &Gear, member: Option<&Member>) -> Frame3 {
+    let cone = g.params.is_bevel() || g.params.is_hypoid();
+    Frame3::at([0.0, 0.0, -g.export_origin.height(faces(&g.params, member), cone)])
+}
+
 /// The whole train as it stands at `driver_angle`, or just gear `only`,
-/// which goes out at the origin with tooth 0 on +X, ready to cut.
+/// which goes out with tooth 0 on +X, ready to cut, placed by `alone`.
 /// The parts `keep` picks: placed as they sit in the train (turned to
 /// `driver_angle`), or, for a single part (`only`), at the origin.
 pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: impl Fn(&Gear) -> bool) -> Vec<Shape> {
@@ -168,6 +190,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .filter_map(|(g, s)| {
             let prof = gear::tooth_profile(&g.params)?;
             let (center, rot) = if only.is_none() { (s.center, s.phase + s.ratio * driver_angle) } else { ([0.0, 0.0], 0.0) };
+            let z = if only.is_none() { s.z } else { alone(g, None).origin[2] };
             let outline: Vec<[f64; 2]> =
                 gear::outline(&g.params, &prof).into_iter().map(|q| place(q, center, rot)).collect();
             Some(Shape {
@@ -175,7 +198,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
                 path: fit_arcs(&outline, tolerance(g.params.module)),
                 center,
                 bore: g.params.bore,
-                z: if only.is_none() { s.z } else { 0.0 },
+                z,
                 height: g.params.face_width,
             })
         })
@@ -200,8 +223,7 @@ pub fn bevels(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
         .filter(|(g, _)| only.is_none_or(|id| id == g.id) && keep(g) && g.params.is_buildable())
         .filter_map(|(g, s)| {
             let geom = BevelGeom::new(&g.params)?;
-            let (frame, rot) =
-                if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) };
+            let (frame, rot) = if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (alone(g, None), 0.0) };
             Some(BevelPart { name: g.name.clone(), geom, frame, rot })
         })
         .collect()
@@ -246,9 +268,9 @@ pub fn hypoids(
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };
             let s = &solved[i];
-            let (frame, rot) =
-                if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (Frame3::at([0.0; 3]), 0.0) };
             let member = if which == 0 { pair.0.clone() } else { pair.1.clone() };
+            let (frame, rot) =
+                if only.is_none() { (s.frame, s.phase + s.ratio * driver_angle) } else { (alone(g, Some(&member)), 0.0) };
             out.push(HypoidPart { name: g.name.clone(), member, frame, rot });
         }
     }

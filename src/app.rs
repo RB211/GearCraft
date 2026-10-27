@@ -7,7 +7,7 @@ use crate::export::{self, place};
 use crate::mesh;
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
-use crate::train::{self, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
+use crate::train::{self, Datum, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui,
     Vec2,
@@ -210,6 +210,11 @@ pub struct GearCraftApp {
     /// What the last sizing did: the driven part, the pair's teeth then
     /// (driving, driven), and the message, shown while those still hold.
     ratio_result: Option<(u64, u32, u32, String)>,
+    /// The last Make back-drivable: the wheel, the drive it made, and what
+    /// changed.
+    back_result: Option<(u64, worm::Spec, String)>,
+    /// Make back-drivable gives the wheel more teeth to keep the ratio.
+    back_keep_ratio: bool,
     workspace: Workspace,
     /// What was selected in each workspace, restored on switching back.
     workspace_selection: HashMap<Workspace, u64>,
@@ -253,6 +258,8 @@ impl GearCraftApp {
             ratio_target: HashMap::new(),
             ratio_max_teeth: 120,
             ratio_result: None,
+            back_result: None,
+            back_keep_ratio: true,
             workspace: Workspace::Spur,
             workspace_selection: HashMap::new(),
             three_d: false,
@@ -265,6 +272,32 @@ impl GearCraftApp {
             app.load(f);
         }
         app
+    }
+
+    /// Make the worm drive part `idx` belongs to back-drivable, noting
+    /// what changed for the Back-driving section.
+    fn make_back_drivable(&mut self, idx: usize) {
+        match self.project.make_back_drivable(idx, self.back_keep_ratio) {
+            Ok((old, new)) => {
+                let n = |z: u32, what: &str| format!("{z} {what}{}", if z == 1 { "" } else { "s" });
+                let mut note = format!(
+                    "Worm now {} at {} pitch Ø; wheel {} teeth",
+                    n(new.starts, "start"),
+                    len(new.diameter, self.project.pitch_unit),
+                    new.teeth
+                );
+                let (was, now) = (old.teeth as f64 / old.starts as f64, new.teeth as f64 / new.starts as f64);
+                if (was - now).abs() > 1e-9 {
+                    note += &format!("; the ratio is {now:.4} : 1, was {was:.4} : 1");
+                }
+                if new.length > old.length {
+                    note += &format!("; worm lengthened to {}", len(new.length, self.project.pitch_unit));
+                }
+                let id = self.project.gears[self.pair_driven(idx).unwrap_or(idx)].id;
+                self.back_result = Some((id, new, note + "."));
+            }
+            Err(e) => self.flash(e),
+        }
     }
 
     fn flash(&mut self, msg: impl Into<String>) {
@@ -787,6 +820,15 @@ impl GearCraftApp {
             .position(|r| matches!(r.placement, Placement::Hypoid { parent, .. } | Placement::Worm { parent, .. } if parent == g.id))
     }
 
+    /// Heights of part `idx`'s end faces along its own axis, or None while
+    /// a generated part's teeth are not ready.
+    fn own_faces(&self, idx: usize) -> Option<[f64; 2]> {
+        let g = &self.project.gears[idx];
+        let Some(r) = self.pair_driven(idx) else { return Some(export::faces(&g.params, None)) };
+        let pair = self.pairs.get(&self.project.gears[r].id).filter(|j| j.rx.is_none())?.members.clone()?;
+        Some(export::faces(&g.params, Some(if r == idx { &pair.1 } else { &pair.0 })))
+    }
+
     // ---- view ------------------------------------------------------------
 
     fn to_screen(&self, rect: Rect, p: [f64; 2]) -> Pos2 {
@@ -1200,6 +1242,19 @@ impl GearCraftApp {
         if let Some(t) = &self.texture3d {
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             painter.image(t.id(), rect, uv, Color32::WHITE);
+        }
+
+        // The selected part's export origin, on its axis.
+        let sel = self.selected.filter(|&id| parts.iter().any(|p| p.id == id)).and_then(|id| self.project.index_of(id));
+        if let Some((i, f)) = sel.and_then(|i| Some((i, self.own_faces(i)?))) {
+            let (g, s) = (&self.project.gears[i], &solved[i]);
+            let h = g.export_origin.height(f, g.params.is_bevel() || g.params.is_hypoid());
+            let at = |z: f64| self.camera.project(rect, s.frame.apply([0.0, 0.0, z])).0;
+            let o = at(h);
+            let axis = Stroke::new(1.0, chrome::ACCENT.gamma_multiply(0.7));
+            painter.line_segment([at(f[0].min(h)), at(f[1].max(h))], axis);
+            painter.circle(o, 4.0, chrome::ACCENT, Stroke::new(1.5, visuals.extreme_bg_color));
+            painter.text(o + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, "Export origin", FontId::proportional(11.0), chrome::ACCENT);
         }
 
         if self.pair_pending() {
@@ -1760,8 +1815,19 @@ impl GearCraftApp {
             self.ratio_result.as_ref().filter(|r| (r.0, r.1, r.2) == (pr.driven, pr.teeth.0, pr.teeth.1)).map(|r| r.3.clone())
         });
         let mut ratio_req: Option<f64> = None;
+        // The worm drive's friction lives on its wheel's placement.
+        let mut friction = pair_driven.and_then(|r| match self.project.gears[r].placement {
+            Placement::Worm { friction, .. } => Some(friction),
+            _ => None,
+        });
+        let back_note = pair_driven
+            .and_then(|r| self.back_result.as_ref().filter(|b| b.0 == self.project.gears[r].id))
+            .filter(|b| worm_design.as_ref().is_some_and(|d| d.spec == b.1))
+            .map(|b| b.2.clone());
+        let mut back_req = false;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let faces = self.own_faces(idx);
             let g = &mut self.project.gears[idx];
             ui.horizontal(|ui| {
                 ui.label("Name");
@@ -1808,6 +1874,80 @@ impl GearCraftApp {
                         ui.end_row();
                     });
                     if let Some(note) = &ratio_note {
+                        ui.label(RichText::new(note).weak());
+                    }
+                });
+            }
+
+            if let (Some(d), Some(mu)) = (&worm_design, &mut friction) {
+                section(ui, "Back-driving", |ui| {
+                    egui::Grid::new("backdrive").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Friction μ");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(mu).range(0.01..=0.6).speed(0.002).max_decimals(3)).on_hover_text(
+                                "Running friction between the threads and the teeth. It sets the efficiency and \
+                                 whether the wheel can drive the worm.",
+                            );
+                            ui.menu_button("Materials ⏷", |ui| {
+                                for (name, m) in worm::MATERIALS {
+                                    if ui.button(format!("{name}  ·  {m}")).clicked() {
+                                        *mu = m;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
+                        let deg = |a: f64| format!("{:.2}°", a.to_degrees());
+                        let rho = worm::friction_angle(*mu, d.spec.pressure_angle);
+                        value_row(ui, "Lead angle", deg(d.lead_angle));
+                        ui.label("Friction angle");
+                        ui.label(RichText::new(deg(rho)).monospace()).on_hover_text(
+                            "The lead angle must be above this for the wheel to turn the worm at all, and \
+                             well above it to start the worm from rest.",
+                        );
+                        ui.end_row();
+                        value_row(ui, "Efficiency, worm driving", format!("{:.0} %", 100.0 * d.efficiency(*mu)));
+                        value_row(ui, "Efficiency, wheel driving", format!("{:.0} %", 100.0 * d.back_efficiency(*mu)));
+                        let (verdict, hint) = match d.back_drive(*mu) {
+                            worm::BackDrive::Locked => (
+                                "No: self-locking",
+                                "Friction holds the worm, even running. Don't rely on it as a brake: shock and \
+                                 vibration can still slip it.",
+                            ),
+                            worm::BackDrive::Running => (
+                                "Only once turning",
+                                "The wheel keeps a turning worm going, but won't start it from rest, and \
+                                 vibration may let it creep.",
+                            ),
+                            worm::BackDrive::Free => ("Yes", "The wheel can turn the worm from rest."),
+                        };
+                        ui.label("Wheel drives worm");
+                        ui.label(RichText::new(verdict).monospace()).on_hover_text(hint);
+                        ui.end_row();
+                        ui.label("");
+                        ui.add_enabled_ui(d.back_drive(*mu) != worm::BackDrive::Free, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button("Make back-drivable")
+                                    .on_hover_text(
+                                        "Steepen the lead angle until the wheel can start the worm: add starts, \
+                                         and thin the worm if it needs it, to no less than 8 modules.",
+                                    )
+                                    .clicked()
+                                {
+                                    back_req = true;
+                                }
+                                ui.checkbox(&mut self.back_keep_ratio, "Keep ratio").on_hover_text(
+                                    "Give the wheel as many times the teeth as the worm gains starts, so the ratio \
+                                     stands but the wheel grows. Off: the wheel keeps its teeth and size, and the \
+                                     ratio drops.",
+                                );
+                            });
+                        });
+                        ui.end_row();
+                    });
+                    if let Some(note) = &back_note {
                         ui.label(RichText::new(note).weak());
                     }
                 });
@@ -2270,7 +2410,7 @@ impl GearCraftApp {
                             .on_hover_text(if worm { "Turns the wheel round the worm's shaft." } else { "Turns the ring gear round the pinion's shaft." });
                         ui.end_row();
                     }
-                    Placement::Worm { parent, angle, diameter, throated, left_hand } => {
+                    Placement::Worm { parent, angle, diameter, throated, left_hand, .. } => {
                         ui.label("Worm");
                         parent_combo(ui, parent, &earlier_worms);
                         ui.end_row();
@@ -2319,6 +2459,45 @@ impl GearCraftApp {
                 }); }
             });
 
+            section(ui, "Export origin", |ui| {
+                let cone = g.params.is_bevel() || g.params.is_hypoid();
+                let o = &mut g.export_origin;
+                egui::Grid::new("export_origin").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Origin at");
+                    // A flat part's own origin is its bottom face.
+                    let shown = if !cone && o.datum == Datum::Own { Datum::Bottom } else { o.datum };
+                    let mut datum = shown;
+                    let name = |d: Datum| match d {
+                        Datum::Own => "Pitch apex",
+                        Datum::Bottom => "Bottom face",
+                        Datum::Middle => "Mid-face",
+                        Datum::Top => "Top face",
+                    };
+                    egui::ComboBox::from_id_salt("datum").selected_text(name(datum)).show_ui(ui, |ui| {
+                        for d in [Datum::Own, Datum::Bottom, Datum::Middle, Datum::Top] {
+                            if d != Datum::Own || cone {
+                                ui.selectable_value(&mut datum, d, name(d));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("A point on the gear's axis. Bottom and top are along +Z as exported.");
+                    if datum != shown {
+                        o.datum = datum;
+                    }
+                    ui.end_row();
+                    ui.label("Offset");
+                    len_drag(ui, &mut o.offset, unit, -10000.0..=10000.0, 0.1)
+                        .on_hover_text("Moves the origin along the axis from the point picked above.");
+                    ui.end_row();
+                    if let Some(f) = faces {
+                        let h = o.height(f, cone);
+                        value_row(ui, "Faces at Z", format!("{} … {}", len(f[0] - h, unit), len(f[1] - h, unit)));
+                    }
+                });
+                ui.label(RichText::new("Used when this part is exported on its own; a whole train keeps its layout.").weak().small());
+            });
+
             let p = g.params.clone();
             let asked = match g.placement {
                 Placement::Belt { target, .. } => target,
@@ -2347,10 +2526,7 @@ impl GearCraftApp {
                 _ => {}
             }
             if let Some(d) = &worm_design {
-                let m = d.spec.module;
-                let (z1, z2) = (d.spec.starts as f64, d.spec.teeth as f64);
-                // DIN 3975's least threaded length.
-                let least = if z1 <= 2.0 { 11.0 + 0.06 * z2 } else { 12.5 + 0.09 * z2 } * m;
+                let least = worm::least_length(d.spec.starts, d.spec.teeth, d.spec.module);
                 if d.spec.length < least - 1e-6 {
                     issues.push(Issue::warn(format!(
                         "The worm is shorter than DIN 3975 asks for ({}): the end teeth lose contact early.",
@@ -2382,10 +2558,6 @@ impl GearCraftApp {
                     let Some(d) = &worm_design else { return };
                     let deg = |a: f64| format!("{:.3}°", a.to_degrees());
                     let hand = if d.spec.left_hand { "left hand" } else { "right hand" };
-                    // Friction 0.05, a hardened, ground worm on a bronze wheel
-                    // running in oil.
-                    let rho = (0.05 / d.spec.pressure_angle.to_radians().cos()).atan();
-                    let efficiency = d.lead_angle.tan() / (d.lead_angle + rho).tan();
                     egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
                         if role == worm::Role::Worm {
                             value_row(ui, "Lead angle", format!("{}, {hand}", deg(d.lead_angle)));
@@ -2408,11 +2580,6 @@ impl GearCraftApp {
                         }
                         value_row(ui, "Centre distance", fmt(d.center));
                         value_row(ui, "Ratio", format!("{:.4} : 1", d.spec.teeth as f64 / d.spec.starts as f64));
-                        value_row(ui, "Efficiency (approx.)", format!("{:.0} %", 100.0 * efficiency));
-                        ui.label("Self-locking");
-                        ui.label(RichText::new(if d.lead_angle < 5f64.to_radians() { "likely" } else { "no" }).monospace())
-                            .on_hover_text("Under about 5° of lead angle friction usually stops the wheel driving the worm back; don't rely on it as a brake.");
-                        ui.end_row();
                     });
                     return;
                 }
@@ -2570,6 +2737,14 @@ impl GearCraftApp {
 
         if let (Some(pr), Some(t)) = (&pair, ratio_target) {
             self.ratio_target.insert(pr.driven, t);
+        }
+        if let (Some(r), Some(mu)) = (pair_driven, friction) {
+            if let Placement::Worm { friction, .. } = &mut self.project.gears[r].placement {
+                *friction = mu;
+            }
+        }
+        if back_req {
+            self.make_back_drivable(idx);
         }
         if let (Some(pr), Some(t)) = (&pair, ratio_req) {
             match self.project.size_pair_to_ratio(idx, t, self.ratio_max_teeth) {
@@ -3096,6 +3271,10 @@ mod tests {
             let how = std::env::var("GEARCRAFT_SHOT_WORMDRIVE").unwrap_or_default();
             if how == "worm" {
                 app.selected = app.first_shown();
+            }
+            if how == "backdrive" {
+                let wheel = app.project.gears.iter().position(|g| g.params.worm_drive == Some(worm::Role::Wheel));
+                app.make_back_drivable(wheel.unwrap());
             }
             if how == "straight" {
                 for g in &mut app.project.gears {
