@@ -1010,12 +1010,15 @@ mod tests {
         use crate::train::{Link, PitchUnit, Placement};
         use crate::worm::Role;
         let u = PitchUnit::Module;
-        for (starts, throated) in [(1, true), (3, false)] {
+        for (starts, throated, globoid) in [(1, true, false), (3, false, false), (2, true, true)] {
             let mut p = Project::empty();
             let w = p.add_root(crate::gear::GearParams { teeth: starts, ..u.starter_worm_drive(Role::Worm) }, 0.0, 0.0);
             p.add_child(w, u.starter_worm_drive(Role::Wheel), Link::Worm);
             if let Placement::Worm { throated: t, .. } = &mut p.gears[1].placement {
                 *t = throated;
+            }
+            if globoid {
+                p.make_globoid(1, true);
             }
             p.normalize();
             let parts = export::hypoids(&p, 0.2, None, |_| true, |_| None);
@@ -1028,8 +1031,8 @@ mod tests {
 
     /// `GEARCRAFT_WORM_STEP=dir cargo test write_worm_samples` writes worm
     /// drives (and their projects) for checking in a CAD program: a
-    /// single-start worm with a throated wheel, and a 3-start left-hand one
-    /// with a straight wheel.
+    /// single-start worm with a throated wheel, a 3-start left-hand one
+    /// with a straight wheel, and a single-start globoid drive.
     #[test]
     fn write_worm_samples() {
         use crate::train::{Link, PitchUnit, Placement};
@@ -1037,12 +1040,16 @@ mod tests {
         let Ok(dir) = std::env::var("GEARCRAFT_WORM_STEP") else { return };
         let dir = std::path::Path::new(&dir);
         let u = PitchUnit::Module;
-        for (name, starts, throated) in [("worm1", 1, true), ("worm3", 3, false)] {
+        for (name, starts, throated) in [("worm1", 1, true), ("worm3", 3, false), ("globoid1", 1, true)] {
             let mut p = Project::empty();
             let w = p.add_root(crate::gear::GearParams { teeth: starts, ..u.starter_worm_drive(Role::Worm) }, 0.0, 0.0);
             p.add_child(w, u.starter_worm_drive(Role::Wheel), Link::Worm);
             if let Placement::Worm { throated: t, left_hand, .. } = &mut p.gears[1].placement {
                 (*t, *left_hand) = (throated, !throated);
+            }
+            if name.starts_with("globoid") {
+                p.gears[1].params.teeth = 40;
+                p.make_globoid(1, true);
             }
             p.gears[1].params.backlash = 0.1;
             p.normalize();

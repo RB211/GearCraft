@@ -1029,7 +1029,11 @@ fn section(
     let trace = |start: [f64; 2], past: &dyn Fn(f64) -> bool| -> Result<Vec<[f64; 2]>, String> {
         let h = scale / 110.0;
         let mut pts = vec![start];
-        let mut dir = [-1.0, 0.0];
+        // Keep the space on the same side throughout, starting down into
+        // the space: unlike following on from the last step, this carries
+        // the trace over a crease, such as a ridge the cutter's passes
+        // leave on the floor.
+        let mut side = 0.0;
         for _ in 0..2000 {
             let p = *pts.last().unwrap();
             let g = grad(p);
@@ -1037,15 +1041,30 @@ fn section(
             if gl <= 0.0 {
                 return Err("flank trace lost".into());
             }
-            let mut tau = [-g[1] / gl, g[0] / gl];
-            if tau[0] * dir[0] + tau[1] * dir[1] < 0.0 {
-                tau = [-tau[0], -tau[1]];
+            if side == 0.0 {
+                side = if g[1] > 0.0 { 1.0 } else { -1.0 };
             }
+            let tau = [-side * g[1] / gl, side * g[0] / gl];
             if past(p[1]) && pts.len() > 1 {
                 return Ok(pts);
             }
-            let q = settle([p[0] + h * tau[0], p[1] + h * tau[1]]);
-            dir = tau;
+            // The next contour point a step away: sweeping round from
+            // straight into the space towards the material, the first
+            // crossing. Unlike stepping ahead and settling back, this goes
+            // over the tip of a ridge, however sharp.
+            let at = |beta: f64| {
+                let (sb, cb) = (side * beta).sin_cos();
+                let d = [(g[0] * cb - g[1] * sb) / gl, (g[0] * sb + g[1] * cb) / gl];
+                [p[0] + h * d[0], p[1] + h * d[1]]
+            };
+            let sweep = 36;
+            let crossing = (1..=sweep).map(|k| PI * k as f64 / sweep as f64).find(|&b| f(at(b)) <= 0.0);
+            let q = match crossing {
+                Some(b) if f(at(b - PI / sweep as f64)) > 0.0 => {
+                    at(root(&|beta| f(at(beta)), b - PI / sweep as f64, b))
+                }
+                _ => settle([p[0] + h * tau[0], p[1] + h * tau[1]]),
+            };
             pts.push(q);
         }
         Err("flank trace did not reach the floor".into())
@@ -1092,7 +1111,12 @@ fn section(
                 let k = acc.partition_point(|&a| a < target).clamp(1, acc.len() - 1);
                 let w = (target - acc[k - 1]) / (acc[k] - acc[k - 1]).max(1e-300);
                 let p = [prof[k - 1][0] + w * (prof[k][0] - prof[k - 1][0]), prof[k - 1][1] + w * (prof[k][1] - prof[k - 1][1])];
-                let p = settle(p);
+                // Between two trace points a short step apart, p is all
+                // but on the contour already: keep it if settling it goes
+                // astray, as it can off a crease, where the gradient fails.
+                let q = settle(p);
+                let moved = (q[0] - p[0]).hypot(q[1] - p[1]);
+                let p = if moved < scale / 110.0 && f(q).abs() <= f(p).abs() { q } else { p };
                 [p[0], p[1] / rs]
             })
             .collect()

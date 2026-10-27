@@ -658,7 +658,7 @@ pub fn parts(
             continue;
         }
         let pair = cached(ring.id)
-            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement)?.generate().ok()?)));
+            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement, project.ball_end_mill)?.generate().ok()?)));
         let Some(pair) = pair else { continue };
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };
@@ -865,6 +865,10 @@ mod tests {
         if let Some(Placement::Worm { throated, left_hand, .. }) = p.gears.iter_mut().find(|g| g.id == wheel).map(|g| &mut g.placement) {
             (*throated, *left_hand) = (false, true);
         }
+        // A globoid drive, its hourglass worm wrapped round the wheel.
+        let w = p.add_root(u.starter_worm_drive(worm::Role::Worm), -900.0, -300.0);
+        let wheel = p.add_child(w, GearParams { teeth: 40, ..u.starter_worm_drive(worm::Role::Wheel) }, Link::Worm);
+        p.make_globoid(p.index_of(wheel).unwrap(), true);
         p.normalize();
         p
     }

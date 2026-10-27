@@ -39,6 +39,14 @@ struct Cached {
     solid: view3d::Solid,
 }
 
+/// A change offered beside the problem it clears.
+enum Fix {
+    WormLength(f64),
+    WheelFace(f64),
+    /// The project's ball end mill Ø.
+    Ball(f64),
+}
+
 /// A belt's layout for drawing: its pitch-line loop, offsets of the land,
 /// back and tooth tip from the pitch line, tooth half-widths at base and
 /// tip, and where each tooth sits along the loop.
@@ -140,7 +148,7 @@ impl Workspace {
         match self {
             Workspace::Spur => "Involute spur gears: meshing pairs, compound trains",
             Workspace::Bevel => "Straight bevel gears with spherical involute teeth, at any shaft angle",
-            Workspace::Worm => "A cylindrical worm of 1 to 6 starts turning a wheel at right angles, for big reductions",
+            Workspace::Worm => "A worm of 1 to 6 starts, straight or hourglass (globoid), turning a wheel at right angles, for big reductions",
             Workspace::BevelWorm => "A 3 to 7-start conical worm driving a wheel, its shaft meeting or passing the wheel's axis",
             Workspace::Pulleys => "MXL to XXH timing pulleys and the belts between them",
         }
@@ -632,6 +640,20 @@ impl GearCraftApp {
         self.selected = Some(wheel);
     }
 
+    /// A globoid drive: a single-start hourglass worm wrapped round a
+    /// 40-tooth wheel, sized by AGMA 6135.
+    fn add_globoid_drive(&mut self) {
+        let x = self.clear_x();
+        let unit = self.project.pitch_unit;
+        let w = self.project.add_root(unit.starter_worm_drive(worm::Role::Worm), x, 0.0);
+        let wheel = GearParams { teeth: 40, ..unit.starter_worm_drive(worm::Role::Wheel) };
+        let wheel = self.project.add_child(w, wheel, Link::Worm);
+        if let Some(i) = self.project.index_of(wheel) {
+            self.project.make_globoid(i, true);
+        }
+        self.selected = Some(wheel);
+    }
+
     /// Where a new train can go, clear of the parts on show.
     fn clear_x(&self) -> f64 {
         let solved = self.project.solve();
@@ -750,7 +772,7 @@ impl GearCraftApp {
         let mut live = Vec::new();
         for ring in &self.project.gears {
             let Some(pinion) = ring.placement.parent().and_then(|p| self.project.get(p)) else { continue };
-            let Some(spec) = train::pair_spec(&pinion.params, &ring.params, &ring.placement) else { continue };
+            let Some(spec) = train::pair_spec(&pinion.params, &ring.params, &ring.placement, self.project.ball_end_mill) else { continue };
             live.push(ring.id);
             let job = self.pairs.entry(ring.id).or_insert_with(|| PairJob {
                 spec: spec.clone(),
@@ -767,6 +789,8 @@ impl GearCraftApp {
                 });
                 job.spec = spec;
                 job.rx = Some(rx);
+                // The old settings' error no longer applies.
+                job.error = None;
             }
             let done = job.rx.as_ref().and_then(|rx| rx.try_recv().ok());
             if let Some(r) = done {
@@ -1506,6 +1530,9 @@ impl GearCraftApp {
                         if ui.button("New worm drive").clicked() {
                             self.add_worm_drive();
                         }
+                        if ui.button("New globoid drive").clicked() {
+                            self.add_globoid_drive();
+                        }
                     }
                     Workspace::BevelWorm => {
                         if ui.button("New bevel worm set").clicked() {
@@ -1626,6 +1653,15 @@ impl GearCraftApp {
                 {
                     self.add_worm_drive();
                 }
+                if big(ui, Icon::WormDrive, "Globoid Drive", false, true)
+                    .on_hover_text(
+                        "An hourglass worm wrapped round a 40-tooth wheel (double-enveloping): several teeth \
+                         bear at once, for far more load in the same space",
+                    )
+                    .clicked()
+                {
+                    self.add_globoid_drive();
+                }
             }),
             Workspace::BevelWorm => chrome::group(ui, "Create", |ui| {
                 if big(ui, Icon::Worm, "Worm Set", false, true)
@@ -1665,6 +1701,17 @@ impl GearCraftApp {
                     }
                 }
             }
+        });
+        chrome::group(ui, "Machining", |ui| {
+            ui.vertical(|ui| {
+                ui.add_space(8.0);
+                ui.label("Ball end mill Ø");
+                let unit = self.project.pitch_unit;
+                len_drag(ui, &mut self.project.ball_end_mill, unit, 0.0..=25.0, 0.01).on_hover_text(
+                    "The ball end mill the teeth are cut with, on a 4-axis mill. Every root is rounded to it and \
+                     sits at least its radius under the other part's tips. 0: not chosen yet.",
+                );
+            });
         });
         chrome::group(ui, "Motion", |ui| {
             let (icon, label) = if self.playing { ("⏸", "Pause") } else { ("▶", "Run") };
@@ -1815,6 +1862,24 @@ impl GearCraftApp {
             self.ratio_result.as_ref().filter(|r| (r.0, r.1, r.2) == (pr.driven, pr.teeth.0, pr.teeth.1)).map(|r| r.3.clone())
         });
         let mut ratio_req: Option<f64> = None;
+        let mut globoid_req = false;
+        // Problems with a button that clears them, and the one pressed.
+        let mut fixable: Vec<(Issue, String, Fix)> = Vec::new();
+        let mut fix_req: Option<Fix> = None;
+        // A globoid worm too long for its base circle, or a drive the ball
+        // end mill can't cut, has no teeth, so they are checked here, from
+        // the drive's settings.
+        let ball = self.project.ball_end_mill;
+        let drive_spec = pair_driven.and_then(|r| {
+            let wheel = &self.project.gears[r];
+            let k = self.project.index_of(wheel.placement.parent()?)?;
+            train::worm_spec(&self.project.gears[k].params, &wheel.params, &wheel.placement, ball)
+        });
+        let globoid_spec = drive_spec.as_ref().filter(|s| s.globoid);
+        let too_long = globoid_spec.and_then(|sp| sp.globoid_lengths().filter(|l| sp.length > l.0).map(|l| (sp.length, l)));
+        // The biggest ball that fits, rounded down to what is shown.
+        let largest_ball = drive_spec.as_ref().and_then(|sp| sp.largest_ball()).map(|d| shown_floor(d, unit));
+        let ball_too_big = largest_ball.filter(|&d| ball > 0.0 && ball > d + 1e-9 && too_long.is_none());
         // The worm drive's friction lives on its wheel's placement.
         let mut friction = pair_driven.and_then(|r| match self.project.gears[r].placement {
             Placement::Worm { friction, .. } => Some(friction),
@@ -2410,7 +2475,7 @@ impl GearCraftApp {
                             .on_hover_text(if worm { "Turns the wheel round the worm's shaft." } else { "Turns the ring gear round the pinion's shaft." });
                         ui.end_row();
                     }
-                    Placement::Worm { parent, angle, diameter, throated, left_hand, .. } => {
+                    Placement::Worm { parent, angle, diameter, throated, globoid, left_hand, .. } => {
                         ui.label("Worm");
                         parent_combo(ui, parent, &earlier_worms);
                         ui.end_row();
@@ -2420,12 +2485,28 @@ impl GearCraftApp {
                              but less efficient. About 10 modules is usual.",
                         );
                         ui.end_row();
-                        ui.label("Wheel");
-                        ui.checkbox(throated, "Throated").on_hover_text(
-                            "Teeth hollowed to wrap round the worm, cut as a hob cuts them, for line contact \
-                             and real load. Off: a straight helical wheel, simpler to make, touching the worm \
-                             at a point: for light duty.",
-                        );
+                        ui.label("Type");
+                        let kind = if *globoid { 2 } else if *throated { 1 } else { 0 };
+                        let mut new_kind = kind;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut new_kind, 0, "Straight").on_hover_text(
+                                "A straight helical wheel, simple to make, touching the worm at a point: for light duty.",
+                            );
+                            ui.selectable_value(&mut new_kind, 1, "Throated").on_hover_text(
+                                "Teeth hollowed to wrap round the worm, shaped to every place its threads pass, for \
+                                 line contact and real load (single-enveloping).",
+                            );
+                            ui.selectable_value(&mut new_kind, 2, "Globoid").on_hover_text(
+                                "An hourglass worm wrapped round a throated wheel (double-enveloping), so about \
+                                 an eighth of the wheel's teeth bear at once. It has to be lined up closely, and \
+                                 goes in from the side, not along its axis. Choosing it sizes the worm's length \
+                                 and the wheel's face by AGMA 6135.",
+                            );
+                        });
+                        if new_kind != kind {
+                            (*throated, *globoid) = (new_kind >= 1, new_kind == 2);
+                            globoid_req = *globoid;
+                        }
                         ui.end_row();
                         ui.label("Hand");
                         ui.checkbox(left_hand, "Left hand").on_hover_text("Wind the threads and teeth left-handed; right-handed is usual.");
@@ -2506,6 +2587,7 @@ impl GearCraftApp {
             let fmt = |v: f64| len(v, unit);
             let mut issues = p.issues(fmt);
             match &pair_state {
+                Some((_, Some(_))) if too_long.is_some() || ball_too_big.is_some() => {}
                 Some((_, Some(e))) => issues.push(Issue { level: Level::Error, text: e.clone() }),
                 Some(_) if p.is_hypoid() && hypoid_design.is_none() => {
                     let what = if p.worm { "bevel worm" } else { "hypoid" };
@@ -2527,13 +2609,45 @@ impl GearCraftApp {
             }
             if let Some(d) = &worm_design {
                 let least = worm::least_length(d.spec.starts, d.spec.teeth, d.spec.module);
-                if d.spec.length < least - 1e-6 {
+                if let Some(eff) = d.effective_length() {
+                    let eff = tenth(eff);
+                    if d.spec.length < 0.9 * eff {
+                        fixable.push((
+                            Issue::warn(format!(
+                                "The worm is {} long; AGMA 6135 makes it {}, wrapping more teeth.",
+                                fmt(d.spec.length),
+                                fmt(eff)
+                            )),
+                            format!("Lengthen the worm to {}", fmt(eff)),
+                            Fix::WormLength(eff),
+                        ));
+                    }
+                    let face = tenth(2.0 * d.worm_root);
+                    if d.spec.face > 1.1 * face {
+                        fixable.push((
+                            Issue::warn(format!(
+                                "The wheel's face is {}, wider than the worm's root Ø: its ends barely mesh. \
+                                 AGMA 6135 makes it {}.",
+                                fmt(d.spec.face),
+                                fmt(face)
+                            )),
+                            format!("Narrow the face to {}", fmt(face)),
+                            Fix::WheelFace(face),
+                        ));
+                    }
+                    if let Some(z) = worm::globoid_least_teeth(d.center).filter(|&z| d.spec.teeth < z) {
+                        issues.push(Issue::warn(format!(
+                            "AGMA 6135 asks for at least {z} wheel teeth at this centre distance: give the wheel more \
+                             teeth, and the worm more starts to keep the ratio."
+                        )));
+                    }
+                } else if d.spec.length < least - 1e-6 {
                     issues.push(Issue::warn(format!(
                         "The worm is shorter than DIN 3975 asks for ({}): the end teeth lose contact early.",
                         fmt(least)
                     )));
                 }
-                if d.spec.throated && d.spec.face > 2.0 * d.worm_tip {
+                if d.spec.throated && d.hourglass.is_none() && d.spec.face > 2.0 * d.worm_tip {
                     issues.push(Issue::warn("The wheel's face is wider than the worm: its ends barely mesh."));
                 }
             }
@@ -2559,7 +2673,17 @@ impl GearCraftApp {
                     let deg = |a: f64| format!("{:.3}°", a.to_degrees());
                     let hand = if d.spec.left_hand { "left hand" } else { "right hand" };
                     egui::Grid::new("dims").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-                        if role == worm::Role::Worm {
+                        if let (worm::Role::Worm, Some(h)) = (role, &d.hourglass) {
+                            value_row(ui, "Lead angle (throat)", format!("{}, {hand}", deg(d.lead_angle)));
+                            value_row(ui, "Axial pitch", fmt(d.axial_pitch));
+                            value_row(ui, "Lead", fmt(d.lead));
+                            value_row(ui, "Pitch Ø (throat)", fmt(2.0 * d.worm_radius));
+                            value_row(ui, "Throat Ø", fmt(2.0 * d.worm_tip));
+                            value_row(ui, "Outside Ø (ends)", fmt(2.0 * d.worm_rim()));
+                            value_row(ui, "Root Ø (throat)", fmt(2.0 * d.worm_root));
+                            value_row(ui, "Base circle Ø", fmt(2.0 * h.base));
+                            value_row(ui, "Thread length (AGMA)", fmt(d.effective_length().unwrap_or(0.0)));
+                        } else if role == worm::Role::Worm {
                             value_row(ui, "Lead angle", format!("{}, {hand}", deg(d.lead_angle)));
                             value_row(ui, "Axial pitch", fmt(d.axial_pitch));
                             value_row(ui, "Lead", fmt(d.lead));
@@ -2576,7 +2700,16 @@ impl GearCraftApp {
                             } else {
                                 value_row(ui, "Outside Ø", fmt(2.0 * d.wheel_throat));
                             }
-                            value_row(ui, "Root Ø", fmt(2.0 * d.wheel_root));
+                            if d.spec.throated {
+                                value_row(ui, "Root Ø (throat)", fmt(2.0 * (d.center - d.root_form)));
+                            } else {
+                                value_row(ui, "Root Ø", fmt(2.0 * d.wheel_root));
+                            }
+                        }
+                        value_row(ui, "Root fillet", fmt(d.ball));
+                        value_row(ui, "Root clearance", fmt(d.clearance));
+                        if d.hourglass.is_some() {
+                            value_row(ui, "Teeth wrapped", format!("{:.1}", d.teeth_spanned()));
                         }
                         value_row(ui, "Centre distance", fmt(d.center));
                         value_row(ui, "Ratio", format!("{:.4} : 1", d.spec.teeth as f64 / d.spec.starts as f64));
@@ -2722,9 +2855,63 @@ impl GearCraftApp {
                 issues.push(Issue { level: Level::Error, text: format!("Overlaps {o} without meshing.") });
             }
 
+            if let Some(largest) = ball_too_big {
+                fixable.insert(
+                    0,
+                    (
+                        Issue::error(format!(
+                            "The Ø{} ball end mill is too big for these teeth: where the other part's tips reach, \
+                             the spaces are narrower than it, so it can't cut below them. The biggest that fits is Ø{}; \
+                             a bigger module takes a bigger one.",
+                            fmt(ball),
+                            fmt(largest)
+                        )),
+                        format!("Cut with a Ø{} ball end mill", fmt(largest)),
+                        Fix::Ball(largest),
+                    ),
+                );
+            } else if let (0.0, Some(d)) = (ball, &worm_design) {
+                // Shown as the setting will hold it, so pressing the fix
+                // leaves the teeth as they are.
+                let now = shown_floor(2.0 * d.ball, unit);
+                fixable.push((
+                    Issue::warn(format!(
+                        "No ball end mill is chosen, so the roots are rounded for a Ø{} ball, the biggest that fits \
+                         up to the wheel's root fillet. Choose the one you'll cut with under Machining, or keep this.",
+                        fmt(now)
+                    )),
+                    format!("Cut with a Ø{} ball end mill", fmt(now)),
+                    Fix::Ball(now),
+                ));
+            }
+            if let Some((now, (most, agma))) = too_long {
+                let agma = tenth(agma);
+                fixable.insert(
+                    0,
+                    (
+                        Issue::error(format!(
+                            "The worm is {} long, past its base circle Ø of {}: its end threads would overhang \
+                             their roots, so nothing could cut them.",
+                            fmt(now),
+                            fmt(most)
+                        )),
+                        format!("Shorten the worm to {} (AGMA 6135)", fmt(agma)),
+                        Fix::WormLength(agma),
+                    ),
+                );
+            }
             ui.add_space(6.0);
-            if issues.is_empty() {
+            if issues.is_empty() && fixable.is_empty() {
                 ui.label(RichText::new("✔ No problems found").color(ui.visuals().weak_text_color()));
+            }
+            for (is, label, fix) in fixable {
+                let color =
+                    if is.level == Level::Error { ui.visuals().error_fg_color } else { ui.visuals().warn_fg_color };
+                let icon = if is.level == Level::Error { "⛔" } else { "⚠" };
+                ui.label(RichText::new(format!("{icon} {}", is.text)).color(color));
+                if ui.button(label).clicked() {
+                    fix_req = Some(fix);
+                }
             }
             for is in issues {
                 let (icon, color) = match is.level {
@@ -2745,6 +2932,22 @@ impl GearCraftApp {
         }
         if back_req {
             self.make_back_drivable(idx);
+        }
+        if globoid_req {
+            self.project.make_globoid(idx, false);
+        }
+        if let (Some(fix), Some(r)) = (fix_req, pair_driven) {
+            match fix {
+                Fix::WormLength(l) => {
+                    let worm = self.project.gears[r].placement.parent().and_then(|p| self.project.index_of(p));
+                    if let Some(k) = worm {
+                        self.project.gears[k].params.face_width = l;
+                    }
+                }
+                Fix::WheelFace(b) => self.project.gears[r].params.face_width = b,
+                Fix::Ball(d) => self.project.ball_end_mill = d,
+            }
+            self.project.normalize();
         }
         if let (Some(pr), Some(t)) = (&pair, ratio_req) {
             match self.project.size_pair_to_ratio(idx, t, self.ratio_max_teeth) {
@@ -3069,6 +3272,18 @@ fn parent_combo(ui: &mut Ui, parent: &mut u64, choices: &[(u64, String)]) {
     });
 }
 
+/// Rounded down to 0.1 mm, so a length set from a limit stays inside it.
+fn tenth(v: f64) -> f64 {
+    (v * 10.0).floor() / 10.0
+}
+
+/// A length (mm) rounded down to the places it is shown to, so a value set
+/// from a limit stays inside it.
+fn shown_floor(v: f64, unit: PitchUnit) -> f64 {
+    let k = 10f64.powi(unit.decimals() as i32 - 1) / unit.factor();
+    (v * k + 1e-9).floor() / k
+}
+
 /// A length (mm) in the project's units.
 fn len(v: f64, unit: PitchUnit) -> String {
     format!("{:.*}{}", unit.decimals(), v / unit.factor(), unit.suffix())
@@ -3175,7 +3390,7 @@ mod tests {
 
     #[test]
     fn switching_workspace_shows_only_its_parts() {
-        let mut harness = Harness::builder().with_size(Vec2::new(1400.0, 860.0)).build_eframe(|cc| {
+        let mut harness = egui_kittest::Harness::builder().with_size(Vec2::new(1400.0, 860.0)).build_eframe(|cc| {
             let mut app = GearCraftApp::new(cc, None);
             app.replace_project(mixed(), None);
             app
@@ -3203,6 +3418,62 @@ mod tests {
         assert_eq!(harness.state().project.gears.len(), 4, "nothing was removed");
     }
 
+    #[test]
+    fn a_globoid_worm_too_long_for_its_base_circle_is_shortened_by_its_fix() {
+        let u = PitchUnit::Module;
+        let mut p = Project::empty();
+        let w = p.add_root(u.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+        p.add_child(w, u.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        p.make_globoid(1, true);
+        p.gears[0].params.face_width = 30.0;
+        let mut harness = egui_kittest::Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+            let mut app = GearCraftApp::new(cc, None);
+            app.replace_project(p, None);
+            app.switch_workspace(Workspace::Worm);
+            app.selected = Some(w);
+            app
+        });
+        harness.run_steps(3);
+        harness.get_by_label_contains("past its base circle");
+        harness.get_by_label_contains("Shorten the worm to").click();
+        harness.run_steps(3);
+        let app = harness.state();
+        let (worm, wheel) = (&app.project.gears[0], &app.project.gears[1]);
+        let spec = train::worm_spec(&worm.params, &wheel.params, &wheel.placement, app.project.ball_end_mill).unwrap();
+        let (_, agma) = spec.globoid_lengths().unwrap();
+        assert!(worm.params.face_width < 30.0 && agma - worm.params.face_width < 0.1);
+        assert!(spec.design().is_ok());
+        assert!(harness.query_by_label_contains("past its base circle").is_none());
+    }
+
+    #[test]
+    fn a_ball_end_mill_too_big_for_the_teeth_is_swapped_by_its_fix() {
+        let u = PitchUnit::Module;
+        let mut p = Project::empty();
+        let w = p.add_root(u.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+        p.add_child(w, u.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        p.ball_end_mill = 3.0;
+        let mut harness = egui_kittest::Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+            let mut app = GearCraftApp::new(cc, None);
+            app.replace_project(p, None);
+            app.switch_workspace(Workspace::Worm);
+            app.selected = Some(w);
+            app
+        });
+        harness.run_steps(3);
+        harness.get_by_label_contains("ball end mill is too big");
+        harness.get_by_label_contains("Cut with a").click();
+        harness.run_steps(3);
+        let app = harness.state();
+        let (worm, wheel) = (&app.project.gears[0], &app.project.gears[1]);
+        let spec = train::worm_spec(&worm.params, &wheel.params, &wheel.placement, app.project.ball_end_mill).unwrap();
+        let largest = spec.largest_ball().unwrap();
+        assert!(app.project.ball_end_mill <= largest && largest - app.project.ball_end_mill < 0.01);
+        assert!(spec.design().is_ok());
+        assert!(harness.query_by_label_contains("too big").is_none());
+        assert!(harness.query_by_label_contains("No ball end mill").is_none());
+    }
+
     /// Renders the window offscreen to GEARCRAFT_SHOT (a PNG path) so the
     /// layout can be looked at without opening a window. Skipped unless set.
     #[test]
@@ -3210,8 +3481,8 @@ mod tests {
         let Ok(out) = std::env::var("GEARCRAFT_SHOT") else { return };
         let file = std::env::var("GEARCRAFT_SHOT_FILE").ok().map(PathBuf::from);
         let dark = std::env::var("GEARCRAFT_SHOT_LIGHT").is_err();
-        let mut harness = Harness::builder()
-            .with_size(Vec2::new(1400.0, 860.0))
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(1400.0, if std::env::var("GEARCRAFT_SHOT_TALL").is_ok() { 1500.0 } else { 860.0 }))
             .with_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light })
             .wgpu()
             .build_eframe(|cc| GearCraftApp::new(cc, file));
@@ -3275,6 +3546,17 @@ mod tests {
             if how == "backdrive" {
                 let wheel = app.project.gears.iter().position(|g| g.params.worm_drive == Some(worm::Role::Wheel));
                 app.make_back_drivable(wheel.unwrap());
+            }
+            // =globoid makes it a globoid drive, =globoid_long one whose worm
+            // is too long for its base circle, with the worm selected.
+            if how.starts_with("globoid") {
+                let wheel = app.project.gears.iter().position(|g| g.params.worm_drive == Some(worm::Role::Wheel));
+                app.project.make_globoid(wheel.unwrap(), true);
+            }
+            if how == "globoid_long" {
+                let worm = app.project.gears.iter().position(|g| g.params.worm_drive == Some(worm::Role::Worm)).unwrap();
+                app.project.gears[worm].params.face_width = 30.0;
+                app.selected = Some(app.project.gears[worm].id);
             }
             if how == "straight" {
                 for g in &mut app.project.gears {

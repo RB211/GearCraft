@@ -263,7 +263,7 @@ pub fn hypoids(
             continue;
         }
         let pair = cached(ring.id)
-            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement)?.generate().ok()?)));
+            .or_else(|| Some(Arc::new(train::pair_spec(&pinion.params, &ring.params, &ring.placement, project.ball_end_mill)?.generate().ok()?)));
         let Some(pair) = pair else { continue };
         for (g, which) in wanted {
             let Some(i) = project.index_of(g.id) else { continue };

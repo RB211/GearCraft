@@ -53,8 +53,9 @@ pub enum Placement {
         #[serde(default)]
         cutter_radius: f64,
     },
-    /// The wheel of a cylindrical worm drive turned by worm `parent`: its
-    /// axis square to the worm's, `diameter` the worm's pitch diameter.
+    /// The wheel of a worm drive turned by worm `parent`: its axis square
+    /// to the worm's, `diameter` the worm's pitch diameter (at the throat
+    /// of a globoid worm, an hourglass wrapping round the wheel).
     /// `angle` turns the wheel round the worm's axis. `friction` is the
     /// flanks' running friction, which decides whether the wheel can
     /// drive the worm back.
@@ -63,6 +64,8 @@ pub enum Placement {
         angle: f64,
         diameter: f64,
         throated: bool,
+        #[serde(default)]
+        globoid: bool,
         left_hand: bool,
         #[serde(default = "default_friction")]
         friction: f64,
@@ -283,6 +286,9 @@ pub struct Project {
     pub next_id: u64,
     pub driver_rpm: f64,
     pub pitch_unit: PitchUnit,
+    /// Ø of the ball end mill the parts are cut with, mm; 0 until it is
+    /// chosen, the roots then filleted to each part's own radius.
+    pub ball_end_mill: f64,
 }
 
 impl Default for Project {
@@ -375,27 +381,36 @@ pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement
 }
 
 /// The worm drive made by worm `worm` and wheel `wheel` placed by
-/// `placement` (a Placement::Worm).
-pub fn worm_spec(worm: &GearParams, wheel: &GearParams, placement: &Placement) -> Option<worm::Spec> {
-    let Placement::Worm { diameter, throated, left_hand, .. } = *placement else {
+/// `placement` (a Placement::Worm), cut by a ball end mill of Ø `ball`
+/// (0: none chosen, so the wheel's root fillet, or the biggest ball that
+/// fits if that's smaller).
+pub fn worm_spec(worm: &GearParams, wheel: &GearParams, placement: &Placement, ball: f64) -> Option<worm::Spec> {
+    let Placement::Worm { diameter, throated, globoid, left_hand, .. } = *placement else {
         return None;
     };
-    Some(worm::Spec {
+    let sp = worm::Spec {
         starts: worm.teeth,
         teeth: wheel.teeth,
         module: wheel.module,
         pressure_angle: wheel.pressure_angle,
         addendum: wheel.addendum,
         dedendum: wheel.dedendum,
-        root_fillet: wheel.root_fillet,
+        root_fillet: if ball > 0.0 { ball / 2.0 / wheel.module } else { wheel.root_fillet },
         diameter,
         length: worm.face_width,
         face: wheel.face_width,
         throated,
+        globoid,
         left_hand,
         backlash: wheel.backlash,
         worm_bore: worm.bore,
         wheel_bore: wheel.bore,
+    };
+    // With no ball chosen, the biggest that fits, up to the wheel's fillet.
+    let largest = if ball > 0.0 { None } else { sp.largest_ball() };
+    Some(match largest {
+        Some(d) => worm::Spec { root_fillet: sp.root_fillet.min(0.99 * d / 2.0 / sp.module), ..sp },
+        None => sp,
     })
 }
 
@@ -428,11 +443,11 @@ impl PairSpec {
 }
 
 /// The generated pair a ring gear or wheel `driven`, placed by
-/// `placement`, makes with its driver.
-pub fn pair_spec(driver: &GearParams, driven: &GearParams, placement: &Placement) -> Option<PairSpec> {
+/// `placement`, makes with its driver, cut by a ball end mill of Ø `ball`.
+pub fn pair_spec(driver: &GearParams, driven: &GearParams, placement: &Placement, ball: f64) -> Option<PairSpec> {
     match placement {
         Placement::Hypoid { .. } => hypoid_spec(driver, driven, placement).map(PairSpec::Hypoid),
-        Placement::Worm { .. } => worm_spec(driver, driven, placement).map(PairSpec::Worm),
+        Placement::Worm { .. } => worm_spec(driver, driven, placement, ball).map(PairSpec::Worm),
         _ => None,
     }
 }
@@ -489,7 +504,7 @@ impl BeltInfo {
 impl Project {
     /// A starter pair in the given unit system.
     pub fn new(unit: PitchUnit) -> Self {
-        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit };
+        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit, ball_end_mill: 0.0 };
         let a = p.add_root(unit.starter(20), 0.0, 0.0);
         let wheel = GearParams { bore: unit.starter(40).bore * 1.25, ..unit.starter(40) };
         p.add_child(a, wheel, Link::Mesh);
@@ -638,6 +653,7 @@ impl Project {
                     angle: 0.0,
                     diameter: worm::default_diameter(params.module),
                     throated: true,
+                    globoid: false,
                     left_hand: false,
                     friction: worm::DEFAULT_FRICTION,
                 }
@@ -935,7 +951,7 @@ impl Project {
                     let pg = &self.gears[pi];
                     let ps = &out[pi];
                     let f = ps.frame;
-                    let design = worm_spec(&pg.params, &g.params, &g.placement).and_then(|sp| sp.design().ok());
+                    let design = worm_spec(&pg.params, &g.params, &g.placement, self.ball_end_mill).and_then(|sp| sp.solve().ok());
                     match design {
                         Some(d) => {
                             // Across the worm's axis towards azimuth β, at the
@@ -1094,6 +1110,30 @@ impl Project {
         Ok(Resized { driving: za, driven: zb, held })
     }
 
+    /// Make worm drive wheel `w` a globoid drive with AGMA 6135's
+    /// proportions: the worm's threads as long as the base circle allows
+    /// (less 2 % of the centre distance) and the wheel's face as wide as
+    /// the worm's root diameter. `size_worm` also picks the worm's pitch
+    /// diameter for the wheel.
+    pub fn make_globoid(&mut self, w: usize, size_worm: bool) {
+        let Placement::Worm { parent, .. } = self.gears[w].placement else { return };
+        let Some(k) = self.index_of(parent) else { return };
+        let (m, z2) = (self.gears[w].params.module, self.gears[w].params.teeth);
+        if let Placement::Worm { globoid, throated, diameter, .. } = &mut self.gears[w].placement {
+            (*globoid, *throated) = (true, true);
+            if size_worm {
+                *diameter = worm::globoid_diameter(m, z2);
+            }
+        }
+        // Sized with a short worm, which any design allows.
+        let spec = worm_spec(&self.gears[k].params, &self.gears[w].params, &self.gears[w].placement, self.ball_end_mill);
+        let Some(d) = spec.and_then(|s| worm::Spec { length: 1.0, ..s }.solve().ok()) else { return };
+        let floor = |v: f64| (v * 10.0).floor() / 10.0;
+        self.gears[k].params.face_width = floor(d.effective_length().unwrap_or(d.spec.length));
+        self.gears[w].params.face_width = floor(2.0 * d.worm_root);
+        self.normalize();
+    }
+
     /// Make the worm drive part `i` belongs to back-drivable at its
     /// friction (see `worm::Spec::back_drivable`), returning the drive as
     /// it was and as it is now. The wheel gains teeth to keep the ratio if
@@ -1104,7 +1144,7 @@ impl Project {
         let Placement::Worm { friction, .. } = wheel.placement else {
             return Err("Only a worm drive can be made back-drivable.".into());
         };
-        let old = worm_spec(&self.gears[k].params, &wheel.params, &wheel.placement).ok_or("This is not a worm drive.")?;
+        let old = worm_spec(&self.gears[k].params, &wheel.params, &wheel.placement, self.ball_end_mill).ok_or("This is not a worm drive.")?;
         if self.mates(k) > 1 {
             return Err("The worm turns another wheel too: changing its starts would change that drive.".into());
         }
@@ -1577,7 +1617,8 @@ mod tests {
             assert_eq!((p.gears[0].params.teeth, p.gears[1].params.teeth), (3, 90));
             let d = p.solve()[1].worm.clone().unwrap();
             assert_eq!(d.back_drive(worm::DEFAULT_FRICTION), worm::BackDrive::Free);
-            assert_eq!(d.spec, new);
+            // The fillet follows the biggest ball that fits, none being chosen.
+            assert_eq!(worm::Spec { root_fillet: new.root_fillet, ..d.spec }, new);
         }
         let mut p = Project::empty();
         let w = p.add_root(PitchUnit::Module.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
