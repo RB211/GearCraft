@@ -91,9 +91,14 @@ and `MENU=label` (click a widget first).
 
 The interface font is IBM Plex Sans (SIL Open Font License, `assets/fonts/OFL.txt`).
 
-Headless export of a train:
+Headless export of a train, or of one part on its own (axis on Z, tooth 0 on +X, at its
+export origin, as File → Export writes a selected part):
 
-    gearcraft project.gearcraft --export out.dxf     # or out.svg, out.step
+    gearcraft project.gearcraft --export out.dxf     # or out.svg, out.step, out.stl
+    gearcraft project.gearcraft --export gear.step --part 2   # part id or name
+    gearcraft project.gearcraft --list               # the parts: id<TAB>name
+
+CAM_Craft imports `.gearcraft` files one part at a time with `--part`.
 
 ## Shortcuts
 
