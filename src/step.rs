@@ -269,17 +269,31 @@ enum Run {
     /// Involute flank, roll angle from `t0` to `t1`; `side` is -1 on the
     /// right flank (φ = c - half), +1 on the left.
     Involute { c: f64, side: f64, t0: f64, t1: f64 },
+    /// The root fillet by its angle ψ round its centre (0 at the root).
+    Fillet { c: f64, side: f64, t0: f64, t1: f64 },
     Tip,
     Root,
 }
 
-/// A cubic B-spline through the involute flank on the back cone, as
-/// Bézier pieces from exact points and tangents. Returns the control
-/// points and knots (in travel order).
-fn flank_curve(g: &BevelGeom, c: f64, side: f64, t0: f64, t1: f64) -> (Vec<[f64; 3]>, Vec<f64>) {
-    let at = |theta: f64| {
-        let (gamma, sweep) = g.roll(theta);
-        BevelGeom::point(gamma, c + side * (g.base_half - sweep), g.back(gamma))
+/// A cubic B-spline through a flank on the back cone (the involute by
+/// roll angle, or the fillet by its turn), as Bézier pieces from exact
+/// points and tangents. Returns the control points and knots (in travel
+/// order).
+fn flank_curve(g: &BevelGeom, run: &Run) -> (Vec<[f64; 3]>, Vec<f64>) {
+    let (c, side, t0, t1, fillet) = match *run {
+        Run::Involute { c, side, t0, t1 } => (c, side, t0, t1, None),
+        Run::Fillet { c, side, t0, t1 } => (c, side, t0, t1, g.fillet),
+        _ => unreachable!(),
+    };
+    let at = |t: f64| match fillet {
+        Some(f) => {
+            let (gamma, y) = f.at(t);
+            BevelGeom::point(gamma, c + side * y / gamma.sin(), g.back(gamma))
+        }
+        None => {
+            let (gamma, sweep) = g.roll(t);
+            BevelGeom::point(gamma, c + side * (g.base_half - sweep), g.back(gamma))
+        }
     };
     let n = 12;
     let ts: Vec<f64> = (0..=n).map(|i| t0 + (t1 - t0) * i as f64 / n as f64).collect();
@@ -336,8 +350,10 @@ fn bevel_solid(w: &mut Writer, g: &BevelGeom, name: &str) -> Option<usize> {
 
     // Corner rays round the whole gear in outline order, and the runs
     // between them. Below the base cone a flank is radial.
-    let radial = g.base > g.root + 1e-9;
-    let g_inv = g.base.max(g.root);
+    let foot = g.flank_foot();
+    let psi = g.fillet.map(|f| f.end());
+    let radial = g.base > foot + 1e-9;
+    let g_inv = g.base.max(foot);
     let (th0, th1) = (g.roll_at(g_inv), g.roll_at(g.tip));
     let mut corners: Vec<(f64, f64)> = Vec::new();
     let mut runs: Vec<Run> = Vec::new();
@@ -347,9 +363,13 @@ fn bevel_solid(w: &mut Writer, g: &BevelGeom, name: &str) -> Option<usize> {
         let c = t as f64 * pitch;
         tooth_start.push(corners.len());
         corners.push((g.root, c - hr));
+        if let Some(e) = psi {
+            runs.push(Run::Fillet { c, side: -1.0, t0: 0.0, t1: e });
+            corners.push((foot, c - g.half_at(foot)));
+        }
         if radial {
             runs.push(Run::Radial);
-            corners.push((g_inv, c - hr));
+            corners.push((g_inv, c - g.half_at(foot)));
         }
         runs.push(Run::Involute { c, side: -1.0, t0: th0, t1: th1 });
         corners.push((g.tip, c - ht));
@@ -357,8 +377,12 @@ fn bevel_solid(w: &mut Writer, g: &BevelGeom, name: &str) -> Option<usize> {
         corners.push((g.tip, c + ht));
         runs.push(Run::Involute { c, side: 1.0, t0: th1, t1: th0 });
         if radial {
-            corners.push((g_inv, c + hr));
+            corners.push((g_inv, c + g.half_at(foot)));
             runs.push(Run::Radial);
+        }
+        if let Some(e) = psi {
+            corners.push((foot, c + g.half_at(foot)));
+            runs.push(Run::Fillet { c, side: 1.0, t0: e, t1: 0.0 });
         }
         corners.push((g.root, c + hr));
         runs.push(Run::Root);
@@ -390,8 +414,8 @@ fn bevel_solid(w: &mut Writer, g: &BevelGeom, name: &str) -> Option<usize> {
                 let plane = w.plane([0.0; 3], normal, [phi.cos(), phi.sin(), 0.0]);
                 (w.line(pi, pj), w.line(scale(k, pi), scale(k, pj)), plane)
             }
-            Run::Involute { c, side, t0, t1 } => {
-                let (ctrl, knots) = flank_curve(g, c, side, t0, t1);
+            Run::Involute { .. } | Run::Fillet { .. } => {
+                let (ctrl, knots) = flank_curve(g, run);
                 let (mults, values) = knot_lists(&knots);
                 let back_pts: Vec<usize> = ctrl.iter().map(|&p| w.point(p)).collect();
                 let front_pts: Vec<usize> = ctrl.iter().map(|&p| w.point(scale(k, p))).collect();
@@ -583,9 +607,13 @@ impl Patch {
 
     pub(crate) fn eval(&self, u: f64, v: f64) -> [f64; 3] {
         let (bu, bv) = (basis(&self.uk, u), basis(&self.vk, v));
+        // Only four of each are non-zero.
+        let live = |b: &[f64]| (0..b.len()).filter(|&i| b[i] != 0.0).collect::<Vec<_>>();
+        let (iu, iv) = (live(&bu), live(&bv));
         let mut out = [0.0; 3];
-        for (i, row) in self.net.iter().enumerate() {
-            for (j, q) in row.iter().enumerate() {
+        for &i in &iu {
+            for &j in &iv {
+                let q = self.net[i][j];
                 for d in 0..3 {
                     out[d] += bu[i] * bv[j] * q[d];
                 }
@@ -974,6 +1002,14 @@ mod tests {
         let text = step(&[], &bevels, &[], "t");
         assert_closed(&text);
         assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 3);
+        // Rounded for a ball end mill, the roots deepened for it.
+        p.ball_end_mill = 1.2;
+        p.normalize();
+        let g = BevelGeom::new(&p.gears[i].params).unwrap();
+        assert!(g.fillet.is_some_and(|f| f.foot < g.base));
+        let text = step(&[], &export::bevels(&p, 0.3, None, |_| true), &[], "t");
+        assert_closed(&text);
+        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 3);
     }
 
     /// `GEARCRAFT_BEVEL_STEP=dir cargo test write_bevel_samples` writes a
@@ -1065,11 +1101,22 @@ mod tests {
 
     #[test]
     fn hypoid_gears_are_closed() {
-        let parts = export::hypoids(&hypoid_project(), 0.2, None, |_| true, |_| None);
-        assert_eq!(parts.len(), 2);
-        let text = step(&[], &[], &parts, "t");
-        assert_closed(&text);
-        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 2);
+        use crate::train::Placement;
+        // As designed, and with a ball end mill, the spiral bevel's slot
+        // floors raised for its reach.
+        let mut spiral = hypoid_project();
+        spiral.ball_end_mill = 2.0;
+        if let Placement::Hypoid { offset, .. } = &mut spiral.gears[1].placement {
+            *offset = 0.0;
+        }
+        spiral.normalize();
+        for p in [hypoid_project(), spiral] {
+            let parts = export::hypoids(&p, 0.2, None, |_| true, |_| None);
+            assert_eq!(parts.len(), 2);
+            let text = step(&[], &[], &parts, "t");
+            assert_closed(&text);
+            assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 2);
+        }
     }
 
     /// `GEARCRAFT_HYPOID_STEP=dir cargo test write_hypoid_samples` writes
@@ -1146,7 +1193,7 @@ mod cloud {
 
     #[test]
     fn step_surfaces_mesh_without_colliding() {
-        for spec in [car(), Spec { offset: 0.0, ..car() }] {
+        for spec in [car(), Spec { offset: 0.0, ..car() }, Spec { ball: 3.0, ..car() }, Spec { offset: 0.0, ball: 2.4, ..car() }] {
             let d = spec.design().unwrap();
             let (pin, ring) = (d.pinion().unwrap(), d.ring().unwrap());
             // The ring's surfaces hug the slots its cutter makes.
@@ -1169,7 +1216,10 @@ mod cloud {
                     }
                 }
             }
-            assert!(deepest < 1e-3, "pinion surface {deepest} mm into the ring (offset {})", spec.offset);
+            // The flank points themselves run clear; between sections the
+            // surface bends by a micron or two where the flank runs into a
+            // ball-sized root fillet.
+            assert!(deepest < 2e-3, "pinion surface {deepest} mm into the ring (offset {}, ball Ø{})", spec.offset, spec.ball);
         }
     }
 }

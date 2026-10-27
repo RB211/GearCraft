@@ -416,23 +416,36 @@ impl Spec {
     }
 }
 
-/// Resample a flank given seam to tip as (radius, azimuth) points, evenly
-/// along its length, to the profile points every member uses.
-fn resample(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
-    let mut acc = vec![0.0];
-    for w in pts.windows(2) {
-        let r = (w[0][0] + w[1][0]) / 2.0;
-        acc.push(acc.last().unwrap() + (w[1][0] - w[0][0]).hypot(r * (w[1][1] - w[0][1])));
-    }
-    let total = *acc.last().unwrap();
-    (0..=PROFILE_POINTS)
-        .map(|i| {
-            let target = total * i as f64 / PROFILE_POINTS as f64;
-            let k = acc.partition_point(|&a| a < target).clamp(1, acc.len() - 1);
-            let w = ((target - acc[k - 1]) / (acc[k] - acc[k - 1]).max(1e-300)).clamp(0.0, 1.0);
-            [pts[k - 1][0] + w * (pts[k][0] - pts[k - 1][0]), pts[k - 1][1] + w * (pts[k][1] - pts[k - 1][1])]
-        })
-        .collect()
+/// Profile points along a flank's foot, the floor and the ball's round
+/// up to the flank; the rest are up the flank.
+const FOOT_POINTS: usize = PROFILE_POINTS / 4;
+
+/// Resample a flank given seam to tip as (radius, azimuth) points, its
+/// foot (up to `pts[foot]`) and the flank above each evenly along its
+/// length, to the profile points every member uses. Split so, a profile
+/// point stays on the same part of the flank from section to section,
+/// though the thread's height changes along the worm (its chamfered
+/// ends), and the surfaces through the sections stay on the tooth.
+fn resample(pts: &[[f64; 2]], foot: usize) -> Vec<[f64; 2]> {
+    let even = |pts: &[[f64; 2]], n: usize| -> Vec<[f64; 2]> {
+        let mut acc = vec![0.0];
+        for w in pts.windows(2) {
+            let r = (w[0][0] + w[1][0]) / 2.0;
+            acc.push(acc.last().unwrap() + (w[1][0] - w[0][0]).hypot(r * (w[1][1] - w[0][1])));
+        }
+        let total = *acc.last().unwrap();
+        (0..=n)
+            .map(|i| {
+                let target = total * i as f64 / n as f64;
+                let k = acc.partition_point(|&a| a < target).clamp(1, acc.len() - 1);
+                let w = ((target - acc[k - 1]) / (acc[k] - acc[k - 1]).max(1e-300)).clamp(0.0, 1.0);
+                [pts[k - 1][0] + w * (pts[k][0] - pts[k - 1][0]), pts[k - 1][1] + w * (pts[k][1] - pts[k - 1][1])]
+            })
+            .collect()
+    };
+    let mut out = even(&pts[..=foot], FOOT_POINTS);
+    out.extend(&even(&pts[foot..], PROFILE_POINTS - FOOT_POINTS)[1..]);
+    out
 }
 
 /// A tooth's right flank, seam to tip, from its half-angle at each radius:
@@ -443,7 +456,7 @@ fn right_flank(pitch: f64, radii: &[f64], half: impl Fn(usize) -> f64) -> Vec<[f
     let mut pts: Vec<[f64; 2]> =
         (0..floor).map(|i| [r0, -pitch / 2.0 + (pitch / 2.0 - half(0)) * i as f64 / floor as f64]).collect();
     pts.extend(radii.iter().enumerate().map(|(i, &r)| [r, -half(i)]));
-    resample(&pts)
+    resample(&pts, floor)
 }
 
 /// A tooth's right flank, seam to tip, as `right_flank` makes it, from
@@ -495,8 +508,9 @@ fn milled_flank(
         let a = end * i as f64 / arc as f64;
         point(centre - ball * a.cos(), wc + ball * a.sin())
     }));
+    let foot = pts.len();
     pts.extend(radii(touch).map(|r| [r, -half(r)]));
-    resample(&pts)
+    resample(&pts, foot)
 }
 
 /// A cylindrical member's blank: its tip (or rim) radius over a length.
@@ -516,6 +530,28 @@ fn hub_radius(bore: f64, root: f64, depth: f64, what: &str) -> Result<f64, Strin
 /// Sections per turn of a worm's thread, so the flanks between them
 /// stay within a few microns of the helix.
 const SECTIONS_PER_TURN: f64 = 24.0;
+
+/// The worm's ends are chamfered at this angle to the end face, from its
+/// outside down to where the wheel's tips reach, so no part-thread is
+/// left as a feather edge for the wheel to bear on.
+pub const END_CHAMFER: f64 = 30.0;
+
+/// The thread's tip radius `e` from the nearer end, outside radius `tip`
+/// and the wheel's tips reaching to `mate`: the chamfer cone, run into
+/// the outside by a smooth corner (a quadratic blend half the chamfer's
+/// depth across, so the sections between take it without a kink).
+pub fn chamfered_tip(tip: f64, mate: f64, e: f64) -> f64 {
+    let cone = mate + e.max(0.0) / END_CHAMFER.to_radians().tan();
+    let w = 0.5 * (tip - mate).max(0.0);
+    let h = (w - (tip - cone).abs()).max(0.0);
+    tip.min(cone) - if w > 0.0 { h * h / (4.0 * w) } else { 0.0 }
+}
+
+/// Distance from the nearer chamfer's foot to where the threads reach
+/// their full outside: the length each end loses to its chamfer.
+pub fn chamfer_length(tip: f64, mate: f64) -> f64 {
+    1.5 * (tip - mate).max(0.0) * END_CHAMFER.to_radians().tan()
+}
 
 impl Design {
     fn whole_depth(&self) -> f64 {
@@ -541,6 +577,24 @@ impl Design {
     /// The worm's outside radius at its ends, its biggest.
     pub fn worm_rim(&self) -> f64 {
         self.worm_tip_at(self.spec.length / 2.0)
+    }
+
+    /// How far into the worm the wheel's tips reach, a distance `z` from
+    /// its middle along its axis.
+    fn worm_mate_at(&self, z: f64) -> f64 {
+        let ha = self.spec.addendum * self.spec.module;
+        match &self.hourglass {
+            Some(_) => self.center - ((self.wheel_radius + ha).powi(2) - z * z).max(0.0).sqrt(),
+            None => self.worm_radius - ha,
+        }
+    }
+
+    /// The worm's end chamfers: the radius they run down to at the ends,
+    /// and the length each end's thread takes to reach its full outside.
+    pub fn end_chamfer(&self) -> (f64, f64) {
+        let end = self.spec.length / 2.0;
+        let mate = self.worm_mate_at(end);
+        (mate, chamfer_length(self.worm_tip_at(end), mate))
     }
 
     /// AGMA 6135's thread length for a globoid worm: its base circle Ø
@@ -704,24 +758,30 @@ impl Design {
         }
         let z1 = self.spec.starts;
         let pitch = TAU / z1 as f64;
-        let radii = [self.worm_root, self.worm_radius - self.spec.addendum * self.spec.module, self.worm_tip];
-        let right = milled_flank(pitch, radii, |r| self.worm_half(r), |r| self.across(r), self.ball);
+        let mate = self.worm_mate_at(0.0);
+        let flank = |tip: f64| milled_flank(pitch, [self.worm_root, mate, tip], |r| self.worm_half(r), |r| self.across(r), self.ball);
+        let full = flank(self.worm_tip);
         let length = self.spec.length;
         let turns = length / self.lead;
         let sections = ((turns * SECTIONS_PER_TURN).ceil() as usize).max(10) + 1;
         let stations: Vec<f64> = (0..sections).map(|k| length * k as f64 / (sections - 1) as f64).collect();
         let turn = |z: f64| self.sense * TAU * (z - length / 2.0) / self.lead;
         let hub = hub_radius(self.spec.worm_bore, self.worm_root, self.whole_depth(), "worm")?;
+        // The chamfered ends' sections have their own, shorter, threads.
+        let tips: Vec<f64> = stations.iter().map(|&z| chamfered_tip(self.worm_tip, mate, z.min(length - z))).collect();
+        let profiles: Vec<Vec<[f64; 2]>> =
+            tips.iter().map(|&t| if t < self.worm_tip - 1e-12 { flank(t) } else { full.clone() }).collect();
         Ok(Member {
             teeth: z1,
             blank: cylinder(self.worm_tip, length, None),
             t_root: vec![self.worm_root; sections],
-            t_tip: vec![self.worm_tip; sections],
-            right: stations.iter().map(|&z| right.iter().map(|&[r, a]| [r, a + turn(z)]).collect()).collect(),
-            left: stations.iter().map(|&z| right.iter().map(|&[r, a]| [r, -a + turn(z)]).collect()).collect(),
+            t_tip: tips,
+            right: stations.iter().zip(&profiles).map(|(&z, p)| p.iter().map(|&[r, a]| [r, a + turn(z)]).collect()).collect(),
+            left: stations.iter().zip(&profiles).map(|(&z, p)| p.iter().map(|&[r, a]| [r, -a + turn(z)]).collect()).collect(),
             stations,
             hub: [hub; 2],
             bore: self.spec.worm_bore,
+            raised: 0.0,
         })
     }
 
@@ -737,13 +797,14 @@ impl Design {
         let (mut right, mut left, mut t_root, mut t_tip) = (vec![], vec![], vec![], vec![]);
         for &s in &stations {
             let z = s - length / 2.0;
-            let (root, tip) = (self.worm_root_at(z), self.worm_tip_at(z));
+            let root = self.worm_root_at(z);
             let rho = |r: f64| (self.center - r).hypot(z);
             let half = |r: f64| self.globoid_half(h, rho(r)) * ratio;
             // A turn of the worm moves a thread round the wheel's axis.
             let across = |r: f64| rho(r) / ratio * self.lead_angle.cos();
             // The wheel's tips, round its axis.
-            let mate = self.center - ((self.wheel_radius + self.spec.addendum * self.spec.module).powi(2) - z * z).max(0.0).sqrt();
+            let mate = self.worm_mate_at(z);
+            let tip = chamfered_tip(self.worm_tip_at(z), mate, s.min(length - s));
             let flank = milled_flank(pitch, [root, mate, tip], half, across, self.ball);
             // The thread's middle sits where the tool's gap was when the
             // point passed the axial plane.
@@ -764,6 +825,7 @@ impl Design {
             stations,
             hub: [hub; 2],
             bore: self.spec.worm_bore,
+            raised: 0.0,
         })
     }
 
@@ -958,12 +1020,13 @@ impl Design {
             stations,
             hub: [0.0; 2],
             bore: sp.wheel_bore,
+            raised: 0.0,
         })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     pub fn spec(starts: u32, teeth: u32, throated: bool) -> Spec {
@@ -1119,41 +1182,31 @@ mod tests {
         }
     }
 
-    /// How much of the ball fits against every point of a space's root,
-    /// at worst: the profile given seam to tip as (height off the floor,
-    /// distance from the space's middle), both mm in the plane square to
-    /// the thread, the space being mirrored about its middle. 1 if a ball
-    /// of radius `ball` can touch every point under 2 balls up from inside,
-    /// less the bit the chords between the profile's points cut off a
-    /// curve (2 % of the ball, with them 0.2 mm apart round 0.5 mm).
-    fn ball_fits(pts: &[[f64; 2]], ball: f64) -> f64 {
-        let mirrored: Vec<[f64; 2]> = pts.iter().map(|p| [p[0], -p[1]]).collect();
-        let near = |c: [f64; 2]| {
-            [pts, &mirrored[..]]
-                .iter()
-                .flat_map(|side| side.windows(2))
-                .map(|w| {
-                    let (a, b) = (w[0], w[1]);
-                    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                    let k = (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / (dx * dx + dy * dy).max(1e-300)).clamp(0.0, 1.0);
-                    (c[0] - a[0] - k * dx).hypot(c[1] - a[1] - k * dy)
-                })
-                .fold(f64::MAX, f64::min)
-        };
-        (1..pts.len() - 1)
-            .filter(|&i| pts[i][0] < 2.0 * ball)
-            .map(|i| {
-                // Square to the neighbours, give or take: the best of a fan.
-                let (dy, du) = (pts[i + 1][0] - pts[i - 1][0], pts[i + 1][1] - pts[i - 1][1]);
-                let a = (-dy).atan2(du);
-                (-20..=20)
-                    .map(|k| {
-                        let (s, c) = (a + (k as f64).to_radians()).sin_cos();
-                        near([pts[i][0] + ball * c, pts[i][1] + ball * s]) / ball
-                    })
-                    .fold(f64::MIN, f64::max)
-            })
-            .fold(1.0, f64::min)
+    #[test]
+    fn worm_ends_are_chamfered() {
+        for (name, d) in [("cylindrical", spec(1, 30, true).design().unwrap()), ("globoid", globoid(1, 40, false))] {
+            let m = d.worm().unwrap();
+            let k = m.stations.len() - 1;
+            let mate = |z: f64| match &d.hourglass {
+                Some(_) => d.center - ((d.wheel_radius + d.spec.addendum * d.spec.module).powi(2) - z * z).max(0.0).sqrt(),
+                None => d.worm_radius - d.spec.addendum * d.spec.module,
+            };
+            let half = d.spec.length / 2.0;
+            // Down to the wheel's tips at the ends, full in the middle.
+            for (e, z) in [(0, -half), (k, half)] {
+                assert!((m.t_tip[e] - mate(z)).abs() < 1e-9, "{name}: end {e} tip {} not {}", m.t_tip[e], mate(z));
+                let top = m.right[e].last().unwrap()[0];
+                assert!((top - mate(z)).abs() < 1e-6, "{name}: end {e} thread reaches {top}");
+            }
+            assert!((m.t_tip[k / 2] - d.worm_tip_at(m.stations[k / 2] - half)).abs() < 1e-9, "{name}: middle chamfered");
+            // The tip rises smoothly: no step from section to section
+            // turns by more than the chamfer's angle allows.
+            let slope = 1.0 / END_CHAMFER.to_radians().tan();
+            for w in m.t_tip.windows(2).zip(m.stations.windows(2)) {
+                let ((a, b), (sa, sb)) = ((w.0[0], w.0[1]), (w.1[0], w.1[1]));
+                assert!((b - a).abs() <= slope * (sb - sa) * 1.0001 + 1e-9, "{name}: tip jumps {a} to {b}");
+            }
+        }
     }
 
     #[test]
@@ -1184,7 +1237,7 @@ mod tests {
                         [d.root_form - rho, t * (phi - seam).abs() * d.square(rho)]
                     })
                     .collect();
-                let fits = ball_fits(&pts, d.ball);
+                let fits = crate::gear::ball_fits(&pts, d.ball);
                 assert!(fits > 0.97, "{name}: only {fits:.3} of the ball fits the wheel's root");
             }
             let mid = worm.stations.len() / 2;
@@ -1197,7 +1250,7 @@ mod tests {
                 };
                 let pts: Vec<[f64; 2]> =
                     prof.iter().map(|&[r, a]| [r - prof[0][0], (a - seam).abs() * across(r)]).collect();
-                let fits = ball_fits(&pts, d.ball);
+                let fits = crate::gear::ball_fits(&pts, d.ball);
                 assert!(fits > 0.97, "{name}: only {fits:.3} of the ball fits the worm's root");
             }
         }
@@ -1219,7 +1272,9 @@ mod tests {
         let d = globoid(2, 41, false);
         let w = d.worm().unwrap();
         let (k0, mid) = (0, w.stations.len() / 2);
-        assert!(w.t_tip[k0] > w.t_tip[mid] + 0.5 && w.t_root[k0] > w.t_root[mid] + 0.5);
+        // (The ends' outside is chamfered off; the hourglass is under it.)
+        let end = d.worm_tip_at(w.stations[k0] - d.spec.length / 2.0);
+        assert!(end > w.t_tip[mid] + 0.5 && w.t_root[k0] > w.t_root[mid] + 0.5);
         assert!((w.t_tip[mid] - d.worm_tip).abs() < 0.01);
         // At the throat the thread is 45 % of the axial pitch thick on the
         // pitch diameter.
@@ -1231,11 +1286,16 @@ mod tests {
         let span = thick(&w.left[mid]) - thick(&w.right[mid]);
         let axial = span * d.lead / TAU;
         assert!((axial - 0.45 * d.axial_pitch).abs() < 0.02, "thread {axial:.4}, pitch {:.4}", d.axial_pitch);
-        // Its flank points measure as on the worm.
+        // Its flank points measure as on the worm, where the wheel's tips
+        // work (below, the space is kept as wide as the ball).
         for k in [0, mid, w.stations.len() - 1] {
             for i in [PROFILE_POINTS / 2, PROFILE_POINTS - 2] {
                 let [r, phi] = w.right[k][i];
                 let z = w.stations[k] - d.spec.length / 2.0;
+                let mate = d.center - ((d.wheel_radius + d.spec.addendum * d.spec.module).powi(2) - z * z).max(0.0).sqrt();
+                if r < mate {
+                    continue;
+                }
                 let v = d.worm_inside([r * phi.cos(), r * phi.sin(), z], Some(0.0), 0.0);
                 assert!(v.abs() < 1e-4 || k != mid, "{v}");
                 assert!(v.abs() < 1e-3, "station {k}: {v}");
@@ -1260,7 +1320,7 @@ mod tests {
                 (*angle, *t, *left_hand) = (35.0, throated, left);
             }
             p.normalize();
-            let d = crate::train::worm_spec(&p.gears[0].params, &p.gears[1].params, &p.gears[1].placement, p.ball_end_mill)
+            let d = crate::train::worm_spec(&p.gears[0].params, &p.gears[1].params, &p.gears[1].placement, p.ball())
                 .unwrap()
                 .design()
                 .unwrap();

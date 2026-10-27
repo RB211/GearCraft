@@ -230,7 +230,16 @@ pub fn hypoid_solid(m: &Member) -> Solid {
             }
         }
     };
-    let tip_steps = 4;
+    // Tip land steps of at most 3° round the axis, so a worm's wide
+    // tips stay round.
+    let tip_span = (0..=last).map(|k| (m.left[k].last().unwrap()[1] - m.right[k].last().unwrap()[1]).abs()).fold(0.0, f64::max);
+    let tip_steps = ((tip_span / 3f64.to_radians()).ceil() as usize).max(4);
+    // A section's tip edge, between its flanks' top points, as (φ, t).
+    let tip_edge = |k: usize, i: usize| {
+        let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
+        let f = i as f64 / tip_steps as f64;
+        [a[1] + (b[1] - a[1]) * f, a[0] + (b[0] - a[0]) * f]
+    };
     for tooth in 0..z {
         let rot = tooth as f64 * pitch;
         let (right, left) = (m.flank(false, tooth), m.flank(true, tooth));
@@ -243,11 +252,10 @@ pub fn hypoid_solid(m: &Member) -> Solid {
         // Tip land between the flanks' top points.
         let tip: Vec<Vec<[f64; 3]>> = (0..=last)
             .map(|k| {
-                let (a, b) = (*m.right[k].last().unwrap(), *m.left[k].last().unwrap());
                 (0..=tip_steps)
                     .map(|i| {
-                        let f = i as f64 / tip_steps as f64;
-                        m.point(m.stations[k], a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f + rot)
+                        let [phi, t] = tip_edge(k, i);
+                        m.point(m.stations[k], t, phi + rot)
                     })
                     .collect()
             })
@@ -256,15 +264,43 @@ pub fn hypoid_solid(m: &Member) -> Solid {
         grid(&mut s, &tip, off((at(&m.right, top) + at(&m.left, top)) / 2.0));
     }
     // Toe and heel ends: per tooth, the section from the hub circle up
-    // round the tooth, clipped into triangles on the (φ, t) plane.
+    // round the tooth, clipped into triangles on the (φ, t) plane. A
+    // tooth that goes far round the axis (a worm's thread) would bend
+    // those triangles out of true, so it is fanned instead: from the hub
+    // circle straight out to each point round the tooth, as the end face
+    // runs (flat, or a cone).
     let hub_steps = 12;
+    let fan = pitch > TAU / 8.0;
     for (e, k) in [(0usize, 0usize), (1, last)] {
         let st = m.stations[k];
         let ht = m.hub[e];
+        let sign = if e == 0 { -1.0 } else { 1.0 };
+        if fan {
+            let mut round: Vec<[f64; 2]> = m.right[k].iter().map(|&[t, phi]| [phi, t]).collect();
+            round.extend((1..tip_steps).map(|i| tip_edge(k, i)));
+            round.extend(m.left[k].iter().rev().map(|&[t, phi]| [phi, t]));
+            for tooth in 0..z {
+                let rot = tooth as f64 * pitch;
+                let hint = mul_v(sign, along(m.right[k][0][1] + rot + pitch / 2.0));
+                for w in round.windows(2) {
+                    let [a, b] = [w[0], w[1]];
+                    let q = [m.point(st, ht, a[0] + rot), m.point(st, a[1], a[0] + rot), m.point(st, b[1], b[0] + rot), m.point(st, ht, b[0] + rot)];
+                    let n = cross(sub(q[2], q[0]), sub(q[3], q[1]));
+                    let l = dot(n, n).sqrt();
+                    if l < 1e-15 {
+                        continue;
+                    }
+                    let f = if dot(n, hint) < 0.0 { -1.0 / l } else { 1.0 / l };
+                    s.quad(q[0], q[1], q[2], q[3], mul_v(f, n));
+                }
+            }
+            continue;
+        }
         let scale = m.arc_scale(k);
         let base = m.right[k][0][1];
         let mut poly: Vec<[f64; 2]> = vec![[base, ht]];
         poly.extend(m.right[k].iter().map(|&[t, phi]| [phi, t]));
+        poly.extend((1..tip_steps).map(|i| tip_edge(k, i)));
         poly.extend(m.left[k].iter().rev().map(|&[t, phi]| [phi, t]));
         let end = m.left[k][0][1];
         poly.push([end, ht]);
@@ -273,7 +309,6 @@ pub fn hypoid_solid(m: &Member) -> Solid {
         }
         let flat: Vec<[f64; 2]> = poly.iter().map(|&[phi, t]| [phi * scale, t]).collect();
         let tris = ear_clip(&flat);
-        let sign = if e == 0 { -1.0 } else { 1.0 };
         for tooth in 0..z {
             let rot = tooth as f64 * pitch;
             let pts: Vec<[f64; 3]> = poly.iter().map(|&[phi, t]| m.point(st, t, phi + rot)).collect();
@@ -513,6 +548,8 @@ pub struct Placed<'a> {
 pub struct Frame {
     pub image: egui::ColorImage,
     ids: Vec<u32>,
+    /// Each pixel's nearest depth, as `Camera::project` gives it.
+    depth: Vec<f32>,
     parts: Vec<u64>,
     origin: Pos2,
     ppp: f32,
@@ -520,21 +557,31 @@ pub struct Frame {
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { image: egui::ColorImage::new([1, 1], vec![Color32::TRANSPARENT]), ids: vec![u32::MAX], parts: Vec::new(), origin: Pos2::ZERO, ppp: 1.0 }
+        Frame { image: egui::ColorImage::new([1, 1], vec![Color32::TRANSPARENT]), ids: vec![u32::MAX], depth: vec![f32::INFINITY], parts: Vec::new(), origin: Pos2::ZERO, ppp: 1.0 }
     }
 }
 
 impl Frame {
-    /// The part showing at screen point `p`.
-    pub fn pick(&self, p: Pos2) -> Option<u64> {
+    fn pixel(&self, p: Pos2) -> Option<usize> {
         let [w, h] = self.image.size;
         let x = ((p.x - self.origin.x) * self.ppp).floor();
         let y = ((p.y - self.origin.y) * self.ppp).floor();
         if x < 0.0 || y < 0.0 || x as usize >= w || y as usize >= h {
             return None;
         }
-        let id = self.ids[y as usize * w + x as usize];
+        Some(y as usize * w + x as usize)
+    }
+
+    /// The part showing at screen point `p`.
+    pub fn pick(&self, p: Pos2) -> Option<u64> {
+        let id = self.ids[self.pixel(p)?];
         self.parts.get(id as usize).copied()
+    }
+
+    /// Whether a point at screen point `p` and `depth` is in sight, not
+    /// behind what was drawn there by more than `slack`.
+    pub fn sees(&self, p: Pos2, depth: f64, slack: f64) -> bool {
+        self.pixel(p).is_some_and(|i| depth <= self.depth[i] as f64 + slack)
     }
 }
 
@@ -606,15 +653,16 @@ pub fn render(rect: Rect, ppp: f32, cam: &Camera, parts: &[Placed], background: 
 
     let mut color = vec![background; w * h];
     let mut ids = vec![u32::MAX; w * h];
+    let mut depth = vec![f32::INFINITY; w * h];
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
     let band = h.div_ceil(threads);
     std::thread::scope(|scope| {
-        for (k, (cs, is)) in color.chunks_mut(band * w).zip(ids.chunks_mut(band * w)).enumerate() {
+        let bands = color.chunks_mut(band * w).zip(ids.chunks_mut(band * w)).zip(depth.chunks_mut(band * w));
+        for (k, ((cs, is), depth)) in bands.enumerate() {
             let tris = &tris;
             scope.spawn(move || {
                 let top = k * band;
                 let rows = cs.len() / w;
-                let mut depth = vec![f32::INFINITY; cs.len()];
                 for t in tris {
                     if t.y1 < top as f32 || t.y0 > (top + rows) as f32 {
                         continue;
@@ -632,7 +680,7 @@ pub fn render(rect: Rect, ppp: f32, cam: &Camera, parts: &[Placed], background: 
     });
     soften_edges(&mut color, &ids, w, h);
     let image = egui::ColorImage::new([w, h], color);
-    Frame { image, ids, parts: parts.iter().map(|p| p.id).collect(), origin: rect.min, ppp }
+    Frame { image, ids, depth, parts: parts.iter().map(|p| p.id).collect(), origin: rect.min, ppp }
 }
 
 /// Fill one triangle within rows `top..top + rows`, a row at a time over
@@ -699,6 +747,10 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn mul_v(k: f64, a: [f64; 3]) -> [f64; 3] {
+    [k * a[0], k * a[1], k * a[2]]
+}
+
 fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
@@ -734,6 +786,55 @@ mod tests {
         assert!((c - rect.center()).length() < 1e-3);
         for p in [[-50.0, -50.0, 0.0], [50.0, 50.0, 10.0], [50.0, -50.0, 10.0]] {
             assert!(rect.contains(cam.project(rect, p).0));
+        }
+    }
+
+    /// A worm's thread goes right round its axis, yet its end faces are
+    /// whole: their triangles cover the end section exactly, no holes
+    /// and no overlaps, as one and several starts and globoid.
+    #[test]
+    fn worm_ends_are_closed() {
+        use crate::train::{Link, PitchUnit, Project};
+        let u = PitchUnit::Module;
+        for (starts, globoid) in [(1, false), (4, false), (1, true)] {
+            let mut p = Project::empty();
+            let a = p.add_root(u.starter_worm_drive(crate::worm::Role::Worm), 0.0, 0.0);
+            p.gears[0].params.teeth = starts;
+            p.add_child(a, u.starter_worm_drive(crate::worm::Role::Wheel), Link::Worm);
+            if globoid {
+                p.make_globoid(1, true);
+            }
+            p.normalize();
+            let sp = crate::train::worm_spec(&p.gears[0].params, &p.gears[1].params, &p.gears[1].placement, p.ball()).unwrap();
+            let m = sp.design().unwrap().worm().unwrap();
+            let solid = hypoid_solid(&m);
+            for (k, z) in [(0, m.stations[0]), (m.stations.len() - 1, *m.stations.last().unwrap())] {
+                let faces: f64 = solid
+                    .tris
+                    .iter()
+                    .filter(|(t, n)| n[2].abs() > 0.999 && t.iter().all(|&i| (solid.verts[i as usize][2] - z).abs() < 1e-9))
+                    .map(|(t, _)| {
+                        let [a, b, c] = t.map(|i| solid.verts[i as usize]);
+                        0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs()
+                    })
+                    .sum();
+                // The section's own outline, its tips finely round.
+                let mut round: Vec<[f64; 2]> = Vec::new();
+                for tooth in 0..m.teeth {
+                    let rot = tooth as f64 * m.pitch();
+                    let (r, l) = (&m.right[k], &m.left[k]);
+                    let (a, b) = (*r.last().unwrap(), *l.last().unwrap());
+                    let tip = (1..400).map(|i| [a[0] + (b[0] - a[0]) * i as f64 / 400.0, a[1] + (b[1] - a[1]) * i as f64 / 400.0]);
+                    for [t, phi] in r.iter().copied().chain(tip).chain(l.iter().rev().copied()) {
+                        let q = m.point(z, t, phi + rot);
+                        round.push([q[0], q[1]]);
+                    }
+                }
+                let n = round.len();
+                let inside: f64 =
+                    0.5 * (0..n).map(|i| round[i][0] * round[(i + 1) % n][1] - round[(i + 1) % n][0] * round[i][1]).sum::<f64>().abs();
+                assert!((faces / inside - 1.0).abs() < 0.005, "{starts} starts, globoid {globoid}, z {z}: {faces} vs {inside}");
+            }
         }
     }
 }

@@ -26,6 +26,7 @@
 //! each section a tooth is an arc of azimuth at every depth, found by
 //! solving where the generating body begins.
 
+use crate::reach;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
 
@@ -61,6 +62,9 @@ pub struct Spec {
     pub backlash: f64,
     pub pinion_bore: f64,
     pub ring_bore: f64,
+    /// Ball end mill Ø, mm, that rounds the roots of both gears; 0 if
+    /// none is chosen (then the cutter's usual edge radius).
+    pub ball: f64,
 }
 
 // ---- small vector helpers ---------------------------------------------------
@@ -140,6 +144,10 @@ pub struct Design {
     /// Slot 0's middle azimuth by distance from the apex, for finding the
     /// slots near a point.
     slot_table: Vec<(f64, f64)>,
+    /// How far the ring's slot floors are raised, at cone distances
+    /// evenly spaced from its toe to its heel, so the ball end mill can
+    /// get down to them (see `members`). Empty: not raised.
+    pub floor: Vec<f64>,
 }
 
 /// A Formate cutter, in the ring gear's frame, set to cut slot 0.
@@ -177,6 +185,25 @@ fn pitch_apex(p: V3, g: V3, l0: V3, d: V3) -> V3 {
 }
 
 impl Spec {
+    /// The biggest ball end mill Ø that cuts both gears' roots.
+    pub fn largest_ball(&self) -> Option<f64> {
+        let fits = |d: f64| Spec { ball: d, ..self.clone() }.design().is_some_and(|g| g.ball_trouble().is_none());
+        let mut lo = 0.0;
+        let mut hi = self.module;
+        if !fits(1e-3 * self.module) {
+            return None;
+        }
+        while fits(hi) && hi < 4.0 * self.module {
+            lo = hi;
+            hi *= 1.5;
+        }
+        for _ in 0..30 {
+            let mid = (lo + hi) / 2.0;
+            if fits(mid) { lo = mid } else { hi = mid }
+        }
+        Some(lo)
+    }
+
     fn ring_outer_radius(&self) -> f64 {
         self.module * self.ring_teeth as f64 / 2.0
     }
@@ -291,6 +318,7 @@ impl Spec {
                 edge: 0.0,
             },
             slot_table: Vec::new(),
+            floor: Vec::new(),
         };
         Trial { res: [r1, if tooth.is_some() { 0.0 } else { r2 }], design: Some(design) }
     }
@@ -403,13 +431,76 @@ pub fn ring_left_hand(d: &Design) -> bool {
 
 impl Design {
     fn proportions(&mut self) -> Option<()> {
+        let alpha = self.spec.pressure_angle.to_radians();
+        self.mn = 2.0 * self.ring_radius * self.ring_spiral.cos() / self.spec.ring_teeth as f64;
+        let mn = self.mn;
+        // The roots are rounded for the ball: deep enough that each root
+        // fillet rises no higher than the mate's tips reach, by the true
+        // corner of the ring's teeth (a little squarer than the pressure
+        // angle makes it).
+        // A ball too big to size the teeth for falls back on the usual
+        // edge (and is reported by `ball_trouble`).
+        let usual = 0.25 * mn;
+        let want = if self.spec.ball > 0.0 { self.spec.ball / 2.0 } else { usual };
+        [want, usual].into_iter().find_map(|want| {
+            let mut clearance = usual.max(want * (1.0 - alpha.sin()) + 1e-3 * mn);
+            for _ in 0..4 {
+                self.size(clearance, want)?;
+                let need = self.corner_rise() + 1e-3 * mn;
+                if need <= clearance + 1e-9 {
+                    break;
+                }
+                clearance = need;
+            }
+            Some(())
+        })
+    }
+
+    /// How far up a ring tooth's flank the generating ring's rounded tip
+    /// corner reaches, at worst across the face: the edge radius less its
+    /// share along the face, by the angle between face and flank.
+    fn corner_rise(&self) -> f64 {
+        let blank = self.ring_blank();
+        let pitch = TAU / self.spec.ring_teeth as f64;
+        let re = self.cutter.edge;
+        [self.ring_inner, (self.ring_inner + self.ring_outer) / 2.0, self.ring_outer]
+            .iter()
+            .map(|&s| {
+                let t = blank.tip(s);
+                let at = |phi: f64| section_point(blank.pitch, s, t, phi);
+                // The tooth's edge on the face: from the slot's middle to
+                // the tooth's.
+                let slot = self.slot_azimuth(s.hypot(t));
+                let (mut lo, mut hi) = (slot, slot + pitch / 2.0);
+                for _ in 0..50 {
+                    let m = (lo + hi) / 2.0;
+                    if self.any_slot(at(m), 0.0) > 0.0 { lo = m } else { hi = m }
+                }
+                let x = at((lo + hi) / 2.0);
+                let r = x[0].hypot(x[1]);
+                let na = blank.face_normal();
+                let n1 = [-na[0] * x[0] / r, -na[0] * x[1] / r, -na[1]];
+                let h = 1e-5 * self.mn;
+                let grad: V3 = std::array::from_fn(|k| {
+                    let (mut a, mut b) = (x, x);
+                    a[k] += h;
+                    b[k] -= h;
+                    (self.any_slot(b, 0.0) - self.any_slot(a, 0.0)) / (2.0 * h)
+                });
+                re * (1.0 - dot(n1, unit(grad)))
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// Proportions and the ring's cutter for clearance `clearance` and
+    /// blade edge radius `want` (at most a full round).
+    fn size(&mut self, clearance: f64, want: f64) -> Option<()> {
         let s = &self.spec;
         let (zp, zg) = (s.pinion_teeth as f64, s.ring_teeth as f64);
         let alpha = s.pressure_angle.to_radians();
-        self.mn = 2.0 * self.ring_radius * self.ring_spiral.cos() / zg;
         let mn = self.mn;
         self.depth = 2.0 * mn;
-        self.clearance = 0.25 * mn;
+        self.clearance = clearance;
         let u = zg / zp;
         self.ring_addendum = self.depth * (0.21 + 0.29 / (u * u));
         self.pinion_addendum = self.depth - self.ring_addendum;
@@ -440,7 +531,14 @@ impl Design {
         if point_width <= 0.05 * mn || rc <= width {
             return None;
         }
-        let edge = (0.25 * mn).min(0.45 * point_width * (1.0 - alpha.sin()) / alpha.cos());
+        // The blade edge rounds the ring's slot bottom, a full round at
+        // most; with no ball chosen, kept short of that.
+        let full = point_width / 2.0 * alpha.cos() / (1.0 - alpha.sin());
+        let edge = if s.ball > 0.0 {
+            want.min(0.999 * full)
+        } else {
+            want.min(0.45 * point_width * (1.0 - alpha.sin()) / alpha.cos())
+        };
         self.cutter = Cutter {
             center,
             axis: nr,
@@ -577,12 +675,26 @@ impl Blank {
 
     /// Inside measure (positive inside) with the face raised by `lift`
     /// and the ends pushed out by `margin`.
+    #[cfg(test)]
     fn inside(&self, rz: [f64; 2], lift: f64, margin: f64) -> f64 {
-        let na = [self.face_angle.cos(), -self.face_angle.sin()];
-        let face = lift - ((rz[0] - self.face_point[0]) * na[0] + (rz[1] - self.face_point[1]) * na[1]);
+        self.below_face(rz, lift).min(self.within_ends(rz, margin))
+    }
+
+    /// Distance below the face cone raised by `lift`.
+    fn below_face(&self, rz: [f64; 2], lift: f64) -> f64 {
+        let na = self.face_normal();
+        lift - ((rz[0] - self.face_point[0]) * na[0] + (rz[1] - self.face_point[1]) * na[1])
+    }
+
+    /// The face cone's outward normal in (r, z).
+    fn face_normal(&self) -> [f64; 2] {
+        [self.face_angle.cos(), -self.face_angle.sin()]
+    }
+
+    fn within_ends(&self, rz: [f64; 2], margin: f64) -> f64 {
         let g = self.g();
         let along = rz[0] * g[0] + rz[1] * g[1];
-        face.min(self.outer + margin - along).min(along - (self.inner - margin))
+        (self.outer + margin - along).min(along - (self.inner - margin))
     }
 
     #[cfg(test)]
@@ -677,11 +789,11 @@ impl Design {
         }
     }
 
-    /// How far inside slot `j`'s cutter a ring-frame point is, the floor
-    /// raised by `floor`.
-    fn slot(&self, x: V3, j: i32, floor: f64) -> f64 {
+    /// How far inside slot `j`, as `cutter` cuts it, a ring-frame point
+    /// is, the floor raised by `floor`.
+    fn slot(&self, cutter: &Cutter, x: V3, j: i32, floor: f64) -> f64 {
         let pitch = TAU / self.spec.ring_teeth as f64;
-        self.cutter.inside(rot_z(-(j as f64) * pitch, x), floor)
+        cutter.inside(rot_z(-(j as f64) * pitch, x), floor)
     }
 
     /// Azimuth of slot 0's middle at distance ρ from the apex: where the
@@ -702,22 +814,120 @@ impl Design {
         p[1].atan2(p[0])
     }
 
+    /// How far the slot floors are raised at cone distance `rho`: a
+    /// Catmull-Rom spline through `floor`, level past the ends.
+    pub fn floor_at(&self, rho: f64) -> f64 {
+        let n = self.floor.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let k = ((rho - self.ring_inner) / (self.ring_outer - self.ring_inner) * (n - 1) as f64).clamp(0.0, (n - 1) as f64);
+        let i = (k.floor() as usize).min(n - 2);
+        let t = k - i as f64;
+        let at = |j: isize| self.floor[j.clamp(0, n as isize - 1) as usize];
+        let [p0, p1, p2, p3] = [at(i as isize - 1), at(i as isize), at(i as isize + 1), at(i as isize + 2)];
+        let v = 0.5
+            * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t);
+        v.max(0.0)
+    }
+
     /// Inside measure of any slot near a ring-frame point.
     pub(crate) fn any_slot(&self, x: V3, floor: f64) -> f64 {
+        self.any_slot_by(&self.cutter, x, floor)
+    }
+
+    fn any_slot_by(&self, cutter: &Cutter, x: V3, floor: f64) -> f64 {
         let pitch = TAU / self.spec.ring_teeth as f64;
         let rho = norm(x);
+        let floor = floor + self.floor_at(rho);
         let az = self.slot_table.iter().rev().find(|e| e.0 <= rho).or(self.slot_table.first()).map_or(0.0, |e| e.1);
         let rel = x[1].atan2(x[0]) - az;
         let j0 = (rel.rem_euclid(TAU) / pitch).round() as i32;
-        (-1..=1).map(|k| self.slot(x, j0 + k, floor)).fold(f64::MIN, f64::max)
+        (-1..=1).map(|k| self.slot(cutter, x, j0 + k, floor)).fold(f64::MIN, f64::max)
     }
 
     /// The generating ring gear (tip and floor raised by the clearance,
-    /// ends extended): inside measure, positive in its material.
+    /// ends extended): inside measure, positive in its material. Its tip
+    /// corners are rounded by the blade edge radius, so the pinion's root
+    /// fillets it cuts are no tighter than the ball. Its raised slot floor
+    /// meets the flanks square: the clearance keeps the real ring's root
+    /// fillets below the pinion's tips, so they shape nothing.
     fn tool(&self, blank: &Blank, x: V3) -> f64 {
-        let rz = [x[0].hypot(x[1]), x[2]];
+        let r = x[0].hypot(x[1]);
+        let rz = [r, x[2]];
         let c = self.clearance;
-        blank.inside(rz, c, 0.3 * self.spec.face).min(-self.any_slot(x, c))
+        let ends = blank.within_ends(rz, 0.3 * self.spec.face);
+        let face = blank.below_face(rz, c);
+        let sharp = Cutter { edge: 0.0, ..self.cutter };
+        let slot = |x: V3| self.any_slot_by(&sharp, x, c);
+        let side = -slot(x);
+        let re = self.cutter.edge;
+        if face >= re || side >= re || re <= 0.0 || r < 1e-9 {
+            return face.min(side).min(ends);
+        }
+        // The rounded corner: re less the distance to the edge where the
+        // surfaces, both pulled in by re, meet. The cosine between their
+        // inward normals: the face cone's from its meridian, the flank's
+        // by a difference.
+        let na = blank.face_normal();
+        let n1 = [-na[0] * x[0] / r, -na[0] * x[1] / r, -na[1]];
+        let h = 1e-4 * self.mn;
+        let grad: V3 = std::array::from_fn(|k| {
+            let mut xh = x;
+            xh[k] += h;
+            (-slot(xh) - side) / h
+        });
+        let cos = dot(n1, unit(grad)).clamp(-0.99, 0.99);
+        let (u, v) = (re - face, re - side);
+        let s2 = 1.0 - cos * cos;
+        let (l1, l2) = ((u - v * cos) / s2, (v - u * cos) / s2);
+        let corner = if l1 > 0.0 && l2 > 0.0 { re - (l1 * l1 + l2 * l2 + 2.0 * l1 * l2 * cos).sqrt() } else { face.min(side) };
+        corner.min(ends)
+    }
+
+    /// The generating ring's tooth across its raised tip at the toe,
+    /// square to the tooth (where it is narrowest): the most room it has
+    /// to round its corners.
+    pub fn tool_tip_width(&self) -> f64 {
+        let blank = self.ring_blank();
+        let s = self.ring_inner;
+        let pitch = TAU / self.spec.ring_teeth as f64;
+        let t = blank.tip(s) + self.clearance;
+        let inside = |phi: f64| self.any_slot(section_point(blank.pitch, s, t, phi), self.clearance);
+        let n = 96;
+        let mut width = 0.0;
+        for i in 0..n {
+            let (a, b) = (pitch * i as f64 / n as f64, pitch * (i + 1) as f64 / n as f64);
+            let (fa, fb) = (inside(a), inside(b));
+            if fa < 0.0 && fb < 0.0 {
+                width += b - a;
+            } else if (fa < 0.0) != (fb < 0.0) {
+                let (mut lo, mut hi) = (a, b);
+                for _ in 0..40 {
+                    let m = (lo + hi) / 2.0;
+                    if (inside(m) < 0.0) == (fa < 0.0) { lo = m } else { hi = m }
+                }
+                width += if fa < 0.0 { lo - a } else { b - lo };
+            }
+        }
+        let radius = s * blank.pitch.sin() + t * blank.pitch.cos();
+        width * radius * self.ring_spiral.cos()
+    }
+
+    /// Why the ball end mill can't cut this pair, if it can't.
+    pub fn ball_trouble(&self) -> Option<&'static str> {
+        let rb = self.spec.ball / 2.0;
+        if rb <= 0.0 {
+            return None;
+        }
+        if self.cutter.edge < rb - 1e-9 {
+            return Some("the ring gear's slots are narrower than it at the bottom");
+        }
+        let (sa, ca) = self.cutter.alpha.sin_cos();
+        if self.tool_tip_width() < 2.0 * rb * (1.0 - sa) / ca {
+            return Some("the pinion's spaces are narrower than it at the bottom, at the toe");
+        }
+        None
     }
 }
 
@@ -742,6 +952,9 @@ pub struct Member {
     /// cones meet the flat faces.
     pub hub: [f64; 2],
     pub bore: f64,
+    /// How far the ring's slot floors were raised for the ball end mill's
+    /// reach, and the pinion's tips cut down with them, at most.
+    pub raised: f64,
 }
 
 impl Member {
@@ -813,6 +1026,7 @@ pub(crate) fn build_member(
         left: vec![],
         hub: [0.0; 2],
         bore,
+        raised: 0.0,
     };
     for r in results {
         let (tr, tt, right, left) = r?;
@@ -1129,6 +1343,66 @@ fn section(
 }
 
 impl Design {
+    /// The pinion and ring gear as the ball end mill can cut them on the
+    /// 4-axis mill (see `reachable`).
+    pub fn members(&self) -> Result<(Member, Member), String> {
+        let d = self.reachable()?;
+        let raised = d.floor.iter().copied().fold(0.0, f64::max);
+        let (mut pinion, mut ring) = (d.pinion()?, d.ring()?);
+        (pinion.raised, ring.raised) = (raised, raised);
+        Ok((pinion, ring))
+    }
+
+    /// The design as the ball end mill can cut it on the 4-axis mill. A
+    /// tool kept square to the ring's axis can't follow its curved slots
+    /// all the way down, near the toe most: there the slot floors are
+    /// raised until it can. The pinion's tips, cut by the ring's slots,
+    /// come down with them and keep their clearance; the flanks above are
+    /// as designed, the contact a little shorter.
+    pub fn reachable(&self) -> Result<Design, String> {
+        let mut d = self.clone();
+        d.raise_floors()?;
+        Ok(d)
+    }
+
+    /// Raise the ring's slot floors, a step at a time where the ball end
+    /// mill can't reach, up to half the working depth.
+    fn raise_floors(&mut self) -> Result<(), String> {
+        const KNOTS: usize = 9;
+        let ball = self.spec.ball;
+        if ball <= 0.0 {
+            return Ok(());
+        }
+        self.floor = vec![0.0; KNOTS];
+        let (step, most) = (0.08 * self.depth, 0.5 * self.depth);
+        for _ in 0..12 {
+            let ring = self.ring()?;
+            let r = reach::check(&reach::member(&ring, ball), ball);
+            if r.share() <= reach::STRAY {
+                break;
+            }
+            let span = self.ring_outer - self.ring_inner;
+            let mut up = [false; KNOTS];
+            for p in &r.missed {
+                let k = (norm(*p) - self.ring_inner) / span * (KNOTS - 1) as f64;
+                for (i, u) in up.iter_mut().enumerate() {
+                    *u |= (i as f64 - k).abs() <= 1.5;
+                }
+            }
+            let mut moved = false;
+            for (f, u) in self.floor.iter_mut().zip(up) {
+                if u && *f < most {
+                    *f = (*f + step).min(most);
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// The ring gear's sections: slots straight from the cutter.
     pub fn ring(&self) -> Result<Member, String> {
         let blank = self.ring_blank();
@@ -1223,6 +1497,7 @@ pub mod tests {
             backlash: 0.0,
             pinion_bore: 15.0,
             ring_bore: 110.0,
+            ball: 0.0,
         }
     }
 
@@ -1321,6 +1596,30 @@ pub mod tests {
         }
     }
 
+    /// Where the ball end mill can't get down the ring's curved slots,
+    /// their floors are raised until it can, the more the more they curve;
+    /// the pinion's tips come down to match, so the pair still runs
+    /// without interference, its flanks touching.
+    #[test]
+    fn floors_are_raised_where_the_ball_cant_reach() {
+        let hypoid = Spec { ball: 2.0, ..car() }.design().unwrap().reachable().unwrap();
+        let spiral = Spec { offset: 0.0, ball: 2.0, ..car() }.design().unwrap().reachable().unwrap();
+        let most = |d: &Design| d.floor.iter().copied().fold(0.0, f64::max);
+        assert!(most(&hypoid) > 0.0 && most(&hypoid) < 0.25 * hypoid.depth, "{:?}", hypoid.floor);
+        assert!(most(&spiral) > most(&hypoid), "{:?}", spiral.floor);
+        for d in [&hypoid, &spiral] {
+            let ring = d.ring().unwrap();
+            let r = reach::check(&reach::member(&ring, d.spec.ball), d.spec.ball);
+            assert!(r.share() < 0.01, "offset {}: {:.3} out of reach", d.spec.offset, r.share());
+            for (step, deepest) in deepest_through_mesh(d).into_iter().enumerate() {
+                assert!(deepest < 1e-6, "offset {}, step {step}: {deepest}", d.spec.offset);
+                assert!(deepest > -0.05, "offset {}, step {step}: no contact ({deepest})", d.spec.offset);
+            }
+        }
+        // No ball chosen: nothing raised.
+        assert!(car().design().unwrap().reachable().unwrap().floor.is_empty());
+    }
+
     /// Bevel worms: 3 to 7 starts on a near-face wheel, the shafts
     /// meeting or passing a little apart, run in mesh as the car set does,
     /// with more than a pitch of overlap.
@@ -1417,6 +1716,60 @@ pub mod tests {
                 assert!(l[PROFILE_POINTS][1] > r[PROFILE_POINTS][1]);
             }
         }
+    }
+
+    /// A ball end mill set: both gears' roots are rounded for it, where
+    /// the teeth are smallest (the toe) and in the middle, and the pair
+    /// still runs without interference.
+    #[test]
+    fn roots_are_milled_by_the_ball() {
+        let worm = Spec {
+            pinion_teeth: 5,
+            ring_teeth: 30,
+            module: 4.0,
+            face: 18.0,
+            offset: 5.0,
+            spiral: 50.0,
+            pinion_bore: 0.0,
+            ring_bore: 30.0,
+            ball: 1.5,
+            ..car()
+        };
+        for (name, spec) in [("hypoid", Spec { ball: 3.0, ..car() }), ("spiral bevel", Spec { offset: 0.0, ball: 2.4, ..car() }), ("bevel worm", worm)] {
+            let d = spec.design().unwrap();
+            assert_eq!(d.ball_trouble(), None, "{name}");
+            assert!((d.cutter.edge - spec.ball / 2.0).abs() < 1e-12);
+            for (what, m) in [("ring", d.ring().unwrap()), ("pinion", d.pinion().unwrap())] {
+                for k in [0, SECTIONS / 2] {
+                    let s = m.stations[k];
+                    let (sg, cg) = m.blank.pitch.sin_cos();
+                    // Square to the tooth: its spiral angle here, from how
+                    // the slot bottom turns from section to section.
+                    let turn = (m.right[k + 1][0][1] - m.right[k][0][1]) / (m.stations[k + 1] - s);
+                    let spiral = (s * sg * turn).atan();
+                    // Space 0: tooth -1's high side (tooth 0's, a pitch
+                    // back) tip to slot bottom, then tooth 0's low side.
+                    let r = |t: f64| (s * sg + t * cg) * spiral.cos().abs();
+                    let seam = m.right[k][0][1];
+                    let back = m.left[k].iter().rev().map(|&[t, phi]| [t, (phi - m.pitch() - seam) * r(t)]);
+                    let pts: Vec<[f64; 2]> = back.chain(m.right[k][1..].iter().map(|&[t, phi]| [t, (phi - seam) * r(t)])).collect();
+                    let fits = crate::gear::ball_fits_space(&pts, spec.ball / 2.0);
+                    assert!(fits > 0.97, "{name} {what}, section {k}: only {fits:.3} of the ball fits");
+                }
+            }
+            for (step, deepest) in deepest_through_mesh(&d).into_iter().enumerate() {
+                assert!(deepest < 1e-6, "{name}, step {step}: {deepest}");
+                assert!(deepest > -0.05, "{name}, step {step}: no contact ({deepest})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_ball_too_big_for_the_spaces_is_flagged() {
+        let largest = car().largest_ball().unwrap();
+        assert!(largest > 2.0, "{largest}");
+        assert_eq!(Spec { ball: 0.98 * largest, ..car() }.design().unwrap().ball_trouble(), None);
+        assert!(Spec { ball: 1.05 * largest, ..car() }.design().unwrap().ball_trouble().is_some());
     }
 }
 

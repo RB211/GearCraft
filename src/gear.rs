@@ -72,6 +72,11 @@ pub struct GearParams {
     /// `face_width` its threaded length.
     #[serde(default)]
     pub worm_drive: Option<worm::Role>,
+    /// The project's ball end mill Ø, mm, copied in by
+    /// `Project::apply_ball`; 0 when none is chosen. The roots are rounded
+    /// for it.
+    #[serde(skip)]
+    pub ball: f64,
 }
 
 impl Default for GearParams {
@@ -94,6 +99,7 @@ impl Default for GearParams {
             hypoid: None,
             worm: false,
             worm_drive: None,
+            ball: 0.0,
         }
     }
 }
@@ -276,7 +282,7 @@ impl GearParams {
     pub fn root_radius(&self) -> f64 {
         match self.belt {
             Some(b) => self.tip_radius() - b.rack(self.teeth).hr,
-            None => self.pitch_radius() - self.module * (self.dedendum - self.profile_shift),
+            None => self.pitch_radius() - self.module * (self.cut_dedendum() - self.profile_shift),
         }
     }
     pub fn circular_pitch(&self) -> f64 {
@@ -298,9 +304,64 @@ impl GearParams {
     }
     /// Largest rack tip radius that still leaves a flat on the rack tip.
     pub fn max_fillet(&self) -> f64 {
+        self.max_fillet_at(self.cut_dedendum())
+    }
+
+    fn max_fillet_at(&self, dedendum: f64) -> f64 {
         let a = self.alpha();
         let hw0 = (PI * self.module / 2.0 + self.backlash) / 2.0;
-        ((hw0 - self.dedendum * self.module * a.tan()) * a.cos() / (1.0 - a.sin())).max(0.0)
+        ((hw0 - dedendum * self.module * a.tan()) * a.cos() / (1.0 - a.sin())).max(0.0)
+    }
+
+    /// The root fillet radius the spaces are cut with, mm: the ball's,
+    /// or with none chosen the rack's.
+    pub fn fillet(&self) -> f64 {
+        if self.ball > 0.0 { self.ball / 2.0 } else { self.root_fillet * self.module }
+    }
+
+    /// Dedendum coefficient as cut: deep enough that the fillet rises no
+    /// higher than the mate's tips reach (the rack's straight flank runs
+    /// down past them), so a big ball deepens the roots. ISO's 0.38 m
+    /// fillet rises 0.25003 m: a thousandth of a module is let pass.
+    pub fn cut_dedendum(&self) -> f64 {
+        let rise = self.fillet() * (1.0 - self.alpha().sin()) / self.module;
+        self.dedendum.max(self.addendum + rise - 1e-3)
+    }
+
+    /// For a part cut on its own (not one of a generated pair): the ball
+    /// end mill Ø its roots are rounded for as it stands, and the biggest
+    /// that fits its spaces.
+    pub fn ball_room(&self) -> Option<(f64, f64)> {
+        if self.is_generated() || !self.is_buildable() {
+            return None;
+        }
+        if let Some(b) = self.belt {
+            let g = b.rack(self.teeth);
+            let most = 0.999 * g.max_r1();
+            return Some((2.0 * g.r1.max(self.ball / 2.0).min(most), 2.0 * most));
+        }
+        if self.is_bevel() {
+            let g = BevelGeom::new(self)?;
+            let toe = g.cone_distance * g.front_ratio();
+            let now = g.fillet.map_or(0.0, |f| 2.0 * f.radius * toe);
+            return Some((now, BevelGeom::largest_ball(self)?));
+        }
+        Some((2.0 * self.fillet().min(0.999 * self.max_fillet()), self.largest_ball()))
+    }
+
+    /// The biggest ball end mill Ø that rounds the roots, the rack tip a
+    /// full round (the roots deepened to suit).
+    pub fn largest_ball(&self) -> f64 {
+        let m = self.module;
+        let (sa, ca) = self.alpha().sin_cos();
+        let a = self.max_fillet_at(self.dedendum);
+        let lift = self.addendum - 1e-3;
+        if a * (1.0 - sa) <= (self.dedendum - lift) * m {
+            return 2.0 * a;
+        }
+        // Deepened: the fillet's rise is the dedendum past the addendum.
+        let hw0 = (PI * m / 2.0 + self.backlash) / 2.0;
+        2.0 * ((hw0 - lift * m * sa / ca) / ca).max(0.0)
     }
 
     pub fn is_buildable(&self) -> bool {
@@ -352,7 +413,16 @@ impl GearParams {
                     b.min_teeth()
                 )));
             }
-            let groove = b.rack(self.teeth).hr;
+            let g = b.rack(self.teeth);
+            if self.ball / 2.0 > g.r1 + 1e-9 && self.ball / 2.0 <= 0.999 * g.max_r1() {
+                out.push(Issue::warn(format!(
+                    "The Ø{} ball end mill rounds the groove bottoms wider than ISO 5294's {}: check the belt's \
+                     teeth still seat.",
+                    len(self.ball),
+                    len(g.r1)
+                )));
+            }
+            let groove = g.hr;
             if self.bore > 0.0 && self.bore / 2.0 >= self.root_radius() - 0.5 * groove {
                 out.push(Issue::warn("Bore leaves almost no material under the grooves."));
             }
@@ -378,7 +448,8 @@ impl GearParams {
         } else if tip_land < 0.25 * self.module {
             out.push(Issue::warn(format!("Narrow tip land ({}, under 0.25 × module).", len(tip_land))));
         }
-        if self.root_fillet > self.max_fillet() + 1e-12 {
+        // A ball too big for the spaces is shown with its fix.
+        if self.ball == 0.0 && self.root_fillet > self.max_fillet() + 1e-12 {
             out.push(Issue::warn(format!(
                 "Root fillet limited to {:.3} × module by the rack geometry.",
                 self.max_fillet() / self.module
@@ -423,9 +494,9 @@ fn gear_rack(p: &GearParams) -> Rack {
     let (ca, ta) = (a.cos(), a.tan());
     let shift = p.profile_shift * m;
     let hw0 = (PI * m / 2.0 + p.backlash) / 2.0;
-    let v_tip = p.dedendum * m;
+    let v_tip = p.cut_dedendum() * m;
     let v_top = -(p.addendum + 1.0) * m;
-    let rho = (p.root_fillet * m).clamp(0.0, p.max_fillet() * 0.999);
+    let rho = p.fillet().clamp(0.0, p.max_fillet() * 0.999);
     let vc = v_tip - rho;
     let uc = hw0 - vc * ta - rho / ca;
     let top = [hw0 - v_top * ta, v_top];
@@ -497,7 +568,7 @@ pub fn tooth_profile(p: &GearParams) -> Option<Profile> {
     let mut half = vec![half_pitch; radii.len()];
 
     let rack = match p.belt {
-        Some(b) => pulley::rack(b, p.teeth),
+        Some(b) => pulley::rack(b, p.teeth, p.ball),
         None => gear_rack(p),
     };
     let y_ref = r;
@@ -774,6 +845,50 @@ impl MeshInfo {
     }
 }
 
+/// How much of the ball fits against every point of a space's root,
+/// at worst: the profile given seam to tip as (height off the floor,
+/// distance from the space's middle), both mm in the plane square to
+/// the tooth, the space being mirrored about its middle.
+#[cfg(test)]
+pub(crate) fn ball_fits(pts: &[[f64; 2]], ball: f64) -> f64 {
+    let whole: Vec<[f64; 2]> = pts.iter().rev().map(|p| [p[0], -p[1]]).chain(pts[1..].iter().copied()).collect();
+    ball_fits_space(&whole, ball)
+}
+
+/// The same for a whole space, given tip to tip (left to right seen from
+/// outside). 1 if a ball of radius `ball` can touch every point under 2
+/// balls up from inside, less the bit the chords between the profile's
+/// points cut off a curve (2 % of the ball, with them 0.2 mm apart round
+/// 0.5 mm).
+#[cfg(test)]
+pub(crate) fn ball_fits_space(pts: &[[f64; 2]], ball: f64) -> f64 {
+    let floor = pts.iter().map(|p| p[0]).fold(f64::MAX, f64::min);
+    let near = |c: [f64; 2]| {
+        pts.windows(2)
+            .map(|w| {
+                let (a, b) = (w[0], w[1]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let k = (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / (dx * dx + dy * dy).max(1e-300)).clamp(0.0, 1.0);
+                (c[0] - a[0] - k * dx).hypot(c[1] - a[1] - k * dy)
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    (1..pts.len() - 1)
+        .filter(|&i| pts[i][0] - floor < 2.0 * ball)
+        .map(|i| {
+            // Square to the neighbours, give or take: the best of a fan.
+            let (dy, du) = (pts[i + 1][0] - pts[i - 1][0], pts[i + 1][1] - pts[i - 1][1]);
+            let a = (-dy).atan2(du);
+            (-20..=20)
+                .map(|k| {
+                    let (s, c) = (a + (k as f64).to_radians()).sin_cos();
+                    near([pts[i][0] + ball * c, pts[i][1] + ball * s]) / ball
+                })
+                .fold(f64::MIN, f64::max)
+        })
+        .fold(1.0, f64::min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +982,54 @@ mod tests {
         assert!(area > 0.0);
         let rmax = o.iter().map(|q| q[0].hypot(q[1])).fold(0.0, f64::max);
         assert!(rmax <= p.tip_radius() + 1e-9);
+    }
+
+    /// A space of a spur gear or pulley as `ball_fits` takes it: from the
+    /// middle of the root out, (height off the root, distance from the
+    /// space's middle), in mm.
+    fn space(p: &GearParams) -> Vec<[f64; 2]> {
+        let prof = tooth_profile(p).unwrap();
+        let mid = PI / p.teeth as f64;
+        let r0 = prof.radii[0];
+        std::iter::once([0.0, 0.0]).chain(prof.radii.iter().zip(&prof.half).map(|(&r, &h)| [r - r0, (mid - h) * r])).collect()
+    }
+
+    #[test]
+    fn spur_roots_are_milled_by_the_ball() {
+        for (teeth, ball) in [(12, 1.2), (24, 1.5), (40, 1.75), (60, 0.8)] {
+            let p = GearParams { teeth, ball, ..Default::default() };
+            assert!(ball <= p.largest_ball());
+            let fits = ball_fits(&space(&p), ball / 2.0);
+            assert!(fits > 0.97, "{teeth} teeth, Ø{ball}: only {fits:.3} of the ball fits");
+            // A big ball deepens the roots so the flanks still run on
+            // below the mate's tips.
+            let rise = ball / 2.0 * (1.0 - p.alpha().sin());
+            assert!(p.cut_dedendum() * p.module >= p.addendum * p.module + rise - 1e-2, "{teeth} teeth: not deepened");
+        }
+        // ISO's fillet leaves ISO's root.
+        let iso = GearParams { ball: 2.0 * 0.38 * 2.0, ..Default::default() };
+        assert_eq!(iso.cut_dedendum(), 1.25);
+    }
+
+    #[test]
+    fn the_biggest_ball_is_a_full_round_root() {
+        for teeth in [10, 24, 80] {
+            let p = GearParams { teeth, ..Default::default() };
+            let d = p.largest_ball();
+            let at = |ball: f64| GearParams { ball, ..p.clone() };
+            assert!(at(0.99 * d).fillet() < at(0.99 * d).max_fillet());
+            assert!(at(1.01 * d).fillet() > at(1.01 * d).max_fillet());
+        }
+    }
+
+    #[test]
+    fn pulley_grooves_are_milled_by_the_ball() {
+        for s in BeltSection::ALL {
+            let z = s.stock_teeth()[4];
+            let ball = 1.9 * s.rack(z).max_r1();
+            let p = GearParams { belt: Some(s), teeth: z, module: s.pitch() / PI, ball, ..Default::default() };
+            let fits = ball_fits(&space(&p), ball / 2.0);
+            assert!(fits > 0.97, "{s:?} Ø{ball:.2}: only {fits:.3} of the ball fits");
+        }
     }
 }

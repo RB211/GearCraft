@@ -289,6 +289,11 @@ pub struct Project {
     /// Ø of the ball end mill the parts are cut with, mm; 0 until it is
     /// chosen, the roots then filleted to each part's own radius.
     pub ball_end_mill: f64,
+    /// Shape the teeth for the ball end mill on the 4-axis mill: roots
+    /// rounded to it, and the ring gears' slot floors raised where it
+    /// can't reach. Off for parts made another way (3D printed, say),
+    /// which keep the teeth as designed; the ball is remembered.
+    pub for_machining: bool,
 }
 
 impl Default for Project {
@@ -358,8 +363,9 @@ fn v_unit(a: [f64; 3]) -> [f64; 3] {
 }
 
 /// The hypoid set made by pinion `pinion` and ring gear `ring` placed by
-/// `placement` (a Placement::Hypoid).
-pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement) -> Option<hypoid::Spec> {
+/// `placement` (a Placement::Hypoid), cut by a ball end mill of Ø `ball`
+/// (0: none chosen).
+pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement, ball: f64) -> Option<hypoid::Spec> {
     let Placement::Hypoid { offset, shaft_angle, spiral, reverse_hand, cutter_radius, .. } = *placement else {
         return None;
     };
@@ -377,6 +383,7 @@ pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement
         backlash: ring.backlash,
         pinion_bore: pinion.bore,
         ring_bore: ring.bore,
+        ball,
     })
 }
 
@@ -432,7 +439,7 @@ impl PairSpec {
         match self {
             PairSpec::Hypoid(sp) => {
                 let d = sp.design().ok_or_else(|| "These settings have no hypoid solution.".to_string())?;
-                Ok((d.pinion()?, d.ring()?))
+                d.members()
             }
             PairSpec::Worm(sp) => {
                 let d = sp.design()?;
@@ -446,7 +453,7 @@ impl PairSpec {
 /// `placement`, makes with its driver, cut by a ball end mill of Ø `ball`.
 pub fn pair_spec(driver: &GearParams, driven: &GearParams, placement: &Placement, ball: f64) -> Option<PairSpec> {
     match placement {
-        Placement::Hypoid { .. } => hypoid_spec(driver, driven, placement).map(PairSpec::Hypoid),
+        Placement::Hypoid { .. } => hypoid_spec(driver, driven, placement, ball).map(PairSpec::Hypoid),
         Placement::Worm { .. } => worm_spec(driver, driven, placement, ball).map(PairSpec::Worm),
         _ => None,
     }
@@ -504,7 +511,7 @@ impl BeltInfo {
 impl Project {
     /// A starter pair in the given unit system.
     pub fn new(unit: PitchUnit) -> Self {
-        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit, ball_end_mill: 0.0 };
+        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit, ball_end_mill: 0.0, for_machining: true };
         let a = p.add_root(unit.starter(20), 0.0, 0.0);
         let wheel = GearParams { bore: unit.starter(40).bore * 1.25, ..unit.starter(40) };
         p.add_child(a, wheel, Link::Mesh);
@@ -730,10 +737,25 @@ impl Project {
         self.gears.retain(|g| !doomed.contains(&g.id));
     }
 
+    /// The ball end mill Ø the teeth are shaped for: none when they are
+    /// not made for machining.
+    pub fn ball(&self) -> f64 {
+        if self.for_machining { self.ball_end_mill } else { 0.0 }
+    }
+
+    /// Give every part the ball end mill its roots are rounded for.
+    pub fn apply_ball(&mut self) {
+        let ball = self.ball();
+        for g in &mut self.gears {
+            g.params.ball = ball;
+        }
+    }
+
     /// Repair anything a hand-edited or older file could get wrong: unknown
     /// or later parents become roots, linked tooth systems are synced, and
     /// standard rack coefficients are re-derived (fine pitch depends on DP).
     pub fn normalize(&mut self) {
+        self.apply_ball();
         // Bevel cones: the first mate of a gear fixes its cone; later
         // mates follow from their tooth counts (the cones share an apex).
         let mut coned = vec![false; self.gears.len()];
@@ -903,7 +925,7 @@ impl Project {
                 (Placement::Hypoid { angle, .. }, Some(pi)) => {
                     let pg = &self.gears[pi];
                     let ps = &out[pi];
-                    let design = hypoid_spec(&pg.params, &g.params, &g.placement).and_then(|sp| sp.design());
+                    let design = hypoid_spec(&pg.params, &g.params, &g.placement, self.ball()).and_then(|sp| sp.design());
                     let f = ps.frame;
                     let beta = angle.to_radians();
                     let turn = |v: [f64; 3]| {
@@ -951,7 +973,7 @@ impl Project {
                     let pg = &self.gears[pi];
                     let ps = &out[pi];
                     let f = ps.frame;
-                    let design = worm_spec(&pg.params, &g.params, &g.placement, self.ball_end_mill).and_then(|sp| sp.solve().ok());
+                    let design = worm_spec(&pg.params, &g.params, &g.placement, self.ball()).and_then(|sp| sp.solve().ok());
                     match design {
                         Some(d) => {
                             // Across the worm's axis towards azimuth β, at the
@@ -1126,7 +1148,7 @@ impl Project {
             }
         }
         // Sized with a short worm, which any design allows.
-        let spec = worm_spec(&self.gears[k].params, &self.gears[w].params, &self.gears[w].placement, self.ball_end_mill);
+        let spec = worm_spec(&self.gears[k].params, &self.gears[w].params, &self.gears[w].placement, self.ball());
         let Some(d) = spec.and_then(|s| worm::Spec { length: 1.0, ..s }.solve().ok()) else { return };
         let floor = |v: f64| (v * 10.0).floor() / 10.0;
         self.gears[k].params.face_width = floor(d.effective_length().unwrap_or(d.spec.length));
@@ -1144,7 +1166,7 @@ impl Project {
         let Placement::Worm { friction, .. } = wheel.placement else {
             return Err("Only a worm drive can be made back-drivable.".into());
         };
-        let old = worm_spec(&self.gears[k].params, &wheel.params, &wheel.placement, self.ball_end_mill).ok_or("This is not a worm drive.")?;
+        let old = worm_spec(&self.gears[k].params, &wheel.params, &wheel.placement, self.ball()).ok_or("This is not a worm drive.")?;
         if self.mates(k) > 1 {
             return Err("The worm turns another wheel too: changing its starts would change that drive.".into());
         }
@@ -1316,6 +1338,35 @@ fn belt_info(a: &GearParams, b: &GearParams, belt_teeth: u32) -> BeltInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parts made other than on the mill (3D printed, say) keep their
+    /// teeth as designed: no rounding to the ball, no raised floors. The
+    /// ball stays chosen for when machining is back on, as it is for
+    /// files from before the setting.
+    #[test]
+    fn parts_not_machined_keep_their_teeth_as_designed() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_hypoid(Role::Pinion), 0.0, 0.0);
+        p.add_child(a, PitchUnit::Module.starter_hypoid(Role::Ring), Link::Hypoid);
+        if let Placement::Hypoid { offset, .. } = &mut p.gears[1].placement {
+            *offset = 0.0;
+        }
+        p.ball_end_mill = 2.0;
+        p.normalize();
+        let ring = |p: &Project| {
+            let spec = pair_spec(&p.gears[0].params, &p.gears[1].params, &p.gears[1].placement, p.ball()).unwrap();
+            spec.generate().unwrap().1
+        };
+        assert!(ring(&p).raised > 0.0);
+        assert!(p.gears.iter().all(|g| g.params.ball == 2.0));
+        p.for_machining = false;
+        p.normalize();
+        assert_eq!(ring(&p).raised, 0.0);
+        assert!(p.gears.iter().all(|g| g.params.ball == 0.0));
+        assert_eq!(p.ball_end_mill, 2.0);
+        let old: Project = serde_json::from_str(r#"{"ball_end_mill": 2.0}"#).unwrap();
+        assert!(old.for_machining);
+    }
 
     #[test]
     fn simple_pair_turns_opposite_at_tooth_ratio() {

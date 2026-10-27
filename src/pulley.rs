@@ -39,6 +39,14 @@ pub struct GenRack {
     pub pld: f64,
 }
 
+impl GenRack {
+    /// The biggest groove-bottom corner radius: the rack tip a full round.
+    pub fn max_r1(&self) -> f64 {
+        let (sa, ca) = self.flank.to_radians().sin_cos();
+        self.bg / 2.0 * ca / (1.0 - sa)
+    }
+}
+
 /// ISO 5294 Table 4: a standard belt width and the narrowest pulley that
 /// carries it, with flanges and without.
 #[derive(Clone, Copy, Debug)]
@@ -353,8 +361,9 @@ pub fn belt_for_center(section: BeltSection, r1: f64, r2: f64, target: f64, stan
 /// The generating rack as drawn in ISO 5294 Figure 1, in the generator's
 /// rack frame: u along the rack, v depth below the rolling (pitch) line.
 /// One rack tooth with half a land either side; the lands sit at depth a,
-/// exactly on the pulley's outside diameter.
-pub(crate) fn rack(section: BeltSection, teeth: u32) -> Rack {
+/// exactly on the pulley's outside diameter. The groove-bottom corners
+/// are rounded for a ball end mill of Ø `ball` where ISO's are tighter.
+pub(crate) fn rack(section: BeltSection, teeth: u32, ball: f64) -> Rack {
     let g = section.rack(teeth);
     let pb = section.pitch();
     let a = g.pld / 2.0;
@@ -366,8 +375,7 @@ pub(crate) fn rack(section: BeltSection, teeth: u32) -> Rack {
     let k = g.bg / 2.0 + v_tip * ta;
 
     // Convex tip corner, tangent to the tip line and the flank.
-    let max_r1 = (k - v_tip * ta) * ca / (1.0 - sa);
-    let r1 = g.r1.min(max_r1 * 0.999);
+    let r1 = g.r1.max(ball / 2.0).min(g.max_r1() * 0.999);
     let (uc1, vc1) = (k - (v_tip - r1) * ta - r1 / ca, v_tip - r1);
     // Concave fillet where the flank meets the land, kept inside the half
     // pitch so neighbouring teeth's fillets cannot overlap.

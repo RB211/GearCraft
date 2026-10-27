@@ -41,6 +41,38 @@ pub fn pitch_angles(z1: u32, z2: u32, sigma: f64) -> (f64, f64) {
     (d1, sigma - d1)
 }
 
+/// A root fillet, the same in every section through the apex: a circle
+/// in (γ, φ·sin γ), the polar angle and arc round the axis on the unit
+/// sphere, so its radius grows with the distance from the apex.
+#[derive(Clone, Copy, Debug)]
+pub struct Fillet {
+    /// Angular radius, the centre (γ, arc from the tooth's middle), and
+    /// the polar angle where it runs onto the flank.
+    pub radius: f64,
+    pub centre: [f64; 2],
+    pub foot: f64,
+}
+
+impl Fillet {
+    /// Arc from the tooth's middle at polar angle γ (root ≤ γ ≤ foot).
+    fn arc(&self, gamma: f64) -> f64 {
+        let [gc, yc] = self.centre;
+        yc - (self.radius * self.radius - (gamma - gc) * (gamma - gc)).max(0.0).sqrt()
+    }
+
+    /// The fillet by the angle ψ round its centre from the root (0) to the
+    /// foot: polar angle and arc from the tooth's middle.
+    pub fn at(&self, psi: f64) -> (f64, f64) {
+        let [gc, yc] = self.centre;
+        (gc - self.radius * psi.cos(), yc - self.radius * psi.sin())
+    }
+
+    /// ψ at the foot.
+    pub fn end(&self) -> f64 {
+        ((self.centre[0] - self.foot) / self.radius).clamp(-1.0, 1.0).acos()
+    }
+}
+
 /// Everything needed to draw or export one bevel gear.
 #[derive(Clone, Debug)]
 pub struct BevelGeom {
@@ -61,10 +93,48 @@ pub struct BevelGeom {
     /// Tooth half-angle in azimuth on the base cone; at polar angle γ it
     /// is this less the involute's sweep.
     pub base_half: f64,
+    /// The root fillet, None if there is none. If the ball end mill is too
+    /// big for the spaces, the biggest that fits.
+    pub fillet: Option<Fillet>,
 }
 
 impl BevelGeom {
     pub fn new(p: &GearParams) -> Option<BevelGeom> {
+        let (geom, lowest, toe) = Self::unfilleted(p)?;
+        // The fillet is tightest at the toe: there it is the ball's radius.
+        let want = if p.ball > 0.0 { p.ball / 2.0 / toe } else { p.root_fillet * p.module / geom.cone_distance };
+        let geom = match geom.with_fillet(want, lowest) {
+            Some(g) => g,
+            None => {
+                // The biggest that fits.
+                let (mut lo, mut hi) = (0.0, want);
+                for _ in 0..30 {
+                    let mid = (lo + hi) / 2.0;
+                    if geom.with_fillet(mid, lowest).is_some() { lo = mid } else { hi = mid }
+                }
+                geom.with_fillet(lo, lowest)?
+            }
+        };
+        if geom.root <= 0.02 || geom.root >= PI / 2.0 - 0.01 {
+            return None;
+        }
+        Some(BevelGeom { profile: geom.tooth_profile(), ..geom })
+    }
+
+    /// The biggest ball end mill Ø that rounds the roots at the toe.
+    pub fn largest_ball(p: &GearParams) -> Option<f64> {
+        let (geom, lowest, toe) = Self::unfilleted(p)?;
+        let (mut lo, mut hi) = (0.0, p.module / toe);
+        for _ in 0..30 {
+            let mid = (lo + hi) / 2.0;
+            if geom.with_fillet(mid, lowest).is_some() { lo = mid } else { hi = mid }
+        }
+        Some(2.0 * lo * toe)
+    }
+
+    /// The gear with no root fillet, the polar angle the mate's tips reach
+    /// down to, and the toe's distance from the apex.
+    fn unfilleted(p: &GearParams) -> Option<(BevelGeom, f64, f64)> {
         let bevel = p.bevel?;
         let delta = bevel.pitch_angle.to_radians();
         let alpha = p.alpha();
@@ -76,9 +146,6 @@ impl BevelGeom {
         let face = p.face_width.clamp(0.05 * cone_distance, 0.6 * cone_distance);
         let tip = delta + p.module * p.addendum / cone_distance;
         let root = delta - p.module * p.dedendum / cone_distance;
-        if root <= 0.02 || root >= PI / 2.0 - 0.01 {
-            return None;
-        }
         let base = (delta.sin() * alpha.cos()).asin();
         let geom = BevelGeom {
             teeth: p.teeth,
@@ -91,11 +158,74 @@ impl BevelGeom {
             profile: Profile { radii: vec![], half: vec![] },
             bore: p.bore,
             base_half: 0.0,
+            fillet: None,
         };
         let r_pitch = cone_distance * delta.sin();
         let base_half = PI / (2.0 * p.teeth as f64) - p.backlash / (4.0 * r_pitch) + geom.involute(delta);
         let geom = BevelGeom { base_half, ..geom };
-        Some(BevelGeom { profile: geom.tooth_profile(), ..geom })
+        let toe = cone_distance * geom.front_ratio();
+        // Roots deep enough that the flanks run on below the mate's tips
+        // (less a thousandth of a module, as for spur gears).
+        let lowest = delta - p.module * (p.addendum - 1e-3) / cone_distance;
+        Some((geom, lowest, toe))
+    }
+
+    /// The gear with a root fillet of angular radius `rho`, its roots
+    /// deepened if need be so the fillet runs onto the flank no higher
+    /// than polar angle `lowest`. None if the space is too narrow for it.
+    fn with_fillet(&self, rho: f64, lowest: f64) -> Option<BevelGeom> {
+        if rho <= 1e-9 {
+            return Some(BevelGeom { fillet: None, ..self.clone() });
+        }
+        let mut root = self.root;
+        for _ in 0..12 {
+            let f = self.fillet_at(root, rho)?;
+            let over = f.foot - lowest;
+            if over <= 1e-8 {
+                // Keep a land between the fillets.
+                let mid = PI / self.teeth as f64 * root.sin();
+                return (f.arc(root) <= 0.99 * mid).then(|| BevelGeom { root, fillet: Some(f), ..self.clone() });
+            }
+            root -= over;
+        }
+        None
+    }
+
+    /// The circle of angular radius ρ touching the root cone at `root` and
+    /// the flank: its centre is ρ off the flank, square to it, at γ =
+    /// root + ρ.
+    fn fillet_at(&self, root: f64, rho: f64) -> Option<Fillet> {
+        let gc = root + rho;
+        // The flank's slope and the space-side normal's γ part at γ.
+        let slope = |g: f64| {
+            let h = 1e-7;
+            (self.flank_arc(g + h) - self.flank_arc(g - h)) / (2.0 * h)
+        };
+        let off = |g: f64| {
+            let d = slope(g);
+            g - rho * d / (1.0 + d * d).sqrt() - gc
+        };
+        let (mut lo, mut hi) = (root, root + 2.0 * rho);
+        if off(lo) > 0.0 || off(hi) < 0.0 {
+            return None;
+        }
+        for _ in 0..40 {
+            let mid = (lo + hi) / 2.0;
+            if off(mid) < 0.0 { lo = mid } else { hi = mid }
+        }
+        let foot = (lo + hi) / 2.0;
+        let d = slope(foot);
+        let yc = self.flank_arc(foot) + rho / (1.0 + d * d).sqrt();
+        (foot > root && self.half_flank(foot) > 0.0).then_some(Fillet { radius: rho, centre: [gc, yc], foot })
+    }
+
+    /// The flank's arc from the tooth's middle on the unit sphere.
+    fn flank_arc(&self, gamma: f64) -> f64 {
+        self.half_flank(gamma) * gamma.sin()
+    }
+
+    fn half_flank(&self, gamma: f64) -> f64 {
+        self.base_half - self.involute(gamma.max(self.base))
     }
 
     /// Azimuth swept by the spherical involute of the base cone from its
@@ -133,16 +263,30 @@ impl BevelGeom {
 
     /// Tooth half-angle in azimuth at polar angle γ.
     pub fn half_at(&self, gamma: f64) -> f64 {
-        (self.base_half - self.involute(gamma.max(self.base))).max(0.0)
+        match self.fillet {
+            Some(f) if gamma < f.foot => f.arc(gamma.max(self.root)) / gamma.sin(),
+            _ => self.half_flank(gamma).max(0.0),
+        }
+    }
+
+    /// Where the flank proper starts: the fillet's foot, or the root.
+    pub fn flank_foot(&self) -> f64 {
+        self.fillet.map_or(self.root, |f| f.foot)
     }
 
     fn tooth_profile(&self) -> Profile {
         let n = 48;
-        let mut radii: Vec<f64> = (0..=n).map(|i| self.root + (self.tip - self.root) * i as f64 / n as f64).collect();
-        if self.base > self.root && self.base < self.tip {
-            radii.push(self.base);
-            radii.sort_by(f64::total_cmp);
+        let foot = self.flank_foot();
+        let mut radii: Vec<f64> = (0..=n).map(|i| foot + (self.tip - foot) * i as f64 / n as f64).collect();
+        // The fillet by equal turns round its centre.
+        if let Some(f) = self.fillet {
+            let m = 12;
+            radii.extend((0..m).map(|i| f.at(f.end() * i as f64 / m as f64).0));
         }
+        if self.base > foot && self.base < self.tip {
+            radii.push(self.base);
+        }
+        radii.sort_by(f64::total_cmp);
         // Half a tooth at the pitch cone, less half the backlash (as an
         // angle on the large-end pitch circle), set in `base_half`. Below
         // the base cone the flank runs straight down to the root.
@@ -317,5 +461,40 @@ mod tests {
         assert!((p[2] - zb).abs() < 1e-9 && (p[0] - rb).abs() < 1e-9);
         // The back cone is square to the pitch cone at the pitch circle.
         assert!((g.back(g.delta) - g.cone_distance).abs() < 1e-9);
+    }
+
+    #[test]
+    fn roots_are_milled_by_the_ball() {
+        for (teeth, delta, ball) in [(20, 26.565, 1.0), (40, 63.435, 1.1), (30, 45.0, 1.2), (9, 20.0, 0.8)] {
+            let p = GearParams {
+                teeth,
+                module: 2.0,
+                face_width: 12.0,
+                bevel: Some(Bevel { pitch_angle: delta }),
+                ball,
+                ..Default::default()
+            };
+            let g = BevelGeom::new(&p).unwrap();
+            let largest = BevelGeom::largest_ball(&p).unwrap();
+            assert!(ball <= largest, "{teeth} teeth: Ø{ball} doesn't fit (Ø{largest:.3} does)");
+            // At the toe, where the teeth are smallest, on the sphere
+            // through it.
+            let d = g.cone_distance * g.front_ratio();
+            let mid = PI / teeth as f64;
+            let (radii, half) = (&g.profile.radii, &g.profile.half);
+            let pts: Vec<[f64; 2]> = std::iter::once([0.0, 0.0])
+                .chain(radii.iter().zip(half).map(|(&gm, &h)| [(gm - g.root) * d, (mid - h) * gm.sin() * d]))
+                .collect();
+            let fits = crate::gear::ball_fits(&pts, ball / 2.0);
+            assert!(fits > 0.97, "{teeth} teeth, Ø{ball}: only {fits:.3} of the ball fits");
+            // The flanks run on below the mate's tips (bar a thousandth).
+            let tips = g.delta - p.module * (p.addendum - 1e-3) / g.cone_distance;
+            assert!(g.flank_foot() <= tips + 1e-7, "{teeth} teeth: fillet rises {:.2e} past the mate's tips", g.flank_foot() - tips);
+        }
+        // Too big for the spaces: the biggest fillet that fits, flagged.
+        let p = GearParams { teeth: 30, bevel: Some(Bevel { pitch_angle: 45.0 }), ball: 4.0, ..Default::default() };
+        let g = BevelGeom::new(&p).unwrap();
+        let largest = BevelGeom::largest_ball(&p).unwrap();
+        assert!(largest < 4.0 && g.fillet.is_some_and(|f| (2.0 * f.radius * g.cone_distance * g.front_ratio() - largest).abs() < 1e-3));
     }
 }

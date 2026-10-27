@@ -7,6 +7,7 @@ use crate::export::{self, place};
 use crate::mesh;
 use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
+use crate::reach;
 use crate::train::{self, Datum, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui,
@@ -30,6 +31,30 @@ struct PairJob {
     rx: Option<mpsc::Receiver<Result<(Member, Member), String>>>,
     members: Option<Arc<(Member, Member)>>,
     error: Option<String>,
+}
+
+/// What a reach check is of: a part made from its own settings, or a
+/// generated member (its pair's spec, and whether it is the driven one).
+#[derive(Clone, PartialEq)]
+enum ReachOf {
+    Own(GearParams),
+    Member(train::PairSpec, bool),
+}
+
+/// Whether the ball end mill, square to a part's axis on the 4-axis mill,
+/// reaches its teeth: checked off the UI thread for the selected part.
+struct ReachJob {
+    of: ReachOf,
+    ball: f64,
+    rx: Option<mpsc::Receiver<Arc<Checked>>>,
+    done: Option<Arc<Checked>>,
+}
+
+/// A reach check's findings, and the points out of reach on every tooth
+/// in the part's frame, for drawing.
+struct Checked {
+    reach: reach::Reach,
+    dots: Vec<[f64; 3]>,
 }
 
 struct Cached {
@@ -194,6 +219,8 @@ pub struct GearCraftApp {
     cache: HashMap<u64, Cached>,
     /// Generated pairs by ring gear or wheel id.
     pairs: HashMap<u64, PairJob>,
+    /// Reach checks by part id.
+    reach: HashMap<u64, ReachJob>,
     view: View,
     fit_pending: bool,
     /// Keep re-fitting when the canvas resizes until the user pans or zooms.
@@ -223,6 +250,9 @@ pub struct GearCraftApp {
     back_result: Option<(u64, worm::Spec, String)>,
     /// Make back-drivable gives the wheel more teeth to keep the ratio.
     back_keep_ratio: bool,
+    /// The biggest ball end mill a hypoid set takes, by its settings with
+    /// no ball: a search over designs, so kept.
+    hypoid_ball: Option<(hypoid::Spec, Option<f64>)>,
     workspace: Workspace,
     /// What was selected in each workspace, restored on switching back.
     workspace_selection: HashMap<Workspace, u64>,
@@ -249,6 +279,7 @@ impl GearCraftApp {
             dirty: false,
             cache: HashMap::new(),
             pairs: HashMap::new(),
+            reach: HashMap::new(),
             view: View { center: [0.0, 0.0], scale: 4.0 },
             fit_pending: true,
             auto_fit: true,
@@ -268,6 +299,7 @@ impl GearCraftApp {
             ratio_result: None,
             back_result: None,
             back_keep_ratio: true,
+            hypoid_ball: None,
             workspace: Workspace::Spur,
             workspace_selection: HashMap::new(),
             three_d: false,
@@ -742,6 +774,8 @@ impl GearCraftApp {
         let ids: Vec<u64> = self.project.gears.iter().map(|g| g.id).collect();
         self.cache.retain(|id, _| ids.contains(id));
         self.refresh_pairs(ctx);
+        self.reach.retain(|id, _| ids.contains(id));
+        self.refresh_reach(ctx);
         for g in &self.project.gears {
             if g.params.is_generated() || self.cache.get(&g.id).is_some_and(|c| c.params == g.params) {
                 continue;
@@ -772,7 +806,7 @@ impl GearCraftApp {
         let mut live = Vec::new();
         for ring in &self.project.gears {
             let Some(pinion) = ring.placement.parent().and_then(|p| self.project.get(p)) else { continue };
-            let Some(spec) = train::pair_spec(&pinion.params, &ring.params, &ring.placement, self.project.ball_end_mill) else { continue };
+            let Some(spec) = train::pair_spec(&pinion.params, &ring.params, &ring.placement, self.project.ball()) else { continue };
             live.push(ring.id);
             let job = self.pairs.entry(ring.id).or_insert_with(|| PairJob {
                 spec: spec.clone(),
@@ -821,6 +855,67 @@ impl GearCraftApp {
             }
         }
         self.pairs.retain(|id, _| live.contains(id));
+    }
+
+    /// What part `idx`'s reach check is of, and its generated pair; None
+    /// with no ball chosen, or while a generated part's teeth are not
+    /// ready.
+    fn reach_of(&self, idx: usize) -> Option<(ReachOf, Option<Arc<(Member, Member)>>)> {
+        let g = &self.project.gears[idx];
+        if self.project.ball() <= 0.0 || !g.params.is_buildable() {
+            return None;
+        }
+        if !g.params.is_generated() {
+            return Some((ReachOf::Own(g.params.clone()), None));
+        }
+        let r = self.pair_driven(idx)?;
+        let job = self.pairs.get(&self.project.gears[r].id).filter(|j| j.rx.is_none())?;
+        Some((ReachOf::Member(job.spec.clone(), r == idx), Some(job.members.clone()?)))
+    }
+
+    /// Part `idx`'s reach check: None when there is none to make, else
+    /// its findings, or None inside while it runs.
+    fn reach_state(&self, idx: usize) -> Option<Option<Arc<Checked>>> {
+        let (of, _) = self.reach_of(idx)?;
+        let ball = self.project.ball();
+        let job = self.reach.get(&self.project.gears[idx].id).filter(|j| j.of == of && j.ball == ball);
+        Some(job.and_then(|j| j.done.clone()))
+    }
+
+    /// Start checking the selected part's reach when what it is made from
+    /// changes, and pick up finished checks.
+    fn refresh_reach(&mut self, ctx: &egui::Context) {
+        for job in self.reach.values_mut() {
+            if let Some(c) = job.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                job.rx = None;
+                job.done = Some(c);
+            }
+        }
+        let Some(idx) = self.selected.and_then(|id| self.project.index_of(id)) else { return };
+        let Some((of, pair)) = self.reach_of(idx) else { return };
+        let ball = self.project.ball();
+        let id = self.project.gears[idx].id;
+        if self.reach.get(&id).is_some_and(|j| j.of == of && j.ball == ball) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (what, ctx) = (of.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let (surface, teeth, face) = match (&what, &pair) {
+                (ReachOf::Member(_, driven), Some(pair)) => {
+                    let m = if *driven { &pair.1 } else { &pair.0 };
+                    (Some(reach::member(m, ball)), m.teeth, None)
+                }
+                (ReachOf::Own(p), _) if p.is_bevel() => (BevelGeom::new(p).map(|g| reach::bevel(&g, ball)), p.teeth, None),
+                (ReachOf::Own(p), _) => (reach::spur(p, ball), p.teeth, Some(p.face_width)),
+                _ => (None, 1, None),
+            };
+            let reach = surface.map(|s| reach::check(&s, ball)).unwrap_or_default();
+            let dots = reach::on_every_tooth(&reach.missed, teeth, face);
+            let _ = tx.send(Arc::new(Checked { reach, dots }));
+            ctx.request_repaint();
+        });
+        self.reach.insert(id, ReachJob { of, ball, rx: Some(rx), done: None });
     }
 
     /// Whether any pair is still being generated.
@@ -1281,6 +1376,19 @@ impl GearCraftApp {
             painter.text(o + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, "Export origin", FontId::proportional(11.0), chrome::ACCENT);
         }
 
+        // Where the ball end mill can't reach the selected part's teeth.
+        if let Some((i, c)) = sel.and_then(|i| Some((i, self.reach_state(i)??))) {
+            let s = &solved[i];
+            let (sn, cs) = (s.phase + s.ratio * self.driver_angle).sin_cos();
+            let slack = 0.3 * self.project.ball() + 0.05;
+            for q in &c.dots {
+                let (p, d) = self.camera.project(rect, s.frame.apply([q[0] * cs - q[1] * sn, q[0] * sn + q[1] * cs, q[2]]));
+                if rect.contains(p) && self.frame3d.sees(p, d, slack) {
+                    painter.circle_filled(p, 1.5, visuals.error_fg_color);
+                }
+            }
+        }
+
         if self.pair_pending() {
             painter.text(
                 rect.left_top() + Vec2::new(10.0, 8.0),
@@ -1703,14 +1811,29 @@ impl GearCraftApp {
             }
         });
         chrome::group(ui, "Machining", |ui| {
-            ui.vertical(|ui| {
-                ui.add_space(8.0);
-                ui.label("Ball end mill Ø");
-                let unit = self.project.pitch_unit;
-                len_drag(ui, &mut self.project.ball_end_mill, unit, 0.0..=25.0, 0.01).on_hover_text(
-                    "The ball end mill the teeth are cut with, on a 4-axis mill. Every root is rounded to it and \
-                     sits at least its radius under the other part's tips. 0: not chosen yet.",
-                );
+            let on = self.project.for_machining;
+            let tip = if on {
+                "The teeth are shaped for the ball end mill on the 4-axis mill: roots rounded to it, and ring gear \
+                 slot floors raised where it can't reach. Click to keep the teeth as designed instead, for parts \
+                 made another way, such as 3D printed."
+            } else {
+                "The teeth are as designed, for parts made another way, such as 3D printed. Click to shape them \
+                 for the ball end mill on the 4-axis mill."
+            };
+            if big(ui, Icon::Text("CNC"), "Machined", on, true).on_hover_text(tip).clicked() {
+                self.project.for_machining = !on;
+            }
+            ui.add_enabled_ui(on, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    ui.label("Ball end mill Ø");
+                    let unit = self.project.pitch_unit;
+                    len_drag(ui, &mut self.project.ball_end_mill, unit, 0.0..=25.0, 0.01).on_hover_text(
+                        "The ball end mill the teeth are cut with, on a 4-axis mill. Every root, on every kind of part, \
+                         is rounded to it, and cut deep enough that the rounding stays under the other part's tips. \
+                         0: not chosen yet.",
+                    );
+                });
             });
         });
         chrome::group(ui, "Motion", |ui| {
@@ -1869,7 +1992,8 @@ impl GearCraftApp {
         // A globoid worm too long for its base circle, or a drive the ball
         // end mill can't cut, has no teeth, so they are checked here, from
         // the drive's settings.
-        let ball = self.project.ball_end_mill;
+        let ball = self.project.ball();
+        let machined = self.project.for_machining;
         let drive_spec = pair_driven.and_then(|r| {
             let wheel = &self.project.gears[r];
             let k = self.project.index_of(wheel.placement.parent()?)?;
@@ -1877,9 +2001,47 @@ impl GearCraftApp {
         });
         let globoid_spec = drive_spec.as_ref().filter(|s| s.globoid);
         let too_long = globoid_spec.and_then(|sp| sp.globoid_lengths().filter(|l| sp.length > l.0).map(|l| (sp.length, l)));
+        // What the ball end mill can cut: the Ø the roots are rounded for
+        // as things stand, the biggest that fits, what limits it, and what
+        // sets the roots with no ball chosen.
+        let hypoid_spec = pair_driven.filter(|_| hypoid_design.is_some()).and_then(|r| {
+            let ring = &self.project.gears[r];
+            let k = self.project.index_of(ring.placement.parent()?)?;
+            train::hypoid_spec(&self.project.gears[k].params, &ring.params, &ring.placement, 0.0)
+        });
+        let hypoid_largest = hypoid_spec.map(|sp| match &self.hypoid_ball {
+            Some((key, d)) if *key == sp => *d,
+            _ => {
+                let d = sp.largest_ball();
+                self.hypoid_ball = Some((sp, d));
+                d
+            }
+        });
+        let p = &self.project.gears[idx].params;
+        let room: Option<(f64, Option<f64>, String, &str)> = if let Some(sp) = &drive_spec {
+            worm_design.as_ref().map(|d| {
+                let why = "where the other part's tips reach, the spaces are narrower than it, so it can't cut below them";
+                (2.0 * d.ball, sp.largest_ball(), why.to_string(), "the biggest that fits up to the wheel's root fillet")
+            })
+        } else if let (Some(d), Some(largest)) = (&hypoid_design, hypoid_largest) {
+            let why = d.ball_trouble().unwrap_or("the spaces are narrower than it at the bottom");
+            Some((2.0 * d.cutter.edge, largest, why.to_string(), "the ring cutter's usual edge radius"))
+        } else {
+            p.ball_room().map(|(now, most)| {
+                let (why, unset) = if p.is_pulley() {
+                    ("the grooves are narrower than it at the bottom", "from ISO 5294's groove corners")
+                } else if p.is_bevel() {
+                    ("at the toe the spaces are narrower than it at the bottom", "at the toe, from the root fillet under Rack")
+                } else {
+                    ("the spaces are narrower than it at the bottom", "from the root fillet under Rack")
+                };
+                (now, Some(most), why.to_string(), unset)
+            })
+        };
         // The biggest ball that fits, rounded down to what is shown.
-        let largest_ball = drive_spec.as_ref().and_then(|sp| sp.largest_ball()).map(|d| shown_floor(d, unit));
+        let largest_ball = room.as_ref().and_then(|r| r.1).map(|d| shown_floor(d, unit));
         let ball_too_big = largest_ball.filter(|&d| ball > 0.0 && ball > d + 1e-9 && too_long.is_none());
+        let bigger = if self.project.gears[idx].params.is_pulley() { "a bigger belt section" } else { "a bigger module" };
         // The worm drive's friction lives on its wheel's placement.
         let mut friction = pair_driven.and_then(|r| match self.project.gears[r].placement {
             Placement::Worm { friction, .. } => Some(friction),
@@ -1890,6 +2052,14 @@ impl GearCraftApp {
             .filter(|b| worm_design.as_ref().is_some_and(|d| d.spec == b.1))
             .map(|b| b.2.clone());
         let mut back_req = false;
+        let reach = self.reach_state(idx);
+        // How far the ring's slot floors were raised for the ball's reach.
+        let raised = pair_driven
+            .and_then(|r| self.pairs.get(&self.project.gears[r].id))
+            .filter(|j| j.rx.is_none())
+            .and_then(|j| j.members.as_ref())
+            .map(|m| m.1.raised)
+            .filter(|&h| h > 0.0);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let faces = self.own_faces(idx);
@@ -2246,6 +2416,18 @@ impl GearCraftApp {
                             g.params.standard = ToothStandard::Custom;
                         } else if g.params.standard != ToothStandard::Custom {
                             ui.label(RichText::new("Set by the tooth standard; editing switches to Custom.").weak().small());
+                        }
+                        if g.params.ball > 0.0 {
+                            let deeper = g.params.cut_dedendum() > g.params.dedendum + 1e-9 && !g.params.is_bevel();
+                            ui.label(
+                                RichText::new(format!(
+                                    "The roots are rounded for the Ø{} ball end mill under Machining, not the fillet here{}.",
+                                    len(g.params.ball, unit),
+                                    if deeper { ", and cut deeper to suit" } else { "" }
+                                ))
+                                .weak()
+                                .small(),
+                            );
                         }
                     });
                 });
@@ -2708,6 +2890,22 @@ impl GearCraftApp {
                         }
                         value_row(ui, "Root fillet", fmt(d.ball));
                         value_row(ui, "Root clearance", fmt(d.clearance));
+                        if role == worm::Role::Worm {
+                            let (mate, long) = d.end_chamfer();
+                            value_row_tip(
+                                ui,
+                                "End chamfers",
+                                format!("{:.0}° to the ends, to Ø{}", worm::END_CHAMFER, fmt(2.0 * mate)),
+                                "Each end of the thread is chamfered down to where the wheel's tips reach, \
+                                 so no part-thread is left as a feather edge.",
+                            );
+                            value_row_tip(
+                                ui,
+                                "Full threads",
+                                fmt((d.spec.length - 2.0 * long).max(0.0)),
+                                "The length of worm with the thread at its full outside, between the chamfers.",
+                            );
+                        }
                         if d.hourglass.is_some() {
                             value_row(ui, "Teeth wrapped", format!("{:.1}", d.teeth_spanned()));
                         }
@@ -2755,6 +2953,14 @@ impl GearCraftApp {
                         value_row(ui, "Mean normal module", format!("{:.4} mm", d.mn));
                         value_row(ui, "Whole depth", fmt(d.depth + d.clearance));
                         value_row(ui, "Cutter radius", fmt(d.cutter.radius));
+                        if let Some(h) = raised {
+                            let (label, tip) = if role == Role::Ring {
+                                ("Slot floors raised", "So a ball end mill square to the ring's axis can get down its curved slots, their floors are raised by up to this much.")
+                            } else {
+                                ("Tips cut down", "The ring's slot floors are raised for the ball end mill's reach, so the tips are cut down by up to this much to keep their clearance.")
+                            };
+                            value_row_tip(ui, label, format!("up to {}", fmt(h)), tip);
+                        }
                     });
                     return;
                 }
@@ -2855,14 +3061,13 @@ impl GearCraftApp {
                 issues.push(Issue { level: Level::Error, text: format!("Overlaps {o} without meshing.") });
             }
 
-            if let Some(largest) = ball_too_big {
+            if let (Some(largest), Some((_, _, why, _))) = (ball_too_big, &room) {
                 fixable.insert(
                     0,
                     (
                         Issue::error(format!(
-                            "The Ø{} ball end mill is too big for these teeth: where the other part's tips reach, \
-                             the spaces are narrower than it, so it can't cut below them. The biggest that fits is Ø{}; \
-                             a bigger module takes a bigger one.",
+                            "The Ø{} ball end mill is too big for these teeth: {why}. The biggest that fits is Ø{}; \
+                             {bigger} takes a bigger one.",
                             fmt(ball),
                             fmt(largest)
                         )),
@@ -2870,14 +3075,13 @@ impl GearCraftApp {
                         Fix::Ball(largest),
                     ),
                 );
-            } else if let (0.0, Some(d)) = (ball, &worm_design) {
+            } else if let (0.0, true, Some((now, _, _, unset))) = (ball, machined, &room) {
                 // Shown as the setting will hold it, so pressing the fix
                 // leaves the teeth as they are.
-                let now = shown_floor(2.0 * d.ball, unit);
+                let now = shown_floor(*now, unit);
                 fixable.push((
                     Issue::warn(format!(
-                        "No ball end mill is chosen, so the roots are rounded for a Ø{} ball, the biggest that fits \
-                         up to the wheel's root fillet. Choose the one you'll cut with under Machining, or keep this.",
+                        "No ball end mill is chosen, so the roots are rounded for a Ø{} ball, {unset}. Choose the one you'll cut with under Machining, or keep this.",
                         fmt(now)
                     )),
                     format!("Cut with a Ø{} ball end mill", fmt(now)),
@@ -2900,7 +3104,45 @@ impl GearCraftApp {
                     ),
                 );
             }
+            if let (Some(h), Some(d)) = (raised, &hypoid_design) {
+                if h > 0.25 * d.depth {
+                    issues.push(Issue::warn(format!(
+                        "For a Ø{} ball end mill square to the ring's axis to get down its curved slots, their floors \
+                         are raised by up to {} and the pinion's tips cut down to match: the teeth touch over {:.0}% \
+                         less of their working depth there. Less spiral angle needs less.",
+                        fmt(ball),
+                        fmt(h),
+                        100.0 * h / d.depth
+                    )));
+                }
+            }
+            match &reach {
+                Some(Some(c)) if ball_too_big.is_none() && c.reach.share() > reach::STRAY => {
+                    let [a, b] = c.reach.radii.unwrap_or_default();
+                    let advice = if p.is_hypoid() && !p.worm {
+                        "the slots curve along the face more than a tool square to the axis can follow, even with \
+                         their floors raised by half the working depth; less spiral angle opens them up"
+                    } else if !p.is_generated() && !p.is_bevel() && !p.is_pulley() {
+                        "the flanks are undercut, facing away from every way the tool can come in; \
+                         a positive profile shift, or a smaller ball, clears them"
+                    } else {
+                        "a smaller ball gets further in"
+                    };
+                    issues.push(Issue::warn(format!(
+                        "On the 4-axis mill, a Ø{} ball end mill square to the part's axis can't reach {:.1}% of the \
+                         teeth, from {} to {} off the axis (marked in 3D): {advice}.",
+                        fmt(ball),
+                        100.0 * c.reach.share(),
+                        fmt(a),
+                        fmt(b)
+                    )));
+                }
+                _ => {}
+            }
             ui.add_space(6.0);
+            if matches!(reach, Some(None)) {
+                ui.label(RichText::new("⏳ Checking the ball end mill's reach…").weak());
+            }
             if issues.is_empty() && fixable.is_empty() {
                 ui.label(RichText::new("✔ No problems found").color(ui.visuals().weak_text_color()));
             }
@@ -2936,16 +3178,17 @@ impl GearCraftApp {
         if globoid_req {
             self.project.make_globoid(idx, false);
         }
-        if let (Some(fix), Some(r)) = (fix_req, pair_driven) {
-            match fix {
-                Fix::WormLength(l) => {
+        if let Some(fix) = fix_req {
+            match (fix, pair_driven) {
+                (Fix::WormLength(l), Some(r)) => {
                     let worm = self.project.gears[r].placement.parent().and_then(|p| self.project.index_of(p));
                     if let Some(k) = worm {
                         self.project.gears[k].params.face_width = l;
                     }
                 }
-                Fix::WheelFace(b) => self.project.gears[r].params.face_width = b,
-                Fix::Ball(d) => self.project.ball_end_mill = d,
+                (Fix::WheelFace(b), Some(r)) => self.project.gears[r].params.face_width = b,
+                (Fix::Ball(d), _) => self.project.ball_end_mill = d,
+                _ => {}
             }
             self.project.normalize();
         }
@@ -3188,6 +3431,8 @@ impl GearCraftApp {
 impl eframe::App for GearCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // New parts, and a changed setting, take the ball end mill.
+        self.project.apply_ball();
         self.poll_file_dialog(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3260,6 +3505,13 @@ fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
 fn value_row(ui: &mut Ui, label: &str, value: String) {
     ui.label(label);
     ui.label(RichText::new(value).monospace());
+    ui.end_row();
+}
+
+/// A `value_row` explained on hover.
+fn value_row_tip(ui: &mut Ui, label: &str, value: String, tip: &str) {
+    ui.label(label).on_hover_text(tip);
+    ui.label(RichText::new(value).monospace()).on_hover_text(tip);
     ui.end_row();
 }
 
@@ -3472,6 +3724,107 @@ mod tests {
         assert!(spec.design().is_ok());
         assert!(harness.query_by_label_contains("too big").is_none());
         assert!(harness.query_by_label_contains("No ball end mill").is_none());
+    }
+
+    /// With machining off there is no ball to choose, so no asking.
+    #[test]
+    fn parts_not_machined_ask_for_no_ball() {
+        for machined in [true, false] {
+            let mut p = Project::empty();
+            let first = p.add_root(PitchUnit::Module.starter(24), 0.0, 0.0);
+            p.for_machining = machined;
+            let mut harness = Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+                let mut app = GearCraftApp::new(cc, None);
+                app.replace_project(p, None);
+                app.selected = Some(first);
+                app
+            });
+            harness.run_steps(3);
+            assert_eq!(harness.query_by_label_contains("No ball end mill").is_some(), machined);
+        }
+    }
+
+    #[test]
+    fn every_kind_of_part_takes_the_ball_end_mill_fix() {
+        let u = PitchUnit::Module;
+        let kinds = [
+            ("spur", u.starter(24), u.starter(40), Link::Mesh),
+            ("bevel", u.starter_bevel(20), u.starter_bevel(40), Link::Bevel),
+            ("pulley", u.starter_pulley(20), u.starter_pulley(30), Link::Belt),
+            ("hypoid", u.starter_hypoid(Role::Pinion), u.starter_hypoid(Role::Ring), Link::Hypoid),
+        ];
+        for (name, a, b, link) in kinds {
+            let mut p = Project::empty();
+            let first = p.add_root(a, 0.0, 0.0);
+            p.add_child(first, b, link);
+            p.ball_end_mill = 30.0;
+            let mut harness = egui_kittest::Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+                let mut app = GearCraftApp::new(cc, None);
+                app.replace_project(p, None);
+                app.switch_workspace(Workspace::of(&app.project.gears[0].params));
+                app.selected = Some(first);
+                app
+            });
+            harness.run_steps(3);
+            harness.get_by_label_contains("ball end mill is too big");
+            harness.get_by_label_contains("Cut with a").click();
+            harness.run_steps(3);
+            let ball = harness.state().project.ball_end_mill;
+            assert!(ball > 0.1 && ball < 30.0, "{name}: Ø{ball}");
+            assert!(harness.query_by_label_contains("too big").is_none(), "{name}: still too big at Ø{ball}");
+            assert!(harness.query_by_label_contains("No ball end mill").is_none(), "{name}");
+        }
+    }
+
+    /// Waits for the selected part's teeth and reach check, and gives
+    /// the share out of reach.
+    fn checked_reach(harness: &mut Harness<'_, GearCraftApp>) -> f64 {
+        let start = Instant::now();
+        loop {
+            harness.step();
+            let app = harness.state();
+            let idx = app.selected.and_then(|id| app.project.index_of(id)).unwrap();
+            if let Some(Some(c)) = app.reach_state(idx) {
+                let share = c.reach.share();
+                harness.run_steps(2);
+                return share;
+            }
+            assert!(start.elapsed() < Duration::from_secs(120), "no reach check");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A spiral bevel ring's slots curve along its face, so a tool kept
+    /// square to its axis can't follow them all the way down: their
+    /// floors are raised until it can, and that is said. A spur gear's
+    /// teeth are all reached as they are.
+    #[test]
+    fn teeth_out_of_reach_are_flagged() {
+        let mut harness = Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+            let mut app = GearCraftApp::new(cc, None);
+            app.switch_workspace(Workspace::Bevel);
+            app.add_hypoid_pair();
+            let r = app.project.index_of(app.selected.unwrap()).unwrap();
+            if let Placement::Hypoid { offset, .. } = &mut app.project.gears[r].placement {
+                *offset = 0.0;
+            }
+            app.project.ball_end_mill = 2.0;
+            app.project.normalize();
+            app
+        });
+        let share = checked_reach(&mut harness);
+        assert!(share < 0.02, "{share}");
+        harness.get_by_label_contains("floors are raised");
+        harness.get_by_label_contains("Slot floors raised");
+
+        let mut p = Project::empty();
+        let first = p.add_root(PitchUnit::Module.starter(24), 0.0, 0.0);
+        p.ball_end_mill = 1.0;
+        harness.state_mut().replace_project(p, None);
+        harness.state_mut().switch_workspace(Workspace::Spur);
+        harness.state_mut().selected = Some(first);
+        assert_eq!(checked_reach(&mut harness), 0.0);
+        assert!(harness.query_by_label_contains("can't reach").is_none());
     }
 
     /// Renders the window offscreen to GEARCRAFT_SHOT (a PNG path) so the
