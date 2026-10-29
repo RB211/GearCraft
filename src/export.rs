@@ -197,7 +197,7 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
                 name: g.name.clone(),
                 path: fit_arcs(&outline, tolerance(g.params.module)),
                 center,
-                bore: g.params.bore,
+                bore: g.params.hole(),
                 z,
                 height: g.params.face_width,
             })

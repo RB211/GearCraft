@@ -294,6 +294,14 @@ pub struct Project {
     /// can't reach. Off for parts made another way (3D printed, say),
     /// which keep the teeth as designed; the ball is remembered.
     pub for_machining: bool,
+    /// Allow for the 3D printer's nozzle: every tooth surface and bore
+    /// wall is drawn in by a quarter of the nozzle width, so the teeth
+    /// come out thinner and the bores wider by half of it, and the printed
+    /// surfaces land where they are designed. Never on together with
+    /// `for_machining`.
+    pub for_printing: bool,
+    /// The printer's nozzle Ø, mm; remembered while printing is off.
+    pub nozzle: f64,
 }
 
 impl Default for Project {
@@ -381,9 +389,10 @@ pub fn hypoid_spec(pinion: &GearParams, ring: &GearParams, placement: &Placement
         reverse_hand,
         cutter_radius,
         backlash: ring.backlash,
-        pinion_bore: pinion.bore,
-        ring_bore: ring.bore,
+        pinion_bore: pinion.hole(),
+        ring_bore: ring.hole(),
         ball,
+        nozzle: ring.nozzle,
     })
 }
 
@@ -410,8 +419,9 @@ pub fn worm_spec(worm: &GearParams, wheel: &GearParams, placement: &Placement, b
         globoid,
         left_hand,
         backlash: wheel.backlash,
-        worm_bore: worm.bore,
-        wheel_bore: wheel.bore,
+        worm_bore: worm.hole(),
+        wheel_bore: wheel.hole(),
+        nozzle: wheel.nozzle,
     };
     // With no ball chosen, the biggest that fits, up to the wheel's fillet.
     let largest = if ball > 0.0 { None } else { sp.largest_ball() };
@@ -511,7 +521,17 @@ impl BeltInfo {
 impl Project {
     /// A starter pair in the given unit system.
     pub fn new(unit: PitchUnit) -> Self {
-        let mut p = Self { version: 1, gears: Vec::new(), next_id: 1, driver_rpm: 10.0, pitch_unit: unit, ball_end_mill: 0.0, for_machining: true };
+        let mut p = Self {
+            version: 1,
+            gears: Vec::new(),
+            next_id: 1,
+            driver_rpm: 10.0,
+            pitch_unit: unit,
+            ball_end_mill: 0.0,
+            for_machining: true,
+            for_printing: false,
+            nozzle: 0.4,
+        };
         let a = p.add_root(unit.starter(20), 0.0, 0.0);
         let wheel = GearParams { bore: unit.starter(40).bore * 1.25, ..unit.starter(40) };
         p.add_child(a, wheel, Link::Mesh);
@@ -743,11 +763,19 @@ impl Project {
         if self.for_machining { self.ball_end_mill } else { 0.0 }
     }
 
-    /// Give every part the ball end mill its roots are rounded for.
-    pub fn apply_ball(&mut self) {
-        let ball = self.ball();
+    /// The nozzle Ø the parts are drawn in for: none when they are not
+    /// made for 3D printing.
+    pub fn nozzle(&self) -> f64 {
+        if self.for_printing { self.nozzle } else { 0.0 }
+    }
+
+    /// Give every part the ball end mill its roots are rounded for and
+    /// the nozzle its surfaces are drawn in for.
+    pub fn apply_making(&mut self) {
+        let (ball, nozzle) = (self.ball(), self.nozzle());
         for g in &mut self.gears {
             g.params.ball = ball;
+            g.params.nozzle = nozzle;
         }
     }
 
@@ -755,7 +783,7 @@ impl Project {
     /// or later parents become roots, linked tooth systems are synced, and
     /// standard rack coefficients are re-derived (fine pitch depends on DP).
     pub fn normalize(&mut self) {
-        self.apply_ball();
+        self.apply_making();
         // Bevel cones: the first mate of a gear fixes its cone; later
         // mates follow from their tooth counts (the cones share an apex).
         let mut coned = vec![false; self.gears.len()];
@@ -1366,6 +1394,31 @@ mod tests {
         assert_eq!(p.ball_end_mill, 2.0);
         let old: Project = serde_json::from_str(r#"{"ball_end_mill": 2.0}"#).unwrap();
         assert!(old.for_machining);
+        assert!(!old.for_printing);
+        assert_eq!(old.nozzle, 0.4);
+    }
+
+    /// Printing hands every part the nozzle, widens the generated pairs'
+    /// bores by it, and is remembered while it is off.
+    #[test]
+    fn printing_hands_every_part_the_nozzle() {
+        let mut p = Project::empty();
+        let a = p.add_root(PitchUnit::Module.starter_worm_drive(worm::Role::Worm), 0.0, 0.0);
+        p.add_child(a, PitchUnit::Module.starter_worm_drive(worm::Role::Wheel), Link::Worm);
+        p.for_machining = false;
+        p.for_printing = true;
+        p.nozzle = 0.6;
+        p.normalize();
+        assert!(p.gears.iter().all(|g| g.params.nozzle == 0.6));
+        let PairSpec::Worm(sp) = pair_spec(&p.gears[0].params, &p.gears[1].params, &p.gears[1].placement, p.ball()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sp.nozzle, 0.6);
+        assert_eq!(sp.wheel_bore, p.gears[1].params.bore + 0.3);
+        p.for_printing = false;
+        p.normalize();
+        assert!(p.gears.iter().all(|g| g.params.nozzle == 0.0));
+        assert_eq!(p.nozzle, 0.6);
     }
 
     #[test]

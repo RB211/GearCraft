@@ -96,6 +96,11 @@ pub struct BevelGeom {
     /// The root fillet, None if there is none. If the ball end mill is too
     /// big for the spaces, the biggest that fits.
     pub fillet: Option<Fillet>,
+    /// How far the teeth are eroded for the 3D printer, as an angle on the
+    /// unit sphere; 0 when they are as designed. `base_half`, `tip` and
+    /// `root` already have it in; below the base cone the flank needs a
+    /// little more.
+    pub erosion: f64,
 }
 
 impl BevelGeom {
@@ -115,10 +120,36 @@ impl BevelGeom {
                 geom.with_fillet(lo, lowest)?
             }
         };
+        // For the 3D printer the teeth are eroded by a quarter of the nozzle width,
+        // taken as an angle at the middle of the face.
+        let geom = match p.shrink() {
+            d if d > 0.0 => geom.eroded(d / (geom.cone_distance - geom.face / 2.0)),
+            _ => geom,
+        };
         if geom.root <= 0.02 || geom.root >= PI / 2.0 - 0.01 {
             return None;
         }
         Some(BevelGeom { profile: geom.tooth_profile(), ..geom })
+    }
+
+    /// The gear with its teeth eroded by the angle `eps` on the unit
+    /// sphere, for 3D printing: the flanks move in (a spherical involute
+    /// offset along its normals is the same involute turned about the
+    /// axis), the tip and root cones come down, and the fillet grows about
+    /// its centre by as much, so it stays tangent to both. Should the
+    /// grown fillet not fit, the root is left sharp.
+    fn eroded(&self, eps: f64) -> BevelGeom {
+        let mut g = BevelGeom {
+            base_half: self.base_half - eps / self.base.sin(),
+            tip: self.tip - eps,
+            root: self.root - eps,
+            fillet: None,
+            erosion: self.erosion + eps,
+            ..self.clone()
+        };
+        let rho = self.fillet.map_or(0.0, |f| f.radius) + eps;
+        g.fillet = g.fillet_at(g.root, rho);
+        g
     }
 
     /// The biggest ball end mill Ø that rounds the roots at the toe.
@@ -156,9 +187,10 @@ impl BevelGeom {
             cone_distance,
             face,
             profile: Profile { radii: vec![], half: vec![] },
-            bore: p.bore,
+            bore: p.hole(),
             base_half: 0.0,
             fillet: None,
+            erosion: 0.0,
         };
         let r_pitch = cone_distance * delta.sin();
         let base_half = PI / (2.0 * p.teeth as f64) - p.backlash / (4.0 * r_pitch) + geom.involute(delta);
@@ -225,7 +257,10 @@ impl BevelGeom {
     }
 
     fn half_flank(&self, gamma: f64) -> f64 {
-        self.base_half - self.involute(gamma.max(self.base))
+        // Below the base cone the flank is a meridian, which erosion by ε
+        // moves in by ε / sin γ, a little more than the involute's ε / sin γb.
+        let below = if gamma < self.base { self.erosion * (1.0 / gamma.sin() - 1.0 / self.base.sin()) } else { 0.0 };
+        self.base_half - self.involute(gamma.max(self.base)) - below
     }
 
     /// Azimuth swept by the spherical involute of the base cone from its
@@ -391,6 +426,37 @@ impl BevelGeom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For the printer every tooth surface is eroded by a quarter of the
+    /// nozzle width: the flanks turned in by it, the tip and root cones that much
+    /// lower, the fillet that much rounder, the bore that much wider.
+    #[test]
+    fn printed_teeth_are_eroded_by_half_the_nozzle() {
+        let p = GearParams { teeth: 20, module: 2.0, bevel: Some(Bevel { pitch_angle: 40.0 }), face_width: 12.0, ..Default::default() };
+        let a = BevelGeom::new(&p).unwrap();
+        let b = BevelGeom::new(&GearParams { nozzle: 0.4, ..p }).unwrap();
+        let eps = 0.1 / (a.cone_distance - a.face / 2.0);
+        assert!((b.tip - (a.tip - eps)).abs() < 1e-12);
+        assert!((b.root - (a.root - eps)).abs() < 1e-12);
+        assert!((b.base_half - (a.base_half - eps / a.base.sin())).abs() < 1e-12);
+        assert!((b.fillet.unwrap().radius - (a.fillet.unwrap().radius + eps)).abs() < 1e-12);
+        assert!((b.fillet.unwrap().centre[0] - a.fillet.unwrap().centre[0]).abs() < 1e-9);
+        assert_eq!(b.bore, a.bore + 0.2);
+        // On the sphere through the middle of the face, every point of the
+        // eroded flank is 0.1 mm inside the designed one.
+        let rho = a.cone_distance - a.face / 2.0;
+        let pt = |g: &BevelGeom, gamma: f64| BevelGeom::point(gamma, g.half_at(gamma), rho);
+        let n = 200;
+        for i in 0..=n {
+            let gamma = b.flank_foot() + (b.tip - b.flank_foot()) * i as f64 / n as f64;
+            let q = pt(&b, gamma);
+            let near = (0..=4000)
+                .map(|j| pt(&a, a.root + (a.tip - a.root) * j as f64 / 4000.0))
+                .map(|r| (q[0] - r[0]).hypot(q[1] - r[1]).hypot(q[2] - r[2]))
+                .fold(f64::MAX, f64::min);
+            assert!((near - 0.1).abs() < 0.002, "γ {gamma}: {near} from the designed flank");
+        }
+    }
 
     fn gear(teeth: u32, delta: f64) -> BevelGeom {
         let p = GearParams { teeth, module: 2.0, face_width: 12.0, bevel: Some(Bevel { pitch_angle: delta }), ..Default::default() };

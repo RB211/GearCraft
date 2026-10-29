@@ -77,6 +77,12 @@ pub struct GearParams {
     /// for it.
     #[serde(skip)]
     pub ball: f64,
+    /// The project's nozzle Ø, mm, copied in by `Project::apply_making`;
+    /// 0 when the part is not 3D printed. Every tooth surface is drawn in
+    /// by a quarter of it, so the teeth are thinner and the bore wider by
+    /// half of it.
+    #[serde(skip)]
+    pub nozzle: f64,
 }
 
 impl Default for GearParams {
@@ -100,6 +106,7 @@ impl Default for GearParams {
             worm: false,
             worm_drive: None,
             ball: 0.0,
+            nozzle: 0.0,
         }
     }
 }
@@ -319,6 +326,19 @@ impl GearParams {
         if self.ball > 0.0 { self.ball / 2.0 } else { self.root_fillet * self.module }
     }
 
+    /// How far every tooth surface is drawn in for the 3D printer, mm: a
+    /// quarter of the nozzle width, so a tooth comes out thinner by half
+    /// of it. 0 when the part is not printed.
+    pub fn shrink(&self) -> f64 {
+        self.nozzle / 4.0
+    }
+
+    /// The bore as made, mm: widened by half the nozzle width for the
+    /// printer (its wall drawn in by `shrink` all round), or as designed.
+    pub fn hole(&self) -> f64 {
+        if self.bore > 0.0 { self.bore + self.nozzle / 2.0 } else { 0.0 }
+    }
+
     /// Dedendum coefficient as cut: deep enough that the fillet rises no
     /// higher than the mate's tips reach (the rack's straight flank runs
     /// down past them), so a big ball deepens the roots. ISO's 0.38 m
@@ -338,7 +358,7 @@ impl GearParams {
         if let Some(b) = self.belt {
             let g = b.rack(self.teeth);
             let most = 0.999 * g.max_r1();
-            return Some((2.0 * g.r1.max(self.ball / 2.0).min(most), 2.0 * most));
+            return Some((2.0 * g.bottom_radius().max(self.ball / 2.0).min(most), 2.0 * most));
         }
         if self.is_bevel() {
             let g = BevelGeom::new(self)?;
@@ -408,18 +428,20 @@ impl GearParams {
             }
             if self.teeth < b.min_teeth() {
                 out.push(Issue::warn(format!(
-                    "ISO 5294 gives {} pulleys from {} teeth; smaller ones wear belts fast.",
+                    "{} {} pulleys from {} teeth; smaller ones wear belts fast.",
+                    b.min_teeth_source(),
                     b.name(),
                     b.min_teeth()
                 )));
             }
             let g = b.rack(self.teeth);
-            if self.ball / 2.0 > g.r1 + 1e-9 && self.ball / 2.0 <= 0.999 * g.max_r1() {
+            if self.ball / 2.0 > g.bottom_radius() + 1e-9 && self.ball / 2.0 <= 0.999 * g.max_r1() {
+                let whose = if b.family() == pulley::Family::Iso { "ISO 5294's" } else { "the belt tooth's" };
                 out.push(Issue::warn(format!(
-                    "The Ø{} ball end mill rounds the groove bottoms wider than ISO 5294's {}: check the belt's \
+                    "The Ø{} ball end mill rounds the groove bottoms wider than {whose} {}: check the belt's \
                      teeth still seat.",
                     len(self.ball),
-                    len(g.r1)
+                    len(g.bottom_radius())
                 )));
             }
             let groove = g.hr;
@@ -485,6 +507,42 @@ pub(crate) struct Rack {
     pub extent: f64,
 }
 
+impl Rack {
+    /// The cutter grown by `d` all round (its Minkowski sum with a disc of
+    /// that radius): what it cuts is the tooth eroded by `d`. Each edge
+    /// becomes its two parallels with a circle at either end, each arc
+    /// its two concentric arcs and end circles. Which side the cutter's
+    /// material is on does not matter: the generator keeps the deepest
+    /// cut at each radius, which is on the grown shape's boundary, and
+    /// everything else here lies within it.
+    fn swollen(&self, d: f64) -> Rack {
+        let mut lines = Vec::with_capacity(2 * self.lines.len());
+        let mut arcs: Vec<([f64; 2], f64, f64, f64)> = Vec::with_capacity(2 * self.lines.len() + 4 * self.arcs.len());
+        let circle = |arcs: &mut Vec<([f64; 2], f64, f64, f64)>, c: [f64; 2]| arcs.push((c, d, -PI, PI));
+        for &[a, b] in &self.lines {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = dx.hypot(dy);
+            if len > 0.0 {
+                let n = [-dy / len * d, dx / len * d];
+                lines.push([[a[0] + n[0], a[1] + n[1]], [b[0] + n[0], b[1] + n[1]]]);
+                lines.push([[a[0] - n[0], a[1] - n[1]], [b[0] - n[0], b[1] - n[1]]]);
+            }
+            circle(&mut arcs, a);
+            circle(&mut arcs, b);
+        }
+        for &(c, rho, t0, t1) in &self.arcs {
+            arcs.push((c, rho + d, t0, t1));
+            if rho > d {
+                arcs.push((c, rho - d, t0, t1));
+            }
+            for t in [t0, t1] {
+                circle(&mut arcs, [c[0] + rho * t.cos(), c[1] + rho * t.sin()]);
+            }
+        }
+        Rack { lines, arcs, extent: self.extent + d }
+    }
+}
+
 /// The basic rack for an involute gear: two straight flanks, rounded tip
 /// corners, the tip flat, and a closing edge well clear of the blank. The
 /// reference line is shifted out by x * module from the rolling line.
@@ -548,8 +606,11 @@ pub fn tooth_profile(p: &GearParams) -> Option<Profile> {
     let m = p.module;
     let z = p.teeth as f64;
     let r = p.pitch_radius();
-    let ra = p.tip_radius();
-    let rf = p.root_radius();
+    // For the 3D printer the whole tooth is eroded by `shrink`: the blank
+    // is that much smaller and the cutter that much fatter all round.
+    let shrink = p.shrink();
+    let ra = p.tip_radius() - shrink;
+    let rf = p.root_radius() - shrink;
     let half_pitch = PI / z;
 
     let mut radii: Vec<f64> = (0..=RADIAL_SAMPLES)
@@ -571,6 +632,7 @@ pub fn tooth_profile(p: &GearParams) -> Option<Profile> {
         Some(b) => pulley::rack(b, p.teeth, p.ball),
         None => gear_rack(p),
     };
+    let rack = if shrink > 0.0 { rack.swollen(shrink) } else { rack };
     let y_ref = r;
     let reach = (ra * ra - rf * rf).sqrt() + rack.extent + 2.0 * m;
     let phi_max = (reach / r).min(0.9 * PI);
@@ -720,7 +782,7 @@ pub fn fill_mesh(p: &GearParams, prof: &Profile) -> FillMesh {
     // between them do not leave slivers along the root arcs.
     let segs = (z * 8).max(96);
     let r_out = prof.radii[0] / (PI / segs as f64).cos();
-    let r_in = (p.bore / 2.0).clamp(0.0, prof.radii[0] * 0.98);
+    let r_in = (p.hole() / 2.0).clamp(0.0, prof.radii[0] * 0.98);
     if r_in > 0.0 {
         for i in 0..segs {
             let a = i as f64 * TAU / segs as f64;
@@ -892,6 +954,40 @@ pub(crate) fn ball_fits_space(pts: &[[f64; 2]], ball: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distance from `q` to the closed polyline `lp`.
+    fn dist_to(q: [f64; 2], lp: &[[f64; 2]]) -> f64 {
+        let mut best = f64::MAX;
+        for i in 0..lp.len() {
+            let (a, b) = (lp[i], lp[(i + 1) % lp.len()]);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l2 = d[0] * d[0] + d[1] * d[1];
+            let k = if l2 > 0.0 { (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            best = best.min((q[0] - a[0] - k * d[0]).hypot(q[1] - a[1] - k * d[1]));
+        }
+        best
+    }
+
+    /// For the printer every tooth surface is drawn in by a quarter of the
+    /// nozzle width: each point of the printed outline is that far inside
+    /// the designed one, on gears and pulleys, with and without a ball,
+    /// and the bore is wider by half the width.
+    #[test]
+    fn printed_teeth_are_eroded_by_half_the_nozzle() {
+        let u = crate::train::PitchUnit::Module;
+        let nozzle = 0.4;
+        for p in [u.starter(24), GearParams { teeth: 12, module: 1.0, ball: 0.8, ..u.starter(12) }, u.starter_pulley(20)] {
+            let design = outline(&p, &tooth_profile(&p).unwrap());
+            let q = GearParams { nozzle, ..p.clone() };
+            let printed = outline(&q, &tooth_profile(&q).unwrap());
+            assert_eq!(q.hole(), p.bore + nozzle / 2.0);
+            let (far, near) = printed.iter().step_by(5).map(|&pt| dist_to(pt, &design)).fold((0.0, f64::MAX), |(hi, lo), d| (d.max(hi), d.min(lo)));
+            assert!((near - nozzle / 4.0).abs() < 0.015 && (far - nozzle / 4.0).abs() < 0.015, "{near}..{far} inside, {} teeth", p.teeth);
+            // And the printed outline lies within the designed one.
+            let r_tip = |o: &[[f64; 2]]| o.iter().map(|q| q[0].hypot(q[1])).fold(0.0, f64::max);
+            assert!((r_tip(&design) - r_tip(&printed) - nozzle / 4.0).abs() < 1e-6);
+        }
+    }
 
     fn half_at(prof: &Profile, rr: f64) -> f64 {
         let i = prof.radii.partition_point(|&q| q < rr);

@@ -65,6 +65,10 @@ pub struct Spec {
     /// Ball end mill Ø, mm, that rounds the roots of both gears; 0 if
     /// none is chosen (then the cutter's usual edge radius).
     pub ball: f64,
+    /// Nozzle Ø, mm, of the 3D printer the gears are made on: every tooth
+    /// surface is eroded by a quarter of it (the bores above are already
+    /// widened by half of it); 0 when they are not printed.
+    pub nozzle: f64,
 }
 
 // ---- small vector helpers ---------------------------------------------------
@@ -719,6 +723,17 @@ impl Blank {
     pub fn arc_radius(&self, s: f64) -> f64 {
         let r = s * self.pitch.sin();
         if r > 1e-9 { r } else { self.face_point[0] }
+    }
+
+    /// The blank with its face cone and throat let in by `d`, for teeth
+    /// eroded by `d`.
+    pub fn eroded(&self, d: f64) -> Blank {
+        let na = self.face_normal();
+        Blank {
+            face_point: [self.face_point[0] - d * na[0], self.face_point[1] - d * na[1]],
+            throat: self.throat.map(|[a, rt, zw]| [a, rt + d, zw]),
+            ..*self
+        }
     }
 }
 
@@ -1406,9 +1421,12 @@ impl Design {
     /// The ring gear's sections: slots straight from the cutter.
     pub fn ring(&self) -> Result<Member, String> {
         let blank = self.ring_blank();
-        let gap = |s: f64, t: f64, phi: f64| self.any_slot(section_point(blank.pitch, s, t, phi), 0.0);
+        // For the 3D printer the teeth are eroded by a quarter of the nozzle width:
+        // the slots that much wider and deeper, the face that much lower.
+        let d = self.spec.nozzle / 4.0;
+        let gap = |s: f64, t: f64, phi: f64| self.any_slot(section_point(blank.pitch, s, t, phi), 0.0) + d;
         let h = self.depth;
-        let mut m = build_member(self.spec.ring_teeth, blank, self.spec.ring_bore, [1.5 * h, 0.5 * h], SECTIONS, &gap)?;
+        let mut m = build_member(self.spec.ring_teeth, blank.eroded(d), self.spec.ring_bore, [1.5 * h, 0.5 * h], SECTIONS, &gap)?;
         // Near a face gear the toe and heel faces come level, or cross:
         // keep the back (heel) face at least half a tooth depth behind the
         // front.
@@ -1431,6 +1449,9 @@ impl Design {
         // while this point passes through mesh (its pinion azimuth within
         // 60° of the mean point's, which sits at azimuth 0).
         let reach = (PI / 3.0) / k.abs();
+        // For the 3D printer the teeth are eroded by a quarter of the nozzle width:
+        // the generating ring is that much fatter, the face that much lower.
+        let d = self.spec.nozzle / 4.0;
         let gap = |s: f64, t: f64, phi: f64| {
             let q = section_point(blank.pitch, s, t, phi);
             let r = q[0].hypot(q[1]);
@@ -1452,10 +1473,11 @@ impl Design {
                 .take(3)
                 .map(|&(th, _)| golden(&at, th - step, th + step, 30).1)
                 .fold(f64::MIN, f64::max)
+                + d
         };
         let h = self.depth;
         // The usual least top land for bevel gears: a quarter module.
-        let blank = clear_tips(blank, TAU / zp, 0.25 * self.spec.module, &gap);
+        let blank = clear_tips(blank.eroded(d), TAU / zp, 0.25 * self.spec.module, &gap);
         let mut m = build_member(self.spec.pinion_teeth, blank, self.spec.pinion_bore, [0.5 * h, 0.5 * h], SECTIONS, &gap)?;
         // A slender pinion (a bevel worm's) has little below its roots:
         // keep the hub circles clear of the bore and off the axis.
@@ -1497,6 +1519,7 @@ pub mod tests {
             backlash: 0.0,
             pinion_bore: 15.0,
             ring_bore: 110.0,
+            nozzle: 0.0,
             ball: 0.0,
         }
     }
@@ -1636,6 +1659,7 @@ pub mod tests {
                 backlash: 0.0,
                 pinion_bore: 0.0,
                 ring_bore: 30.0,
+                nozzle: 0.0,
                 ..car()
             };
             let d = spec.design().unwrap_or_else(|| panic!("{starts} starts, offset {offset}: no design"));
@@ -1732,6 +1756,7 @@ pub mod tests {
             spiral: 50.0,
             pinion_bore: 0.0,
             ring_bore: 30.0,
+            nozzle: 0.0,
             ball: 1.5,
             ..car()
         };

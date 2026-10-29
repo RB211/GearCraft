@@ -264,6 +264,7 @@ pub fn big_button(ui: &mut Ui, icon: Icon, label: &str, selected: bool, enabled:
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text);
     let size = vec2((galley.size().x + 16.0).max(58.0), 58.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label));
     let v = ui.visuals();
     if selected {
         ui.painter().rect_filled(rect, 5.0, ACCENT.gamma_multiply(0.22));

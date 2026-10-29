@@ -81,6 +81,10 @@ pub struct Spec {
     pub backlash: f64,
     pub worm_bore: f64,
     pub wheel_bore: f64,
+    /// Nozzle Ø, mm, of the 3D printer the drive is made on: every thread
+    /// and tooth surface is eroded by a quarter of it (the bores above are
+    /// already widened by half of it); 0 when it is not printed.
+    pub nozzle: f64,
 }
 
 /// The solved drive.
@@ -759,8 +763,15 @@ impl Design {
         let z1 = self.spec.starts;
         let pitch = TAU / z1 as f64;
         let mate = self.worm_mate_at(0.0);
-        let flank = |tip: f64| milled_flank(pitch, [self.worm_root, mate, tip], |r| self.worm_half(r), |r| self.across(r), self.ball);
-        let full = flank(self.worm_tip);
+        // For the 3D printer the threads are eroded by a quarter of the
+        // nozzle width: thinner, with a lower tip and deeper root, and the root
+        // corners rounder by as much.
+        let d = self.spec.nozzle / 4.0;
+        let (root, outside) = (self.worm_root - d, self.worm_tip - d);
+        let flank = |tip: f64| {
+            milled_flank(pitch, [root, mate, tip], |r| self.worm_half(r) - d / self.across(r), |r| self.across(r), self.ball + d)
+        };
+        let full = flank(outside);
         let length = self.spec.length;
         let turns = length / self.lead;
         let sections = ((turns * SECTIONS_PER_TURN).ceil() as usize).max(10) + 1;
@@ -768,13 +779,13 @@ impl Design {
         let turn = |z: f64| self.sense * TAU * (z - length / 2.0) / self.lead;
         let hub = hub_radius(self.spec.worm_bore, self.worm_root, self.whole_depth(), "worm")?;
         // The chamfered ends' sections have their own, shorter, threads.
-        let tips: Vec<f64> = stations.iter().map(|&z| chamfered_tip(self.worm_tip, mate, z.min(length - z))).collect();
+        let tips: Vec<f64> = stations.iter().map(|&z| chamfered_tip(outside, mate, z.min(length - z))).collect();
         let profiles: Vec<Vec<[f64; 2]>> =
-            tips.iter().map(|&t| if t < self.worm_tip - 1e-12 { flank(t) } else { full.clone() }).collect();
+            tips.iter().map(|&t| if t < outside - 1e-12 { flank(t) } else { full.clone() }).collect();
         Ok(Member {
             teeth: z1,
-            blank: cylinder(self.worm_tip, length, None),
-            t_root: vec![self.worm_root; sections],
+            blank: cylinder(outside, length, None),
+            t_root: vec![root; sections],
             t_tip: tips,
             right: stations.iter().zip(&profiles).map(|(&z, p)| p.iter().map(|&[r, a]| [r, a + turn(z)]).collect()).collect(),
             left: stations.iter().zip(&profiles).map(|(&z, p)| p.iter().map(|&[r, a]| [r, -a + turn(z)]).collect()).collect(),
@@ -795,17 +806,19 @@ impl Design {
         let sections = ((length / self.lead * SECTIONS_PER_TURN).ceil() as usize).max(10) + 1;
         let stations: Vec<f64> = (0..sections).map(|k| length * k as f64 / (sections - 1) as f64).collect();
         let (mut right, mut left, mut t_root, mut t_tip) = (vec![], vec![], vec![], vec![]);
+        // For the 3D printer the threads are eroded by a quarter of the nozzle width.
+        let d = self.spec.nozzle / 4.0;
         for &s in &stations {
             let z = s - length / 2.0;
-            let root = self.worm_root_at(z);
+            let root = self.worm_root_at(z) - d;
             let rho = |r: f64| (self.center - r).hypot(z);
-            let half = |r: f64| self.globoid_half(h, rho(r)) * ratio;
             // A turn of the worm moves a thread round the wheel's axis.
             let across = |r: f64| rho(r) / ratio * self.lead_angle.cos();
+            let half = |r: f64| self.globoid_half(h, rho(r)) * ratio - d / across(r);
             // The wheel's tips, round its axis.
             let mate = self.worm_mate_at(z);
-            let tip = chamfered_tip(self.worm_tip_at(z), mate, s.min(length - s));
-            let flank = milled_flank(pitch, [root, mate, tip], half, across, self.ball);
+            let tip = chamfered_tip(self.worm_tip_at(z) - d, mate, s.min(length - s));
+            let flank = milled_flank(pitch, [root, mate, tip], half, across, self.ball + d);
             // The thread's middle sits where the tool's gap was when the
             // point passed the axial plane.
             let turn = |r: f64| self.sense * z.atan2(self.center - r) * ratio;
@@ -817,7 +830,7 @@ impl Design {
         let hub = hub_radius(self.spec.worm_bore, self.worm_root, self.whole_depth(), "worm")?;
         Ok(Member {
             teeth: z1,
-            blank: cylinder(self.worm_rim(), length, Some([self.center, h.tip_arc, length / 2.0])),
+            blank: cylinder(self.worm_rim(), length, Some([self.center, h.tip_arc, length / 2.0])).eroded(d),
             t_root,
             t_tip,
             right,
@@ -979,8 +992,10 @@ impl Design {
         let b = self.spec.face;
         let blank = cylinder(self.wheel_rim, b, Some([self.center, self.center - self.wheel_throat, b / 2.0]));
         let corners = self.corners();
-        let gap = |s: f64, t: f64, phi: f64| self.milled(&corners, s, t, phi);
-        hypoid::build_member(self.spec.teeth, blank, self.spec.wheel_bore, [0.0; 2], 15, &gap)
+        // For the 3D printer the teeth are eroded by a quarter of the nozzle width.
+        let d = self.spec.nozzle / 4.0;
+        let gap = |s: f64, t: f64, phi: f64| self.milled(&corners, s, t, phi) + d;
+        hypoid::build_member(self.spec.teeth, blank.eroded(d), self.spec.wheel_bore, [0.0; 2], 15, &gap)
             .map_err(|e| format!("The wheel could not be cut ({e}): check the face width and worm diameter."))
     }
 
@@ -998,6 +1013,7 @@ impl Design {
             standard: ToothStandard::Custom,
             backlash: sp.backlash,
             profile_shift: 0.0,
+            nozzle: sp.nozzle,
             ..GearParams::default()
         };
         let prof = gear::tooth_profile(&p).ok_or("These settings do not make a wheel.")?;
@@ -1048,6 +1064,7 @@ pub mod tests {
             backlash: 0.0,
             worm_bore: 0.0,
             wheel_bore: 10.0,
+            nozzle: 0.0,
         }
     }
 

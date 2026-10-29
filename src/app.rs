@@ -79,9 +79,8 @@ struct BeltShape {
     lp: pulley::BeltLoop,
     land: f64,
     back: f64,
-    depth: f64,
-    half_base: f64,
-    half_tip: f64,
+    /// The tooth's outline: along the belt, depth below the land.
+    tooth: Vec<[f64; 2]>,
     stations: Vec<f64>,
 }
 
@@ -1189,13 +1188,11 @@ impl GearCraftApp {
         // rides on the pulley tips, half the PLD inside it.
         let land = -section.rack(g.params.teeth).pld / 2.0;
         let back = land + tooth.thickness - tooth.height;
-        let half_base = tooth.width / 2.0;
-        let half_tip = (half_base - tooth.height * tooth.half_angle.to_radians().tan()).max(0.05);
         let pitch = lp.len() / bi.teeth as f64;
         let rot = solved[pi].phase + solved[pi].ratio * self.driver_angle;
         let s0 = lp.s_on_first(rot + pulley::groove_angle(pp.teeth));
         let stations = (0..bi.teeth).map(|k| s0 + k as f64 * pitch).collect();
-        Some(BeltShape { lp, land, back, depth: tooth.height, half_base, half_tip, stations })
+        Some(BeltShape { lp, land, back, tooth: tooth.outline(), stations })
     }
 
     /// Belts drawn as they sit: the backing on the pulley tips, each tooth
@@ -1234,16 +1231,12 @@ impl GearCraftApp {
             }
             // Start inside the backing so tooth and band join without a seam.
             let root = b.land + 0.25 * (b.back - b.land);
+            let (first, last) = (b.tooth[0][0], b.tooth[b.tooth.len() - 1][0]);
             for &at in &b.stations {
-                let quad = vec![
-                    place(at, root, -b.half_base),
-                    place(at, b.land, -b.half_base),
-                    place(at, b.land - b.depth, -b.half_tip),
-                    place(at, b.land - b.depth, b.half_tip),
-                    place(at, b.land, b.half_base),
-                    place(at, root, b.half_base),
-                ];
-                painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+                let mut shape = vec![place(at, root, first)];
+                shape.extend(b.tooth.iter().map(|q| place(at, b.land - q[1], q[0])));
+                shape.push(place(at, root, last));
+                painter.add(Shape::convex_polygon(shape, color, Stroke::NONE));
             }
         }
     }
@@ -1334,7 +1327,7 @@ impl GearCraftApp {
                 let pi = g.placement.parent().and_then(|p| self.project.index_of(p))?;
                 let z_mid = solved[pi].z + self.project.gears[pi].params.face_width / 2.0;
                 let solid = view3d::belt_solid(
-                    &b.lp, &b.stations, b.land, b.back, b.depth, b.half_base, b.half_tip, z_mid, g.params.belt_width,
+                    &b.lp, &b.stations, b.land, b.back, &b.tooth, z_mid, g.params.belt_width,
                 );
                 Some((solid, g.id))
             })
@@ -1466,13 +1459,13 @@ impl GearCraftApp {
             }
             painter.add(Shape::closed_line(pts, Stroke::new(1.0, edge)));
             if g.params.bore > 0.0 {
-                painter.circle_stroke(center, (g.params.bore / 2.0 * self.view.scale) as f32, Stroke::new(1.0, edge));
+                painter.circle_stroke(center, (g.params.hole() / 2.0 * self.view.scale) as f32, Stroke::new(1.0, edge));
             }
             // Arbor mark, plus a tick so rotation is visible on plain gears.
             let tick = (ra_px * 0.15).clamp(3.0, 10.0);
             painter.circle_filled(center, 2.0, edge);
             let dir = Vec2::new(rot.cos() as f32, -rot.sin() as f32);
-            let r0 = (g.params.bore / 2.0 * self.view.scale) as f32 + 2.0;
+            let r0 = (g.params.hole() / 2.0 * self.view.scale) as f32 + 2.0;
             painter.line_segment([center + dir * r0, center + dir * (r0 + tick)], Stroke::new(1.5, edge));
         }
 
@@ -1518,7 +1511,7 @@ impl GearCraftApp {
                 }
                 let at = self.to_screen(rect, s.center) + Vec2::new(0.0, 14.0);
                 let text = match g.params.belt {
-                    Some(b) => format!("{}  {}{}", g.name, g.params.teeth, b.name()),
+                    Some(b) => format!("{}  {}", g.name, b.pulley_name(g.params.teeth)),
                     None => format!("{}  {}T", g.name, g.params.teeth),
                 };
                 let font = FontId::proportional(12.0);
@@ -1810,28 +1803,54 @@ impl GearCraftApp {
                 }
             }
         });
-        chrome::group(ui, "Machining", |ui| {
-            let on = self.project.for_machining;
-            let tip = if on {
+        chrome::group(ui, "Making", |ui| {
+            let unit = self.project.pitch_unit;
+            let machined = self.project.for_machining;
+            let tip = if machined {
                 "The teeth are shaped for the ball end mill on the 4-axis mill: roots rounded to it, and ring gear \
-                 slot floors raised where it can't reach. Click to keep the teeth as designed instead, for parts \
-                 made another way, such as 3D printed."
+                 slot floors raised where it can't reach. Click to keep the teeth as designed instead."
             } else {
-                "The teeth are as designed, for parts made another way, such as 3D printed. Click to shape them \
-                 for the ball end mill on the 4-axis mill."
+                "The teeth are as designed. Click to shape them for the ball end mill on the 4-axis mill."
             };
-            if big(ui, Icon::Text("CNC"), "Machined", on, true).on_hover_text(tip).clicked() {
-                self.project.for_machining = !on;
+            if big(ui, Icon::Text("CNC"), "Machined", machined, true).on_hover_text(tip).clicked() {
+                self.project.for_machining = !machined;
+                if self.project.for_machining {
+                    self.project.for_printing = false;
+                }
             }
-            ui.add_enabled_ui(on, |ui| {
+            ui.add_enabled_ui(machined, |ui| {
                 ui.vertical(|ui| {
                     ui.add_space(8.0);
                     ui.label("Ball end mill Ø");
-                    let unit = self.project.pitch_unit;
                     len_drag(ui, &mut self.project.ball_end_mill, unit, 0.0..=25.0, 0.01).on_hover_text(
                         "The ball end mill the teeth are cut with, on a 4-axis mill. Every root, on every kind of part, \
                          is rounded to it, and cut deep enough that the rounding stays under the other part's tips. \
                          0: not chosen yet.",
+                    );
+                });
+            });
+            let printed = self.project.for_printing;
+            let tip = if printed {
+                "The parts allow for the 3D printer's nozzle: every tooth surface and bore wall is drawn in by a \
+                 quarter of the nozzle width, so the teeth come out thinner and the bores wider by half of it, and the \
+                 printed surfaces land where they are designed. Click to keep the parts as designed instead."
+            } else {
+                "The parts are as designed. Click to allow for the 3D printer's nozzle: teeth thinner and bores \
+                 wider by half its width."
+            };
+            if big(ui, Icon::Text("FDM"), "Printed", printed, true).on_hover_text(tip).clicked() {
+                self.project.for_printing = !printed;
+                if self.project.for_printing {
+                    self.project.for_machining = false;
+                }
+            }
+            ui.add_enabled_ui(printed, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    ui.label("Nozzle width");
+                    len_drag(ui, &mut self.project.nozzle, unit, 0.0..=2.0, 0.01).on_hover_text(
+                        "The printer's nozzle Ø. Every tooth surface and bore wall is drawn in by a quarter of it: \
+                         the teeth thinner and the bores wider by half the width.",
                     );
                 });
             });
@@ -1894,7 +1913,7 @@ impl GearCraftApp {
                     let text = RichText::new(format!("{icon}  {}", g.name));
                     let r = ui.selectable_label(self.selected == Some(g.id), text);
                     let size = match g.params.belt {
-                        Some(b) => format!("{}{}", g.params.teeth, b.name()),
+                        Some(b) => b.pulley_name(g.params.teeth),
                         None => format!("{}T", g.params.teeth),
                     };
                     ui.label(RichText::new(size).weak());
@@ -2029,7 +2048,11 @@ impl GearCraftApp {
         } else {
             p.ball_room().map(|(now, most)| {
                 let (why, unset) = if p.is_pulley() {
-                    ("the grooves are narrower than it at the bottom", "from ISO 5294's groove corners")
+                    let unset = match p.belt.map(|b| b.family()) {
+                        Some(pulley::Family::Iso) => "from ISO 5294's groove corners",
+                        _ => "from the belt tooth's tip",
+                    };
+                    ("the grooves are narrower than it at the bottom", unset)
                 } else if p.is_bevel() {
                     ("at the toe the spaces are narrower than it at the bottom", "at the toe, from the root fillet under Rack")
                 } else {
@@ -2194,9 +2217,15 @@ impl GearCraftApp {
                     egui::Grid::new("pulley").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                         ui.label("Belt section");
                         ui.add_enabled_ui(!locked, |ui| {
-                            egui::ComboBox::from_id_salt("section").selected_text(belt.label()).show_ui(ui, |ui| {
-                                for b in BeltSection::ALL {
-                                    ui.selectable_value(&mut belt, b, b.label());
+                            egui::ComboBox::from_id_salt("section").selected_text(belt.label()).height(520.0).show_ui(ui, |ui| {
+                                for f in pulley::Family::ALL {
+                                    if f != pulley::Family::Iso {
+                                        ui.separator();
+                                    }
+                                    ui.label(RichText::new(f.name()).weak().small());
+                                    for b in BeltSection::ALL.into_iter().filter(|b| b.family() == f) {
+                                        ui.selectable_value(&mut belt, b, b.label());
+                                    }
                                 }
                             });
                         });
@@ -2228,7 +2257,10 @@ impl GearCraftApp {
 
                         ui.label("Belt width");
                         ui.add_enabled_ui(!locked, |ui| {
-                            let label = |w: &crate::pulley::BeltWidth| format!("{} ({})", w.code, len(w.width, unit));
+                            let label = |w: &crate::pulley::BeltWidth| match w.code {
+                                "" => len(w.width, unit),
+                                code => format!("{code} ({})", len(w.width, unit)),
+                            };
                             let current = belt.width_near(g.params.belt_width);
                             egui::ComboBox::from_id_salt("width").selected_text(label(&current)).show_ui(ui, |ui| {
                                 for w in belt.widths() {
@@ -2242,9 +2274,12 @@ impl GearCraftApp {
                         ui.end_row();
                     });
                     ui.label(
-                        RichText::new("ISO 5294 groove. Picking a width sets the face width for an unflanged pulley.")
-                            .weak()
-                            .small(),
+                        RichText::new(format!(
+                            "{} Picking a width sets the face width for an unflanged pulley.",
+                            belt.family().groove_note()
+                        ))
+                        .weak()
+                        .small(),
                     );
                 });
             } else if let Some(role) = g.params.worm_drive {
@@ -2436,7 +2471,13 @@ impl GearCraftApp {
             section(ui, "Blank", |ui| {
                 egui::Grid::new("blank").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label("Bore Ø");
-                    len_drag(ui, &mut g.params.bore, unit, 0.0..=10000.0, 0.1);
+                    let r = len_drag(ui, &mut g.params.bore, unit, 0.0..=10000.0, 0.1);
+                    if g.params.nozzle > 0.0 && g.params.bore > 0.0 {
+                        r.on_hover_text(format!(
+                            "Made Ø{}: widened by half the nozzle width under Making, so the printed hole comes out as designed.",
+                            len(g.params.hole(), unit)
+                        ));
+                    }
                     ui.end_row();
                     if g.params.hypoid != Some(Role::Pinion) {
                         let thread = g.params.worm_drive == Some(worm::Role::Worm);
@@ -2550,7 +2591,8 @@ impl GearCraftApp {
                         ui.label("");
                         let r = ui.checkbox(&mut self.belt_standard_only, "Standard belts only").on_hover_text(
                             "Pick from the ISO 5296 stock lengths. Off: any whole number of teeth, for \
-                             made-to-order belts.",
+                             made-to-order belts. Metric belts have no standard lengths, so any whole number of \
+                             teeth is used either way: check your maker's list.",
                         );
                         if r.changed() {
                             fit_req = Some(want);
@@ -3431,8 +3473,9 @@ impl GearCraftApp {
 impl eframe::App for GearCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // New parts, and a changed setting, take the ball end mill.
-        self.project.apply_ball();
+        // New parts, and a changed setting, take the ball end mill and
+        // the nozzle.
+        self.project.apply_making();
         self.poll_file_dialog(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3724,6 +3767,32 @@ mod tests {
         assert!(spec.design().is_ok());
         assert!(harness.query_by_label_contains("too big").is_none());
         assert!(harness.query_by_label_contains("No ball end mill").is_none());
+    }
+
+    /// Machined and Printed are two ways of making the parts: choosing one
+    /// drops the other, and the nozzle reaches the parts.
+    #[test]
+    fn printed_and_machined_are_either_or() {
+        let mut p = Project::empty();
+        p.add_root(PitchUnit::Module.starter(24), 0.0, 0.0);
+        let mut harness = Harness::builder().with_size(Vec2::new(1400.0, 1500.0)).build_eframe(|cc| {
+            let mut app = GearCraftApp::new(cc, None);
+            app.replace_project(p, None);
+            app
+        });
+        harness.run_steps(3);
+        assert!(harness.state().project.for_machining);
+        harness.get_by_label_contains("Printed").click();
+        harness.run_steps(3);
+        let project = &harness.state().project;
+        assert!(project.for_printing && !project.for_machining);
+        assert_eq!(project.gears[0].params.nozzle, 0.4);
+        assert_eq!(project.gears[0].params.hole(), project.gears[0].params.bore + 0.2);
+        harness.get_by_label_contains("Machined").click();
+        harness.run_steps(3);
+        let project = &harness.state().project;
+        assert!(project.for_machining && !project.for_printing);
+        assert_eq!(project.gears[0].params.nozzle, 0.0);
     }
 
     /// With machining off there is no ball to choose, so no asking.

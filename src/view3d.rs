@@ -100,8 +100,9 @@ pub fn gear_solid(p: &GearParams, prof: &Profile, fill: &FillMesh) -> Solid {
     let h = p.face_width.max(0.01);
     let mut s = Solid::default();
     s.walls(&lp, 0.0, h, true);
-    if p.bore > 0.0 {
-        let r = p.bore / 2.0;
+    let hole = p.hole();
+    if hole > 0.0 {
+        let r = hole / 2.0;
         let n = 64;
         let hole: Vec<[f64; 2]> =
             (0..n).map(|i| i as f64 * TAU / n as f64).map(|a| [r * a.cos(), r * a.sin()]).collect();
@@ -400,21 +401,20 @@ pub fn ear_clip(poly: &[[f64; 2]]) -> Vec<[usize; 3]> {
 
 /// The belt as a solid in world coordinates: backing and teeth, `width`
 /// wide, centred on `z_mid`. `teeth` gives each tooth's arc-length
-/// station; `land`/`back`/`tooth` are offsets from the pitch line.
+/// station; `land`/`back` are offsets from the pitch line, and `tooth`
+/// the tooth's outline as `BeltTooth::outline` gives it.
 #[allow(clippy::too_many_arguments)]
 pub fn belt_solid(
     lp: &BeltLoop,
     stations: &[f64],
     land: f64,
     back: f64,
-    depth: f64,
-    half_base: f64,
-    half_tip: f64,
+    tooth: &[[f64; 2]],
     z_mid: f64,
     width: f64,
 ) -> Solid {
     // Walk the loop once, emitting (s, inner offset) pairs: the land
-    // between teeth and the four corners of each tooth.
+    // between teeth and each tooth's outline.
     let len = lp.len();
     let mut marks: Vec<(f64, f64)> = Vec::new();
     let mut sorted: Vec<f64> = stations.iter().map(|s| s.rem_euclid(len)).collect();
@@ -422,10 +422,8 @@ pub fn belt_solid(
     let step = (len / 600.0).max(0.2);
     for (k, &c) in sorted.iter().enumerate() {
         let next = if k + 1 < sorted.len() { sorted[k + 1] } else { sorted[0] + len };
-        marks.push((c - half_base, land));
-        marks.push((c - half_tip, land - depth));
-        marks.push((c + half_tip, land - depth));
-        marks.push((c + half_base, land));
+        let half_base = tooth[tooth.len() - 1][0];
+        marks.extend(tooth.iter().map(|q| (c + q[0], land - q[1])));
         let (a, b) = (c + half_base, next - half_base);
         let n = ((b - a) / step).ceil().max(1.0) as usize;
         for i in 1..n {

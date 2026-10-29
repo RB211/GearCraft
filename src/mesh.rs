@@ -347,7 +347,7 @@ fn spur(p: &GearParams) -> Option<Mesh> {
         m.face(&[[bottom[i], bottom[j], top[j]], [bottom[i], top[j], top[i]]], out);
     }
     // The bore, with a vertex on every ray.
-    let rb = p.bore / 2.0;
+    let rb = p.hole() / 2.0;
     let per = (circle_segments(rb.max(1.0)) / z).max(2);
     let ring = |m: &mut Mesh, zz: f64| -> Vec<u32> {
         if rb <= 0.0 {
@@ -871,6 +871,27 @@ mod tests {
         p.make_globoid(p.index_of(wheel).unwrap(), true);
         p.normalize();
         p
+    }
+
+    /// Made for the printer, every kind of part is still watertight and
+    /// has lost material: its teeth drawn in by a quarter of the nozzle
+    /// width and its bore widened by half of it.
+    #[test]
+    fn printed_parts_are_smaller_and_still_watertight() {
+        let mut p = project();
+        let designed = parts(&p, 0.4, None, |_| true, |_| None);
+        p.for_machining = false;
+        p.for_printing = true;
+        p.nozzle = 0.4;
+        p.normalize();
+        let printed = parts(&p, 0.4, None, |_| true, |_| None);
+        assert_eq!(printed.len(), designed.len());
+        for (a, b) in designed.iter().zip(&printed) {
+            assert_watertight(&b.mesh, &format!("printed {}", b.name));
+            let (va, vb) = (a.mesh.volume(), b.mesh.volume());
+            assert!(vb < va, "{}: {vb} printed is no smaller than {va} designed", a.name);
+            assert!(vb > 0.5 * va, "{}: {vb} printed is far smaller than {va} designed", a.name);
+        }
     }
 
     #[test]
