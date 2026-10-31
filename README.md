@@ -28,6 +28,18 @@ of the nozzle width (set beside the switch), so the teeth come out thinner and t
 nozzle width (an 8 mm bore with a 0.4 mm nozzle is made 8.2 mm) and the printed surfaces land where
 they were designed, on every kind of part, in the drawing and in every export. Neither: the parts as designed.
 
+A spur gear or timing pulley can carry a **hub** (Blank section): a cylinder about the bore standing out
+from the bottom face, the top face or both, with its Ø and thickness. It has to clear the bore and stay
+inside the root circle. The hub shows in 3D and goes out in STEP and the mesh formats; the flat DXF and
+SVG outlines are unchanged. Parts stacked along a shaft start after the hub before them, and the Bottom
+and Top face export origins are the hub's end faces.
+
+A bored spur gear or pulley can also have a **keyway**: tick it in the Blank section and the key is
+sized from DIN 6885-1 (metric projects) or ANSI B17.1 (inch projects) for the bore, or pick Custom and
+set the key width and keyway depth (bore circle to keyway floor, on the centreline) yourself. The keyway
+is centred on tooth 0 (+X), runs through the hubs, and is cut in every view and export, the DXF and SVG
+bores becoming a closed polyline.
+
 Metric (module, mm) and inch (diametral pitch, inches) projects: pick with the Metric | Inch switch at the left of the toolbar
 (it offers to convert existing gears to the nearest standard pitch), or File → New metric/inch project. Lengths,
 the grid and exports follow the project's units. Tooth standards: ISO 53, AGMA full depth (20°/25°),

@@ -1,9 +1,10 @@
 //! STEP (ISO 10303-21, AP214) output: each part as an exact B-rep solid.
 //!
 //! A part is its arc-fitted outline (lines and circular arcs, the same as
-//! the DXF) extruded through its face width, with the bore as a hole. So
-//! every side face is a plane or a cylinder and the ends are planes; no
-//! faceting. The bore is two half cylinders, which every importer accepts
+//! the DXF) extruded through its face width, with the bore as a hole and
+//! any hub as a cylinder standing on an end face. So every side face is a
+//! plane or a cylinder and the ends are planes; no faceting. The bore and
+//! the hubs are two half cylinders each, which every importer accepts
 //! without needing seam edges.
 //!
 //! A bevel gear is exact the same way: each flank is a cone through the
@@ -50,11 +51,17 @@ fn segments(path: &[([f64; 2], f64)]) -> Vec<Seg> {
         .collect()
 }
 
-/// The bore as two clockwise half circles (a hole runs clockwise).
-fn hole(center: [f64; 2], r: f64) -> Vec<Seg> {
+/// A circle as two half circles: anticlockwise for an outer boundary,
+/// clockwise for a hole.
+fn circle(center: [f64; 2], r: f64, ccw: bool) -> Vec<Seg> {
     let p = [center[0] + r, center[1]];
     let q = [center[0] - r, center[1]];
-    vec![Seg { a: p, b: q, arc: Some((center, r, false)) }, Seg { a: q, b: p, arc: Some((center, r, false)) }]
+    vec![Seg { a: p, b: q, arc: Some((center, r, ccw)) }, Seg { a: q, b: p, arc: Some((center, r, ccw)) }]
+}
+
+/// The bore as two clockwise half circles (a hole runs clockwise).
+fn hole(center: [f64; 2], r: f64) -> Vec<Seg> {
+    circle(center, r, false)
 }
 
 struct Writer {
@@ -216,28 +223,54 @@ fn walls(w: &mut Writer, segs: &[Seg], z0: f64, z1: f64, faces: &mut Vec<usize>)
     LoopEdges { bottom, top }
 }
 
+/// A flat face about the axis at height `z`, facing up or down, bounded
+/// by `outer` with a hole `inner`.
+fn flat(w: &mut Writer, c: [f64; 2], z: f64, up: bool, outer: Vec<(usize, bool)>, inner: Option<Vec<(usize, bool)>>) -> usize {
+    let ax = w.axis([c[0], c[1], z], [0.0, 0.0, if up { 1.0 } else { -1.0 }], [1.0, 0.0, 0.0]);
+    let plane = w.add(format!("PLANE('',#{ax})"));
+    let mut bounds = vec![(outer, true)];
+    bounds.extend(inner.map(|i| (i, true)));
+    w.face(plane, true, &bounds)
+}
+
 /// One shape as a MANIFOLD_SOLID_BREP; returns its id.
 fn solid(w: &mut Writer, shape: &Shape) -> usize {
     let (z0, z1) = (shape.z, shape.z + shape.height.max(1e-3));
+    let c = shape.center;
+    let hub = shape.hub.filter(|h| h.below > 0.0 || h.above > 0.0);
+    let (below, above) = hub.map_or((0.0, 0.0), |h| (h.below, h.above));
+    let (zlo, zhi) = (z0 - below, z1 + above);
     let mut faces = Vec::new();
     let outer = walls(w, &segments(&shape.path), z0, z1, &mut faces);
-    let inner = (shape.bore > 0.0).then(|| walls(w, &hole(shape.center, shape.bore / 2.0), z0, z1, &mut faces));
-    let c = shape.center;
-    for (z, up) in [(z1, true), (z0, false)] {
-        let normal = [0.0, 0.0, if up { 1.0 } else { -1.0 }];
-        let ax = w.axis([c[0], c[1], z], normal, [1.0, 0.0, 0.0]);
-        let plane = w.add(format!("PLANE('',#{ax})"));
-        // From above the loops run anticlockwise (outline) and clockwise
-        // (hole) as stored; from below, both reverse.
-        let bound = |edges: &[usize]| -> Vec<(usize, bool)> {
-            if up { edges.iter().map(|&e| (e, true)).collect() } else { edges.iter().rev().map(|&e| (e, false)).collect() }
-        };
-        let pick = |l: &LoopEdges| if up { l.top.clone() } else { l.bottom.clone() };
-        let mut bounds = vec![(bound(&pick(&outer)), true)];
-        if let Some(h) = &inner {
-            bounds.push((bound(&pick(h)), true));
+    let bore_segs = match &shape.keyway {
+        Some(k) => Some(segments(k)),
+        None => (shape.bore > 0.0).then(|| hole(c, shape.bore / 2.0)),
+    };
+    let bore = bore_segs.map(|segs| walls(w, &segs, zlo, zhi, &mut faces));
+    let stand = (hub.filter(|_| below > 0.0)).map(|h| walls(w, &circle(c, h.radius, true), zlo, z0, &mut faces));
+    let crown = (hub.filter(|_| above > 0.0)).map(|h| walls(w, &circle(c, h.radius, true), z1, zhi, &mut faces));
+    // As stored, the loops run anticlockwise (outlines, hubs) or clockwise
+    // (the bore) seen from above: forward on a face looking up, reversed
+    // on one looking down, and a hub's loop the other way round where it
+    // is the hole in the face it stands on.
+    let run = |edges: &[usize], forward: bool| -> Vec<(usize, bool)> {
+        if forward { edges.iter().map(|&e| (e, true)).collect() } else { edges.iter().rev().map(|&e| (e, false)).collect() }
+    };
+    let bore_top = bore.as_ref().map(|b| run(&b.top, true));
+    let bore_bottom = bore.as_ref().map(|b| run(&b.bottom, false));
+    match &crown {
+        Some(h) => {
+            faces.push(flat(w, c, z1, true, run(&outer.top, true), Some(run(&h.bottom, false))));
+            faces.push(flat(w, c, zhi, true, run(&h.top, true), bore_top));
         }
-        faces.push(w.face(plane, true, &bounds));
+        None => faces.push(flat(w, c, z1, true, run(&outer.top, true), bore_top)),
+    }
+    match &stand {
+        Some(h) => {
+            faces.push(flat(w, c, z0, false, run(&outer.bottom, false), Some(run(&h.top, true))));
+            faces.push(flat(w, c, zlo, false, run(&h.bottom, false), bore_bottom));
+        }
+        None => faces.push(flat(w, c, z0, false, run(&outer.bottom, false), bore_bottom)),
     }
     let list: Vec<String> = faces.iter().map(|f| format!("#{f}")).collect();
     let shell = w.add(format!("CLOSED_SHELL('',({}))", list.join(",")));
@@ -982,6 +1015,34 @@ mod tests {
         let text = step(&shapes, &[], &[], "t");
         assert_closed(&text);
         assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), shapes.len());
+    }
+
+    #[test]
+    fn hubbed_parts_are_closed_too() {
+        use crate::gear::{GearParams, Hub};
+        use crate::train::{Link, PitchUnit};
+        let u = PitchUnit::Module;
+        let mut p = Project::empty();
+        let a = p.add_root(GearParams { hub: Hub::Both, hub_diameter: 20.0, hub_thickness: 6.0, keyway: true, ..u.starter(24) }, 0.0, 0.0);
+        p.add_child(a, GearParams { hub: Hub::Bottom, hub_diameter: 12.0, hub_thickness: 4.0, keyway: true, key_standard: false, key_width: 3.0, key_depth: 1.5, ..u.starter(12) }, Link::Mesh);
+        p.add_root(GearParams { bore: 0.0, hub: Hub::Top, hub_diameter: 12.0, hub_thickness: 5.0, ..u.starter(17) }, 0.0, 120.0);
+        let q = p.add_root(GearParams { hub: Hub::Bottom, hub_diameter: 14.0, hub_thickness: 8.0, ..u.starter_pulley(20) }, 300.0, 0.0);
+        p.add_child(q, u.starter_pulley(30), Link::Belt);
+        p.normalize();
+        let shapes = export::shapes(&p, 0.3, None, |_| true);
+        assert_eq!(shapes.iter().filter(|s| s.hub.is_some()).count(), 4);
+        assert_eq!(shapes.iter().filter(|s| s.keyway.is_some()).count(), 2);
+        let text = step(&shapes, &[], &[], "t");
+        assert_closed(&text);
+        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 5);
+        // Each hub adds two half cylinders and a flat ring over the plain part.
+        let mut plain = p.clone();
+        plain.gears.iter_mut().for_each(|g| (g.params.hub, g.params.keyway) = (Hub::None, false));
+        let before = step(&export::shapes(&plain, 0.3, None, |_| true), &[], &[], "t");
+        assert_eq!(text.matches("CYLINDRICAL_SURFACE").count(), before.matches("CYLINDRICAL_SURFACE").count() + 2 * 5);
+        // Each keyway swaps the bore's two half cylinders for two arcs and
+        // three planes.
+        assert_eq!(text.matches("PLANE(").count(), before.matches("PLANE(").count() + 5 + 2 * 3);
     }
 
     #[test]

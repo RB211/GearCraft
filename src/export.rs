@@ -23,6 +23,11 @@ pub struct Shape {
     /// Back face along the axis and the face width, for solid output.
     pub z: f64,
     pub height: f64,
+    /// The hub(s) standing out from the end faces, for solid output.
+    pub hub: Option<gear::Hubs>,
+    /// A keyed bore as a closed clockwise bulge path, in place of the
+    /// round `bore`.
+    pub keyway: Option<Vec<([f64; 2], f64)>>,
 }
 
 /// Fit a closed outline with lines and circular arcs. Every input point
@@ -155,8 +160,8 @@ pub fn place(q: [f64; 2], center: [f64; 2], rot: f64) -> [f64; 2] {
 }
 
 /// Heights of a part's two flat end faces along its own axis, low then
-/// high: a spur gear's back and front, a bevel's toe and heel, a generated
-/// part's (`member`) end sections at the hub.
+/// high: a spur gear's back and front (or its hubs' ends), a bevel's toe
+/// and heel, a generated part's (`member`) end sections at the hub.
 pub fn faces(p: &gear::GearParams, member: Option<&Member>) -> [f64; 2] {
     let (lo, hi) = if let Some(m) = member {
         let z = |s: f64, t: f64| m.point(s, t, 0.0)[2];
@@ -164,7 +169,7 @@ pub fn faces(p: &gear::GearParams, member: Option<&Member>) -> [f64; 2] {
     } else if let Some(b) = BevelGeom::new(p) {
         (b.front_face().0, b.back_face().0)
     } else {
-        (0.0, p.face_width)
+        p.ends()
     };
     [lo.min(hi), lo.max(hi)]
 }
@@ -200,6 +205,8 @@ pub fn shapes(project: &Project, driver_angle: f64, only: Option<u64>, keep: imp
                 bore: g.params.hole(),
                 z,
                 height: g.params.face_width,
+                hub: g.params.hubs(),
+                keyway: g.params.bore_path().map(|k| k.into_iter().map(|(q, b)| (place(q, center, rot), b)).collect()),
             })
         })
         .collect()
@@ -306,6 +313,8 @@ fn in_units(shapes: &[Shape], inch: bool) -> Vec<Shape> {
             bore: s.bore * k,
             z: s.z * k,
             height: s.height * k,
+            hub: s.hub.map(|h| gear::Hubs { radius: h.radius * k, below: h.below * k, above: h.above * k }),
+            keyway: s.keyway.as_ref().map(|p| p.iter().map(|&(q, b)| ([q[0] * k, q[1] * k], b)).collect()),
         })
         .collect()
 }
@@ -341,23 +350,28 @@ pub fn dxf(shapes: &[Shape], inch: bool) -> String {
     pair(&mut s, 0, "ENDSEC");
     pair(&mut s, 0, "SECTION");
     pair(&mut s, 2, "ENTITIES");
-    for sh in shapes {
-        pair(&mut s, 0, "POLYLINE");
-        pair(&mut s, 8, "GEAR");
-        pair(&mut s, 66, "1");
-        pair(&mut s, 70, "1");
-        for &([x, y], bulge) in &sh.path {
-            pair(&mut s, 0, "VERTEX");
-            pair(&mut s, 8, "GEAR");
-            pair(&mut s, 10, &num(x));
-            pair(&mut s, 20, &num(y));
+    let polyline = |s: &mut String, layer: &str, path: &[([f64; 2], f64)]| {
+        pair(s, 0, "POLYLINE");
+        pair(s, 8, layer);
+        pair(s, 66, "1");
+        pair(s, 70, "1");
+        for &([x, y], bulge) in path {
+            pair(s, 0, "VERTEX");
+            pair(s, 8, layer);
+            pair(s, 10, &num(x));
+            pair(s, 20, &num(y));
             if bulge != 0.0 {
-                pair(&mut s, 42, &format!("{bulge:.10}"));
+                pair(s, 42, &format!("{bulge:.10}"));
             }
         }
-        pair(&mut s, 0, "SEQEND");
-        pair(&mut s, 8, "GEAR");
-        if sh.bore > 0.0 {
+        pair(s, 0, "SEQEND");
+        pair(s, 8, layer);
+    };
+    for sh in shapes {
+        polyline(&mut s, "GEAR", &sh.path);
+        if let Some(k) = &sh.keyway {
+            polyline(&mut s, "BORE", k);
+        } else if sh.bore > 0.0 {
             pair(&mut s, 0, "CIRCLE");
             pair(&mut s, 8, "BORE");
             pair(&mut s, 10, &num(sh.center[0]));
@@ -396,28 +410,34 @@ pub fn svg(shapes: &[Shape], inch: bool) -> String {
         -hi[1] - margin,
         if inch { 0.004 } else { 0.1 },
     );
-    for sh in shapes {
-        let _ = write!(s, "<g id=\"{}\">\n<path d=\"", xml_escape(&sh.name));
-        let n = sh.path.len();
-        if let Some(([x, y], _)) = sh.path.first() {
-            let _ = write!(s, "M{x:.6},{y:.6} ");
+    let path_d = |path: &[([f64; 2], f64)]| -> String {
+        let mut d = String::new();
+        let n = path.len();
+        if let Some(([x, y], _)) = path.first() {
+            let _ = write!(d, "M{x:.6},{y:.6} ");
         }
         for k in 0..n {
-            let (a, bulge) = sh.path[k];
-            let [x, y] = sh.path[(k + 1) % n].0;
+            let (a, bulge) = path[k];
+            let [x, y] = path[(k + 1) % n].0;
             if bulge == 0.0 {
-                let _ = write!(s, "L{x:.6},{y:.6} ");
+                let _ = write!(d, "L{x:.6},{y:.6} ");
             } else {
                 let theta = 4.0 * bulge.abs().atan();
                 let r = dist(a, [x, y]) / (2.0 * (theta / 2.0).sin());
                 let large = u8::from(theta > std::f64::consts::PI);
                 // The path is in Y-up coordinates, where sweep 1 is counter-clockwise.
                 let sweep = u8::from(bulge > 0.0);
-                let _ = write!(s, "A{r:.6},{r:.6} 0 {large} {sweep} {x:.6},{y:.6} ");
+                let _ = write!(d, "A{r:.6},{r:.6} 0 {large} {sweep} {x:.6},{y:.6} ");
             }
         }
-        s.push_str("Z\"/>\n");
-        if sh.bore > 0.0 {
+        d.push('Z');
+        d
+    };
+    for sh in shapes {
+        let _ = writeln!(s, "<g id=\"{}\">\n<path d=\"{}\"/>", xml_escape(&sh.name), path_d(&sh.path));
+        if let Some(k) = &sh.keyway {
+            let _ = writeln!(s, "<path d=\"{}\"/>", path_d(k));
+        } else if sh.bore > 0.0 {
             let _ = writeln!(
                 s,
                 "<circle cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\"/>",

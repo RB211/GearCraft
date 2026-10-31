@@ -50,6 +50,30 @@ pub struct GearParams {
     /// Belt width, mm (pulleys only).
     #[serde(default)]
     pub belt_width: f64,
+    /// A hub on one or both end faces of a spur gear or pulley: a
+    /// cylinder about the bore standing out from the face.
+    #[serde(default)]
+    pub hub: Hub,
+    /// Hub Ø, mm.
+    #[serde(default)]
+    pub hub_diameter: f64,
+    /// How far each hub stands out from its face, mm.
+    #[serde(default)]
+    pub hub_thickness: f64,
+    /// A keyway along the bore (and through the hubs), centred on tooth 0.
+    #[serde(default)]
+    pub keyway: bool,
+    /// Size the key from the standard table for the bore (DIN 6885-1 in a
+    /// metric project, ANSI B17.1 in an inch one) rather than by hand.
+    #[serde(default = "yes")]
+    pub key_standard: bool,
+    /// Key width, mm.
+    #[serde(default)]
+    pub key_width: f64,
+    /// Keyway depth in the hub, mm: from the bore circle to the keyway
+    /// floor, on the keyway's centreline (DIN's t2).
+    #[serde(default)]
+    pub key_depth: f64,
     /// Set for a straight bevel gear: its pitch cone, which the solve
     /// derives from the mate. `module` is then the large-end module and
     /// `face_width` runs along the cone.
@@ -101,6 +125,13 @@ impl Default for GearParams {
             face_width: 10.0,
             belt: None,
             belt_width: 0.0,
+            hub: Hub::None,
+            hub_diameter: 0.0,
+            hub_thickness: 0.0,
+            keyway: false,
+            key_standard: true,
+            key_width: 0.0,
+            key_depth: 0.0,
             bevel: None,
             hypoid: None,
             worm: false,
@@ -109,6 +140,105 @@ impl Default for GearParams {
             nozzle: 0.0,
         }
     }
+}
+
+/// Which end faces of a spur gear or pulley carry a hub. The bottom face
+/// is the back, at Z 0 in the part's frame; the top face is at the face
+/// width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Hub {
+    #[default]
+    None,
+    Bottom,
+    Top,
+    Both,
+}
+
+impl Hub {
+    pub fn label(self) -> &'static str {
+        match self {
+            Hub::None => "None",
+            Hub::Bottom => "Bottom face",
+            Hub::Top => "Top face",
+            Hub::Both => "Both faces",
+        }
+    }
+    pub fn bottom(self) -> bool {
+        matches!(self, Hub::Bottom | Hub::Both)
+    }
+    pub fn top(self) -> bool {
+        matches!(self, Hub::Top | Hub::Both)
+    }
+}
+
+/// A part's hub(s) as made: their radius, and how far they stand below
+/// the back face (Z 0) and above the front face (the face width), mm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hubs {
+    pub radius: f64,
+    pub below: f64,
+    pub above: f64,
+}
+
+/// How far inside the root circle a hub must stay, mm, so it stands on
+/// the end face clear of the teeth.
+pub const HUB_CLEARANCE: f64 = 0.1;
+
+fn yes() -> bool {
+    true
+}
+
+/// A keyway as made: its width and the radius to its floor, mm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Keyway {
+    pub width: f64,
+    pub floor: f64,
+}
+
+/// A standard parallel key for a bore: (width, height, hub keyway depth
+/// on the centreline), mm. DIN 6885-1 for a metric project (bores of 6
+/// to 130 mm), ANSI B17.1 square keys for an inch one (5/16 to 4½ in),
+/// whose keyseat depth of half the key is measured at the side and so is
+/// deepened by the chordal height here.
+pub fn standard_key(bore: f64, inch: bool) -> Option<(f64, f64, f64)> {
+    if inch {
+        // Shaft Ø up to, key side, in.
+        const ANSI: [(f64, f64); 11] = [
+            (0.4375, 0.09375), (0.5625, 0.125), (0.875, 0.1875), (1.25, 0.25), (1.375, 0.3125), (1.75, 0.375),
+            (2.25, 0.5), (2.75, 0.625), (3.25, 0.75), (3.75, 0.875), (4.5, 1.0),
+        ];
+        let d = bore / 25.4;
+        if d < 0.3125 - 1e-9 {
+            return None;
+        }
+        let (_, b) = *ANSI.iter().find(|(upto, _)| d <= upto + 1e-9)?;
+        let (b, r) = (b * 25.4, bore / 2.0);
+        let chord = r - (r * r - b * b / 4.0).max(0.0).sqrt();
+        return Some((b, b, b / 2.0 + chord));
+    }
+    // Shaft Ø over, up to, b, h, t2.
+    const DIN: [(f64, f64, f64, f64, f64); 16] = [
+        (6.0, 8.0, 2.0, 2.0, 1.0),
+        (8.0, 10.0, 3.0, 3.0, 1.4),
+        (10.0, 12.0, 4.0, 4.0, 1.8),
+        (12.0, 17.0, 5.0, 5.0, 2.3),
+        (17.0, 22.0, 6.0, 6.0, 2.8),
+        (22.0, 30.0, 8.0, 7.0, 3.3),
+        (30.0, 38.0, 10.0, 8.0, 3.3),
+        (38.0, 44.0, 12.0, 8.0, 3.3),
+        (44.0, 50.0, 14.0, 9.0, 3.8),
+        (50.0, 58.0, 16.0, 10.0, 4.3),
+        (58.0, 65.0, 18.0, 11.0, 4.4),
+        (65.0, 75.0, 20.0, 12.0, 4.9),
+        (75.0, 85.0, 22.0, 14.0, 5.4),
+        (85.0, 95.0, 25.0, 14.0, 5.4),
+        (95.0, 110.0, 28.0, 16.0, 6.4),
+        (110.0, 130.0, 32.0, 18.0, 7.4),
+    ];
+    if bore < 6.0 - 1e-9 {
+        return None;
+    }
+    DIN.iter().find(|(_, upto, ..)| bore <= upto + 1e-9).map(|&(_, _, b, h, t2)| (b, h, t2))
 }
 
 /// Basic-rack proportions. Coefficients are per module (or per 1/DP,
@@ -339,6 +469,159 @@ impl GearParams {
         if self.bore > 0.0 { self.bore + self.nozzle / 2.0 } else { 0.0 }
     }
 
+    /// A plain cylindrical part, a spur gear or a timing pulley: the
+    /// kinds that can carry a hub and a keyway.
+    pub fn is_flat(&self) -> bool {
+        self.bevel.is_none() && self.hypoid.is_none() && self.worm_drive.is_none()
+    }
+
+    /// Size the key from the standard table when it follows one (0 when
+    /// the table has no key for the bore).
+    pub fn apply_key_standard(&mut self, inch: bool) {
+        if self.keyway && self.key_standard {
+            let (b, _, t2) = standard_key(self.bore, inch).unwrap_or_default();
+            self.key_width = b;
+            self.key_depth = t2;
+        }
+    }
+
+    /// Why the keyway as set cannot be made, if it cannot.
+    fn keyway_fault(&self, len: &dyn Fn(f64) -> String) -> Option<Issue> {
+        if !self.keyway || !self.is_flat() {
+            return None;
+        }
+        if self.bore <= 0.0 {
+            return Some(Issue::error("A keyway needs a bore; it is left off."));
+        }
+        if self.key_standard && self.key_width <= 0.0 {
+            return Some(Issue::error(format!(
+                "No standard key for a Ø{} bore (DIN 6885-1 covers 6 to 130 mm, ANSI B17.1 5/16 to 4½ in); \
+                 choose Custom and size the keyway by hand. It is left off.",
+                len(self.bore)
+            )));
+        }
+        if self.key_width <= 0.0 || self.key_depth <= 0.0 {
+            return Some(Issue::error("Key width and keyway depth must be more than 0; the keyway is left off."));
+        }
+        if self.key_width + self.nozzle / 2.0 >= self.hole() - 1e-9 {
+            return Some(Issue::error("The key is as wide as the bore; the keyway is left off."));
+        }
+        let floor = self.bore / 2.0 + self.key_depth;
+        if let Some(h) = self.hubs().filter(|h| floor + self.shrink() >= h.radius) {
+            return Some(Issue::error(format!(
+                "The keyway cuts through the Ø{} hub; the keyway is left off.",
+                len(2.0 * h.radius)
+            )));
+        }
+        if floor >= self.root_radius() - HUB_CLEARANCE {
+            return Some(Issue::error("The keyway cuts through the teeth; the keyway is left off."));
+        }
+        None
+    }
+
+    /// The keyway as made, or None when there is none or it cannot be made
+    /// (`issues` says why). Printed, its walls are drawn in by `shrink`
+    /// like every other surface, so it comes out wider and deeper.
+    pub fn keyway(&self) -> Option<Keyway> {
+        if !self.keyway || !self.is_flat() || self.keyway_fault(&|v| v.to_string()).is_some() {
+            return None;
+        }
+        Some(Keyway { width: self.key_width + self.nozzle / 2.0, floor: self.bore / 2.0 + self.key_depth + self.shrink() })
+    }
+
+    /// The bore's outline as made, anticlockwise from the keyway's edge,
+    /// the arc in steps of at most `max_step` radians; None without a bore.
+    /// With a keyway the loop leaves the circle at ±θ for the notch out to
+    /// the floor, so its azimuth rises all the way round.
+    pub fn bore_loop(&self, max_step: f64) -> Option<Vec<[f64; 2]>> {
+        let r = self.hole() / 2.0;
+        if r <= 0.0 {
+            return None;
+        }
+        let k = self.keyway();
+        let theta = k.map_or(0.0, |k| (k.width / 2.0 / r).clamp(-1.0, 1.0).asin());
+        let sweep = TAU - 2.0 * theta;
+        let n = (sweep / max_step.max(1e-3)).ceil().max(3.0) as usize;
+        let mut out: Vec<[f64; 2]> = (0..=n).map(|i| polar(r, theta + sweep * i as f64 / n as f64)).collect();
+        match k {
+            Some(k) => {
+                let (xc, hw) = ((r * r - k.width * k.width / 4.0).max(0.0).sqrt(), k.width / 2.0);
+                out[0] = [xc, hw];
+                *out.last_mut().unwrap() = [xc, -hw];
+                out.push([k.floor, -hw]);
+                out.push([k.floor, hw]);
+            }
+            None => {
+                out.pop();
+            }
+        }
+        Some(out)
+    }
+
+    /// A keyed bore as a closed clockwise (vertex, bulge) path, for
+    /// export: the circle as two arcs from the notch round to it, then the
+    /// notch. None without a keyway as made.
+    pub fn bore_path(&self) -> Option<Vec<([f64; 2], f64)>> {
+        let k = self.keyway()?;
+        let r = self.hole() / 2.0;
+        let hw = k.width / 2.0;
+        let xc = (r * r - hw * hw).max(0.0).sqrt();
+        let theta = (hw / r).clamp(-1.0, 1.0).asin();
+        let bulge = -((PI - theta) / 4.0).tan();
+        Some(vec![([xc, -hw], bulge), ([-r, 0.0], bulge), ([xc, hw], 0.0), ([k.floor, hw], 0.0), ([k.floor, -hw], 0.0)])
+    }
+
+    /// The biggest hub Ø: just inside the root circle.
+    pub fn max_hub_diameter(&self) -> f64 {
+        2.0 * self.root_radius() - HUB_CLEARANCE
+    }
+
+    /// Why the hub as set cannot be made, if it cannot.
+    fn hub_fault(&self, len: &dyn Fn(f64) -> String) -> Option<Issue> {
+        if self.hub == Hub::None || !self.is_flat() {
+            return None;
+        }
+        if self.hub_thickness <= 0.0 {
+            return Some(Issue::error("Hub thickness must be more than 0; the hub is left off."));
+        }
+        if self.hub_diameter - self.nozzle / 2.0 <= self.hole() {
+            return Some(Issue::error(format!(
+                "Hub Ø must be more than the bore Ø {}; the hub is left off.",
+                len(self.hole())
+            )));
+        }
+        if self.hub_diameter > self.max_hub_diameter() {
+            return Some(Issue::error(format!(
+                "Hub Ø must stay inside the root circle, at most {}; the hub is left off.",
+                len(self.max_hub_diameter())
+            )));
+        }
+        None
+    }
+
+    /// The hub(s) as made, or None when there is none or it cannot be
+    /// made (`issues` says why). Printed, the hub's wall is drawn in by
+    /// `shrink` like every other surface.
+    pub fn hubs(&self) -> Option<Hubs> {
+        if self.hub == Hub::None || !self.is_flat() || self.hub_fault(&|v| v.to_string()).is_some() {
+            return None;
+        }
+        let t = self.hub_thickness;
+        Some(Hubs {
+            radius: self.hub_diameter / 2.0 - self.shrink(),
+            below: if self.hub.bottom() { t } else { 0.0 },
+            above: if self.hub.top() { t } else { 0.0 },
+        })
+    }
+
+    /// Along its own axis, where a flat part (spur gear or pulley) starts
+    /// and ends: its back face at 0 and its front at the face width, or
+    /// its hubs beyond them.
+    pub fn ends(&self) -> (f64, f64) {
+        let (below, above) = self.hubs().map_or((0.0, 0.0), |h| (h.below, h.above));
+        (-below, self.face_width + above)
+    }
+
     /// Dedendum coefficient as cut: deep enough that the fillet rises no
     /// higher than the mate's tips reach (the rack's straight flank runs
     /// down past them), so a big ball deepens the roots. ISO's 0.38 m
@@ -448,6 +731,8 @@ impl GearParams {
             if self.bore > 0.0 && self.bore / 2.0 >= self.root_radius() - 0.5 * groove {
                 out.push(Issue::warn("Bore leaves almost no material under the grooves."));
             }
+            out.extend(self.hub_fault(&len));
+            out.extend(self.keyway_fault(&len));
             return out;
         }
         if !self.is_buildable() {
@@ -480,6 +765,8 @@ impl GearParams {
         if self.bore > 0.0 && self.bore / 2.0 >= self.root_radius() - 0.5 * self.module {
             out.push(Issue::warn("Bore leaves almost no material under the teeth."));
         }
+        out.extend(self.hub_fault(&len));
+        out.extend(self.keyway_fault(&len));
         out
     }
 }
@@ -779,20 +1066,35 @@ pub fn fill_mesh(p: &GearParams, prof: &Profile) -> FillMesh {
     let mut tris = Vec::new();
 
     // Hub. Vertices sit slightly outside the root circle so the chords
-    // between them do not leave slivers along the root arcs.
+    // between them do not leave slivers along the root arcs. The inner
+    // edge is the bore with its keyway, its azimuth rising all the way
+    // round; the outer arc over each of its edges is stepped no coarser
+    // than that (the keyway floor spans a wide one).
     let segs = (z * 8).max(96);
+    let step = TAU / segs as f64;
     let r_out = prof.radii[0] / (PI / segs as f64).cos();
-    let r_in = (p.hole() / 2.0).clamp(0.0, prof.radii[0] * 0.98);
-    if r_in > 0.0 {
-        for i in 0..segs {
-            let a = i as f64 * TAU / segs as f64;
-            verts.push(polar(r_in, a));
-            verts.push(polar(r_out, a));
-        }
-        for i in 0..segs as u32 {
-            let j = (i + 1) % segs as u32;
-            tris.push([2 * i, 2 * i + 1, 2 * j + 1]);
-            tris.push([2 * i, 2 * j + 1, 2 * j]);
+    let hole = p.bore_loop(step).filter(|_| p.hole() / 2.0 < prof.radii[0] * 0.98);
+    if let Some(hole) = hole {
+        let n = hole.len();
+        let az = |q: [f64; 2]| q[1].atan2(q[0]);
+        for i in 0..n {
+            let (a, b) = (hole[i], hole[(i + 1) % n]);
+            let (a0, mut a1) = (az(a), az(b));
+            if a1 < a0 {
+                a1 += TAU;
+            }
+            let k = ((a1 - a0) / step).ceil().max(1.0) as usize;
+            let (ia, ib) = (verts.len() as u32, verts.len() as u32 + 1);
+            verts.push(a);
+            verts.push(b);
+            let first = verts.len() as u32;
+            for s in 0..=k {
+                verts.push(polar(r_out, a0 + (a1 - a0) * s as f64 / k as f64));
+            }
+            for s in 0..k as u32 {
+                tris.push([ia, first + s, first + s + 1]);
+            }
+            tris.push([ia, first + k as u32, ib]);
         }
     } else {
         verts.push([0.0, 0.0]);
@@ -954,6 +1256,66 @@ pub(crate) fn ball_fits_space(pts: &[[f64; 2]], ball: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_keys_follow_the_bore() {
+        assert_eq!(standard_key(8.0, false), Some((2.0, 2.0, 1.0)));
+        assert_eq!(standard_key(9.0, false), Some((3.0, 3.0, 1.4)));
+        assert_eq!(standard_key(20.0, false), Some((6.0, 6.0, 2.8)));
+        assert_eq!(standard_key(5.0, false), None);
+        assert_eq!(standard_key(200.0, false), None);
+        // ANSI: a 1/8 in square key for a 1/2 in shaft, its half depth
+        // deepened by the chordal height on the centreline.
+        let (b, h, t) = standard_key(12.7, true).unwrap();
+        assert!((b - 3.175).abs() < 1e-9 && b == h);
+        let chord = 6.35 - (6.35f64.powi(2) - 1.5875f64.powi(2)).sqrt();
+        assert!((t - (1.5875 + chord)).abs() < 1e-9);
+        assert_eq!(standard_key(5.0, true), None);
+    }
+
+    #[test]
+    fn keyed_bore_loop_and_path_agree() {
+        let mut g = GearParams { keyway: true, key_standard: false, key_width: 3.0, key_depth: 1.4, ..Default::default() };
+        let k = g.keyway().unwrap();
+        assert_eq!((k.width, k.floor), (3.0, 5.4));
+        let lp = g.bore_loop(0.002).unwrap();
+        let area = |lp: &[[f64; 2]]| {
+            (0..lp.len()).map(|i| {
+                let (a, b) = (lp[i], lp[(i + 1) % lp.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            }).sum::<f64>() / 2.0
+        };
+        // Anticlockwise, azimuth rising all the way round (wrapping once).
+        assert!(area(&lp) > 0.0);
+        let az: Vec<f64> = lp.iter().map(|q| q[1].atan2(q[0]).rem_euclid(TAU)).collect();
+        assert_eq!(az.windows(2).filter(|w| w[1] < w[0]).count(), 1, "{az:?}");
+        // The circle less the segment under the notch, plus the notch.
+        let (r, hw) = (4.0f64, 1.5f64);
+        let xc = (r * r - hw * hw).sqrt();
+        let theta = (hw / r).asin();
+        let want = PI * r * r - (r * r * theta - xc * hw) + 2.0 * hw * (5.4 - xc);
+        assert!((area(&lp) - want).abs() < 1e-3, "{} vs {want}", area(&lp));
+        // The export path is the same shape, clockwise.
+        let path = g.bore_path().unwrap();
+        let pts = crate::view3d::sample_path(&path, 0.002);
+        assert!((area(&pts) + want).abs() < 1e-3, "{} vs {want}", area(&pts));
+        // Printed, the keyway comes out wider and deeper by the nozzle.
+        g.nozzle = 0.4;
+        let k = g.keyway().unwrap();
+        assert!((k.width - 3.2).abs() < 1e-9 && (k.floor - 5.5).abs() < 1e-9);
+        // A keyway through the hub or the teeth is refused.
+        g.nozzle = 0.0;
+        g.hub = Hub::Both;
+        g.hub_diameter = 10.0;
+        g.hub_thickness = 3.0;
+        assert!(g.keyway().is_none() && g.hubs().is_some());
+        g.hub = Hub::None;
+        g.key_depth = 30.0;
+        assert!(g.keyway().is_none());
+        g.key_depth = 1.4;
+        g.key_width = 8.0;
+        assert!(g.keyway().is_none());
+    }
 
     /// Distance from `q` to the closed polyline `lp`.
     fn dist_to(q: [f64; 2], lp: &[[f64; 2]]) -> f64 {

@@ -5,7 +5,7 @@ use crate::view3d;
 use crate::worm;
 use crate::export::{self, place};
 use crate::mesh;
-use crate::gear::{self, FillMesh, GearParams, Issue, Level, ToothStandard};
+use crate::gear::{self, FillMesh, GearParams, Hub, Issue, Level, ToothStandard};
 use crate::pulley::{self, BeltSection};
 use crate::reach;
 use crate::train::{self, Datum, Gear, Link, Placement, PitchUnit, Project, STD_DPS, STD_MODULES, Solved};
@@ -1250,7 +1250,7 @@ impl GearCraftApp {
             let mut r = g.params.tip_radius().max(1.0);
             let (mut z0, mut z1) = match BevelGeom::new(&g.params) {
                 Some(b) => (b.front_face().0, b.back(b.tip) * b.tip.cos()),
-                None => (0.0, g.params.face_width),
+                None => g.params.ends(),
             };
             // Generated teeth are only known once made.
             if let Some(c) = self.cache.get(&g.id).filter(|_| g.params.is_generated()) {
@@ -1458,8 +1458,12 @@ impl GearCraftApp {
                 selected_outline = Some(pts.clone());
             }
             painter.add(Shape::closed_line(pts, Stroke::new(1.0, edge)));
-            if g.params.bore > 0.0 {
-                painter.circle_stroke(center, (g.params.hole() / 2.0 * self.view.scale) as f32, Stroke::new(1.0, edge));
+            if let Some(hole) = g.params.bore_loop(0.1) {
+                let pts: Vec<Pos2> = hole.iter().map(|&q| self.to_screen(rect, place(q, s.center, rot))).collect();
+                painter.add(Shape::closed_line(pts, Stroke::new(1.0, edge)));
+            }
+            if let Some(h) = g.params.hubs() {
+                painter.circle_stroke(center, (h.radius * self.view.scale) as f32, Stroke::new(1.0, edge.gamma_multiply(0.5)));
             }
             // Arbor mark, plus a tick so rotation is visible on plain gears.
             let tick = (ra_px * 0.15).clamp(3.0, 10.0);
@@ -2479,6 +2483,38 @@ impl GearCraftApp {
                         ));
                     }
                     ui.end_row();
+                    if g.params.is_flat() && g.params.bore > 0.0 {
+                        let standard = if unit.is_inch() { "ANSI B17.1" } else { "DIN 6885" };
+                        ui.label("Keyway");
+                        ui.checkbox(&mut g.params.keyway, "")
+                            .on_hover_text("A keyway along the bore, centred on tooth 0 (+X), and through the hubs.");
+                        ui.end_row();
+                        if g.params.keyway {
+                            ui.label("Key size");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut g.params.key_standard, true, standard)
+                                    .on_hover_text("The parallel key the standard gives for this bore.");
+                                ui.selectable_value(&mut g.params.key_standard, false, "Custom");
+                            });
+                            ui.end_row();
+                            g.params.apply_key_standard(unit.is_inch());
+                            if g.params.key_standard {
+                                let p = &g.params;
+                                let key = gear::standard_key(p.bore, unit.is_inch())
+                                    .map_or("none for this bore".to_string(), |(b, h, _)| format!("{} × {}", len(b, unit), len(h, unit)));
+                                value_row(ui, "Key", key);
+                                value_row_tip(ui, "Keyway depth", len(p.key_depth, unit), "From the bore circle to the keyway floor, on the centreline.");
+                            } else {
+                                ui.label("Key width");
+                                len_drag(ui, &mut g.params.key_width, unit, 0.0..=10000.0, 0.1);
+                                ui.end_row();
+                                ui.label("Keyway depth");
+                                len_drag(ui, &mut g.params.key_depth, unit, 0.0..=10000.0, 0.1)
+                                    .on_hover_text("From the bore circle to the keyway floor, on the centreline.");
+                                ui.end_row();
+                            }
+                        }
+                    }
                     if g.params.hypoid != Some(Role::Pinion) {
                         let thread = g.params.worm_drive == Some(worm::Role::Worm);
                         ui.label(if thread { "Thread length" } else { "Face width" });
@@ -2491,6 +2527,47 @@ impl GearCraftApp {
                             r.on_hover_text("A throated wheel's face is usually about ¾ of the worm's outside diameter.");
                         }
                         ui.end_row();
+                    }
+                    if g.params.is_flat() {
+                        ui.label("Hub");
+                        let before = g.params.hub;
+                        egui::ComboBox::from_id_salt("hub")
+                            .selected_text(g.params.hub.label())
+                            .show_ui(ui, |ui| {
+                                for h in [Hub::None, Hub::Bottom, Hub::Top, Hub::Both] {
+                                    ui.selectable_value(&mut g.params.hub, h, h.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "A cylinder about the bore standing out from the face: on the bottom face (the back, \
+                                 at Z 0 as exported), the top face, or both.",
+                            );
+                        if before == Hub::None && g.params.hub != Hub::None {
+                            // Starting sizes for a hub just switched on: twice the
+                            // bore (or half the root circle), half the face.
+                            let p = &mut g.params;
+                            if p.hub_diameter <= 0.0 {
+                                let d = if p.bore > 0.0 { 2.0 * p.bore } else { p.root_radius() };
+                                p.hub_diameter = shown_floor(d.min(p.max_hub_diameter()), unit);
+                            }
+                            if p.hub_thickness <= 0.0 {
+                                p.hub_thickness = shown_floor((p.face_width / 2.0).max(0.1), unit);
+                            }
+                        }
+                        ui.end_row();
+                        if g.params.hub != Hub::None {
+                            ui.label("Hub Ø");
+                            len_drag(ui, &mut g.params.hub_diameter, unit, 0.0..=10000.0, 0.1).on_hover_text(format!(
+                                "More than the bore and inside the root circle: at most {}.",
+                                len(g.params.max_hub_diameter(), unit)
+                            ));
+                            ui.end_row();
+                            ui.label("Hub thickness");
+                            len_drag(ui, &mut g.params.hub_thickness, unit, 0.0..=10000.0, 0.1)
+                                .on_hover_text("How far the hub stands out from its face, each side.");
+                            ui.end_row();
+                        }
                     }
                 });
             });
@@ -2759,7 +2836,8 @@ impl GearCraftApp {
                     len_drag(ui, &mut g.axial, unit, -10000.0..=10000.0, 0.1).on_hover_text(hint);
                     ui.end_row();
                     if !g.params.is_bevel() && !g.params.is_hypoid() {
-                        value_row(ui, "Faces at", format!("{} … {}", len(s.z, unit), len(s.z + g.params.face_width, unit)));
+                        let (lo, hi) = g.params.ends();
+                        value_row(ui, "Faces at", format!("{} … {}", len(s.z + lo, unit), len(s.z + hi, unit)));
                     }
                 }); }
             });
@@ -3018,6 +3096,9 @@ impl GearCraftApp {
                         value_row(ui, "Pitch line differential", fmt(rack.pld));
                         value_row(ui, "Min face, flanged", fmt(w.flanged));
                         value_row(ui, "Min face, unflanged", fmt(w.unflanged));
+                        if let Some(h) = p.hubs() {
+                            value_row(ui, "Length over hubs", fmt(h.below + p.face_width + h.above));
+                        }
                     });
                     return;
                 }
@@ -3048,6 +3129,9 @@ impl GearCraftApp {
                     value_row(ui, "Tooth thickness", fmt(p.pitch_thickness()));
                     value_row(ui, "Tip land", fmt(p.thickness_at(p.tip_radius()).max(0.0)));
                     value_row(ui, "Whole depth", fmt(p.tip_radius() - p.root_radius()));
+                    if let Some(h) = p.hubs() {
+                        value_row(ui, "Length over hubs", fmt(h.below + p.face_width + h.above));
+                    }
                     value_row(ui, "Min shift (no undercut)", format!("{:.3}", p.min_shift_no_undercut()));
                     if unit.is_inch() {
                         value_row(ui, "Module (equivalent)", format!("{:.4} mm", p.module));

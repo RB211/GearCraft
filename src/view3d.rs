@@ -49,6 +49,42 @@ impl Solid {
         }
     }
 
+    /// A flat ring at height z, facing +z or -z, from a circle about the
+    /// axis in to a loop whose azimuth rises all the way round (the bore,
+    /// keyway and all), the outer arc stepped finely over a wide edge such
+    /// as the keyway floor; a disc without one.
+    fn annulus(&mut self, r_out: f64, inner: Option<&[[f64; 2]]>, z: f64, up: bool) {
+        let nrm = [0.0, 0.0, if up { 1.0 } else { -1.0 }];
+        let at = |r: f64, a: f64| [r * a.cos(), r * a.sin(), z];
+        match inner {
+            Some(lp) => {
+                for i in 0..lp.len() {
+                    let (p, q) = (lp[i], lp[(i + 1) % lp.len()]);
+                    let (a0, mut a1) = (p[1].atan2(p[0]), q[1].atan2(q[0]));
+                    if a1 < a0 {
+                        a1 += TAU;
+                    }
+                    let k = ((a1 - a0) / 0.1).ceil().max(1.0) as usize;
+                    let (ip, iq) = (self.vert([p[0], p[1], z]), self.vert([q[0], q[1], z]));
+                    let outer: Vec<u32> =
+                        (0..=k).map(|s| self.vert(at(r_out, a0 + (a1 - a0) * s as f64 / k as f64))).collect();
+                    for s in 0..k {
+                        self.tris.push(([ip, outer[s], outer[s + 1]], nrm));
+                    }
+                    self.tris.push(([ip, outer[k], iq], nrm));
+                }
+            }
+            None => {
+                let n = 64;
+                for i in 0..n {
+                    let (a0, a1) = (i as f64 * TAU / n as f64, (i + 1) as f64 * TAU / n as f64);
+                    let (ia, ib, ic) = (self.vert(at(r_out, a0)), self.vert(at(r_out, a1)), self.vert([0.0, 0.0, z]));
+                    self.tris.push(([ia, ib, ic], nrm));
+                }
+            }
+        }
+    }
+
     /// A planar cap from a 2D triangulation, at height z facing +z or -z.
     fn cap(&mut self, verts: &[[f64; 2]], tris: &[[u32; 3]], z: f64, up: bool) {
         let base = self.verts.len() as u32;
@@ -92,24 +128,37 @@ pub fn sample_path(path: &[([f64; 2], f64)], max_step: f64) -> Vec<[f64; 2]> {
 }
 
 /// A spur gear or pulley: its outline (arc-fitted, then sampled coarsely
-/// enough to stay light) as walls, the bore, and the fill mesh as caps.
+/// enough to stay light) as walls, the bore, the fill mesh as caps, and
+/// any hub as a cylinder standing on its face, closed by a flat ring down
+/// to the bore (the cap under it is hidden).
 pub fn gear_solid(p: &GearParams, prof: &Profile, fill: &FillMesh) -> Solid {
     let outline = gear::outline(p, prof);
     let path = export::fit_arcs(&outline, export::tolerance(p.module) * 20.0);
     let lp = sample_path(&path, 0.35);
     let h = p.face_width.max(0.01);
+    let hubs = p.hubs();
+    let (below, above) = hubs.map_or((0.0, 0.0), |x| (x.below, x.above));
     let mut s = Solid::default();
     s.walls(&lp, 0.0, h, true);
-    let hole = p.hole();
-    if hole > 0.0 {
-        let r = hole / 2.0;
-        let n = 64;
-        let hole: Vec<[f64; 2]> =
-            (0..n).map(|i| i as f64 * TAU / n as f64).map(|a| [r * a.cos(), r * a.sin()]).collect();
-        s.walls(&hole, 0.0, h, false);
+    let n = 64;
+    let circle = |r: f64| -> Vec<[f64; 2]> { (0..n).map(|i| i as f64 * TAU / n as f64).map(|a| [r * a.cos(), r * a.sin()]).collect() };
+    let hole = p.bore_loop(TAU / n as f64);
+    if let Some(hole) = &hole {
+        s.walls(hole, -below, h + above, false);
     }
     s.cap(&fill.verts, &fill.tris, h, true);
     s.cap(&fill.verts, &fill.tris, 0.0, false);
+    if let Some(x) = hubs {
+        let rim = circle(x.radius);
+        if x.below > 0.0 {
+            s.walls(&rim, -x.below, 0.0, true);
+            s.annulus(x.radius, hole.as_deref(), -x.below, false);
+        }
+        if x.above > 0.0 {
+            s.walls(&rim, h, h + x.above, true);
+            s.annulus(x.radius, hole.as_deref(), h + x.above, true);
+        }
+    }
     s
 }
 

@@ -470,12 +470,13 @@ pub fn pair_spec(driver: &GearParams, driven: &GearParams, placement: &Placement
 }
 
 /// Along its own axis, where a part starts and ends relative to its frame
-/// origin: a spur gear or pulley from its back face, a bevel gear from its
-/// apex (front face to back face).
-fn axial_extent(p: &GearParams) -> (f64, f64) {
+/// origin: a spur gear or pulley from its back face (or the hub below it)
+/// to its front face (or the hub above), a bevel gear from its apex (front
+/// face to back face).
+pub fn axial_extent(p: &GearParams) -> (f64, f64) {
     match BevelGeom::new(p) {
         Some(g) => (g.front_face().0, g.back_face().0),
-        None => (0.0, p.face_width),
+        None => p.ends(),
     }
 }
 
@@ -856,6 +857,7 @@ impl Project {
                 }
             }
             self.gears[i].params.apply_standard();
+            self.gears[i].params.apply_key_standard(self.pitch_unit.is_inch());
         }
         self.next_id = self.next_id.max(self.gears.iter().map(|g| g.id + 1).max().unwrap_or(1));
     }
@@ -1550,6 +1552,20 @@ mod tests {
         p.gears[2].axial = 1.5;
         let s = p.solve();
         assert_eq!(s[3].z, 11.5);
+    }
+
+    #[test]
+    fn hubs_push_stacked_parts_along_the_shaft() {
+        use crate::gear::Hub;
+        let mut p = Project::empty();
+        let a = p.add_root(GearParams { face_width: 10.0, hub: Hub::Top, hub_diameter: 16.0, hub_thickness: 3.0, ..Default::default() }, 0.0, 0.0);
+        let b = p.add_child(a, GearParams { teeth: 12, face_width: 8.0, hub: Hub::Bottom, hub_diameter: 12.0, hub_thickness: 2.0, ..Default::default() }, Link::Axle);
+        // A meshing part is centred on its mate's teeth, hubs or not.
+        p.add_child(b, GearParams { teeth: 48, face_width: 4.0, hub: Hub::Both, hub_diameter: 16.0, hub_thickness: 5.0, ..Default::default() }, Link::Mesh);
+        p.normalize();
+        let s = p.solve();
+        assert_eq!(s.iter().map(|s| s.z).collect::<Vec<_>>(), [0.0, 15.0, 17.0]);
+        assert_eq!(axial_extent(&p.gears[2].params), (-5.0, 9.0));
     }
 
     fn deg(p: &Project, i: usize) -> f64 {

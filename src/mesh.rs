@@ -160,15 +160,22 @@ impl Mesh {
         self.face(&tris, out);
     }
 
-    /// The wall between two rings of vertices one above the other.
+    /// The wall between two rings of vertices one above the other: a
+    /// bore, out of the material being into the hole, towards the axis.
     fn bore(&mut self, lo: &[u32], hi: &[u32]) {
+        self.wall(lo, hi, false);
+    }
+
+    /// The wall between two rings of vertices one above the other, round
+    /// the axis: the outside of a cylinder (`outward`) or the inside of a
+    /// hole.
+    fn wall(&mut self, lo: &[u32], hi: &[u32], outward: bool) {
         let n = lo.len();
+        let s = if outward { 1.0 } else { -1.0 };
         for i in 0..n {
             let j = (i + 1) % n;
             let p = self.verts[lo[i] as usize];
-            // Out of the material is into the hole, towards the axis.
-            let out = [-p[0], -p[1], 0.0];
-            self.face(&[[lo[i], lo[j], hi[j]], [lo[i], hi[j], hi[i]]], out);
+            self.face(&[[lo[i], lo[j], hi[j]], [lo[i], hi[j], hi[i]]], [s * p[0], s * p[1], 0.0]);
         }
     }
 
@@ -277,19 +284,12 @@ impl Mesh {
 
 // ---- spur gears and pulleys -------------------------------------------------
 
-/// A spur gear or pulley: the arc-fitted outline extruded through the
-/// face width, the bore through it. Each end face is filled a tooth at a
-/// time, between rays from the bore through the middle of each space.
-fn spur(p: &GearParams) -> Option<Mesh> {
-    let prof = gear::tooth_profile(p)?;
-    let path = fit_arcs(&gear::outline(p, &prof), tolerance(p.module));
-    let mut lp = sample_path(&path, 0.05);
-    if signed_area(&lp) < 0.0 {
-        lp.reverse();
-    }
-    let z = p.teeth as usize;
+/// A closed anticlockwise loop with a vertex put where each ray from the
+/// origin through the middle of each of `z` spaces first meets it, and
+/// each ray's vertex index. None if a ray misses the loop.
+fn cut_by_rays(lp: &[[f64; 2]], z: usize) -> Option<(Vec<[f64; 2]>, Vec<usize>)> {
     let pitch = TAU / z as f64;
-    // Split the outline where each ray first meets it.
+    // Split the loop where each ray first meets it.
     let mut cuts: Vec<(usize, [f64; 2])> = Vec::new();
     for t in 0..z {
         let a = (t as f64 + 0.5) * pitch;
@@ -311,7 +311,15 @@ fn spur(p: &GearParams) -> Option<Mesh> {
             }
         }
         let (_, i, q) = best?;
-        cuts.push((i, q));
+        // A ray through a vertex of the loop takes that vertex rather than
+        // doubling it (a zero-length edge would turn its wall inside out).
+        let j = (i + 1) % lp.len();
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-9;
+        if near(q, lp[j]) {
+            cuts.push((j, lp[j]));
+        } else {
+            cuts.push((i, q));
+        }
     }
     // The outline with the cut points in, and where each landed.
     let mut outline: Vec<[f64; 2]> = Vec::with_capacity(lp.len() + z);
@@ -330,11 +338,31 @@ fn spur(p: &GearParams) -> Option<Mesh> {
     for (i, &q) in lp.iter().enumerate() {
         outline.push(q);
         while next < z && cuts[order[next]].0 == i {
-            at[order[next]] = outline.len();
-            outline.push(cuts[order[next]].1);
+            let c = cuts[order[next]].1;
+            if c != q {
+                outline.push(c);
+            }
+            at[order[next]] = outline.len() - 1;
             next += 1;
         }
     }
+    Some((outline, at))
+}
+
+/// A spur gear or pulley: the arc-fitted outline extruded through the
+/// face width, the bore (with its keyway) through it, and any hub standing
+/// on an end face, closed by a flat ring down to the bore. Each end face
+/// is filled a tooth at a time, between rays from the bore (or the hub)
+/// through the middle of each space.
+fn spur(p: &GearParams) -> Option<Mesh> {
+    let prof = gear::tooth_profile(p)?;
+    let path = fit_arcs(&gear::outline(p, &prof), tolerance(p.module));
+    let mut lp = sample_path(&path, 0.05);
+    if signed_area(&lp) < 0.0 {
+        lp.reverse();
+    }
+    let z = p.teeth as usize;
+    let (outline, at) = cut_by_rays(&lp, z)?;
     let h = p.face_width.max(0.01);
     let mut m = Mesh::default();
     let n = outline.len();
@@ -346,31 +374,52 @@ fn spur(p: &GearParams) -> Option<Mesh> {
         let out = [b[1] - a[1], a[0] - b[0], 0.0];
         m.face(&[[bottom[i], bottom[j], top[j]], [bottom[i], top[j], top[i]]], out);
     }
-    // The bore, with a vertex on every ray.
+    // The bore with its keyway, a vertex on every ray, through the hubs
+    // too; without a bore, a point on the axis at each end.
     let rb = p.hole() / 2.0;
-    let per = (circle_segments(rb.max(1.0)) / z).max(2);
-    let ring = |m: &mut Mesh, zz: f64| -> Vec<u32> {
-        if rb <= 0.0 {
-            return vec![m.v([0.0, 0.0, zz]); 1];
-        }
-        (0..z * per)
-            .map(|k| {
-                let a = 0.5 * pitch + pitch * k as f64 / per as f64;
-                m.v([rb * a.cos(), rb * a.sin(), zz])
-            })
-            .collect()
+    let hubs = p.hubs();
+    let (below, above) = hubs.map_or((0.0, 0.0), |x| (x.below, x.above));
+    let hole = match p.bore_loop(TAU / circle_segments(rb.max(1.0)) as f64) {
+        Some(l) => Some(cut_by_rays(&l, z)?),
+        None => None,
     };
-    let (hole0, hole1) = (ring(&mut m, 0.0), ring(&mut m, h));
-    if rb > 0.0 {
+    let circle = |r: f64| -> Vec<[f64; 2]> {
+        let k = circle_segments(r);
+        (0..k).map(|i| i as f64 * TAU / k as f64).map(|a| [r * a.cos(), r * a.sin()]).collect()
+    };
+    let hub_ring = match hubs {
+        Some(x) => Some(cut_by_rays(&circle(x.radius), z)?),
+        None => None,
+    };
+    let loop_at = |m: &mut Mesh, pts: &[[f64; 2]], zz: f64| -> Vec<u32> { pts.iter().map(|q| m.v([q[0], q[1], zz])).collect() };
+    let (hole0, hole1) = match &hole {
+        Some((l, _)) => (loop_at(&mut m, l, -below), loop_at(&mut m, l, h + above)),
+        None => (vec![m.v([0.0, 0.0, -below])], vec![m.v([0.0, 0.0, h + above])]),
+    };
+    if hole.is_some() {
         m.bore(&hole0, &hole1);
     }
-    for (rim, hole, up) in [(&bottom, &hole0, false), (&top, &hole1, true)] {
+    let hole_at: Vec<usize> = hole.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+    // The inner edge of each end face, with each ray's vertex in it: the
+    // hub standing on the face, whose far end is a flat ring down to the
+    // bore, or else the bore itself.
+    let inner = |m: &mut Mesh, zz: f64, stand: f64, hole_ring: &Vec<u32>, up: bool| -> (Vec<u32>, Vec<usize>) {
+        let Some((pts, hat)) = hub_ring.as_ref().filter(|_| stand > 0.0) else {
+            return (hole_ring.clone(), hole_at.clone());
+        };
+        let far = if up { zz + stand } else { zz - stand };
+        let (foot, end) = (loop_at(m, pts, zz), loop_at(m, pts, far));
+        m.wall(&foot, &end, true);
+        m.annulus(&end, hole.as_ref().map(|_| hole_ring.as_slice()), [0.0, 0.0, if up { 1.0 } else { -1.0 }]);
+        (foot, hat.clone())
+    };
+    let (in0, in1) = (inner(&mut m, 0.0, below, &hole0, false), inner(&mut m, h, above, &hole1, true));
+    for (rim, (edge, eat), up) in [(&bottom, &in0, false), (&top, &in1, true)] {
         let out = [0.0, 0.0, if up { 1.0 } else { -1.0 }];
+        let ni = edge.len();
         for t in 0..z {
             let (o0, o1) = (at[t], at[(t + 1) % z]);
-            let mut idx = Vec::new();
-            let foot = |k: usize| if rb > 0.0 { hole[(k * per) % hole.len()] } else { hole[0] };
-            idx.push(foot(t));
+            let mut idx = vec![if ni > 1 { edge[eat[t]] } else { edge[0] }];
             let mut i = o0;
             loop {
                 idx.push(rim[i]);
@@ -379,12 +428,14 @@ fn spur(p: &GearParams) -> Option<Mesh> {
                 }
                 i = (i + 1) % n;
             }
-            if rb > 0.0 {
-                // Back along the bore to the start.
-                for k in (0..=per).rev() {
-                    idx.push(hole[(t * per + k) % hole.len()]);
+            if ni > 1 {
+                // Back along the inner edge to the start.
+                let (e0, e1) = (eat[t], eat[(t + 1) % z]);
+                let mut i = e1;
+                while i != e0 {
+                    idx.push(edge[i]);
+                    i = (i + ni - 1) % ni;
                 }
-                idx.pop();
             }
             m.polygon(&idx, |q| [q[0], q[1]], out);
         }
@@ -816,6 +867,7 @@ fn zip(files: &[(&str, &[u8])]) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gear::Hub;
     use crate::hypoid::Role;
     use crate::train::{Link, PitchUnit};
     use crate::worm;
@@ -842,11 +894,13 @@ mod tests {
     fn project() -> Project {
         let u = PitchUnit::Module;
         let mut p = Project::empty();
-        let a = p.add_root(u.starter(24), 0.0, 0.0);
-        p.add_child(a, u.starter(12), Link::Mesh);
-        let solid = p.add_root(GearParams { bore: 0.0, ..u.starter(17) }, 0.0, 120.0);
+        let a = p.add_root(GearParams { hub: Hub::Both, hub_diameter: 20.0, hub_thickness: 6.0, keyway: true, ..u.starter(24) }, 0.0, 0.0);
+        // A key wide enough that its notch spans several teeth' sectors.
+        p.add_child(a, GearParams { keyway: true, key_standard: false, key_width: 6.0, key_depth: 2.5, ..u.starter(12) }, Link::Mesh);
+        // No bore, and a hub on one face only.
+        let solid = p.add_root(GearParams { bore: 0.0, hub: Hub::Top, hub_diameter: 12.0, hub_thickness: 5.0, ..u.starter(17) }, 0.0, 120.0);
         let _ = solid;
-        let q = p.add_root(u.starter_pulley(20), 300.0, 0.0);
+        let q = p.add_root(GearParams { hub: Hub::Bottom, hub_diameter: 14.0, hub_thickness: 8.0, keyway: true, ..u.starter_pulley(20) }, 300.0, 0.0);
         p.add_child(q, u.starter_pulley(30), Link::Belt);
         let b = p.add_root(u.starter_bevel(20), 0.0, -200.0);
         p.add_child(b, u.starter_bevel(40), Link::Bevel);
@@ -945,6 +999,28 @@ mod tests {
         let prof = gear::tooth_profile(&g).unwrap();
         let area = signed_area(&gear::outline(&g, &prof)).abs() - PI * (g.bore / 2.0).powi(2);
         let want = area * g.face_width;
+        assert!((m.volume() - want).abs() / want < 1e-3, "{} vs {want}", m.volume());
+        // With hubs: a ring of material on each face, the bore through it.
+        let g = GearParams { hub: Hub::Both, hub_diameter: 20.0, hub_thickness: 6.0, ..g };
+        let m = spur(&g).unwrap();
+        assert_watertight(&m, "hubbed");
+        let want = want + PI * (10.0f64.powi(2) - (g.bore / 2.0).powi(2)) * 12.0;
+        assert!((m.volume() - want).abs() / want < 1e-3, "{} vs {want}", m.volume());
+        let z = m.verts.iter().map(|v| v[2]);
+        assert_eq!((z.clone().fold(f64::MAX, f64::min), z.fold(f64::MIN, f64::max)), (-6.0, g.face_width + 6.0));
+        // A hub too big for the root circle is left off.
+        let g = GearParams { hub_diameter: 2.0 * g.root_radius(), ..g };
+        assert!(g.hubs().is_none());
+        let m = spur(&g).unwrap();
+        assert!((m.volume() - area * g.face_width).abs() / want < 1e-3);
+        // A keyway through the bore and both hubs takes its notch out of
+        // every section.
+        let g = GearParams { hub_diameter: 20.0, keyway: true, key_standard: false, key_width: 3.0, key_depth: 1.4, ..g };
+        let m = spur(&g).unwrap();
+        assert_watertight(&m, "keyed");
+        let hole = signed_area(&g.bore_loop(0.01).unwrap()).abs();
+        let outer = signed_area(&gear::outline(&g, &prof)).abs();
+        let want = (outer - hole) * g.face_width + (PI * 100.0 - hole) * 12.0;
         assert!((m.volume() - want).abs() / want < 1e-3, "{} vs {want}", m.volume());
     }
 
