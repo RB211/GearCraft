@@ -148,3 +148,7 @@ CAM_Craft imports `.gearcraft` files one part at a time with `--part`.
 
 Internal (ring) gears and planetary sets, helical gears, a section
 view for bevels, cycloidal clock profiles (BS 978), escapements, G-code output, and sending gears to SolidCraft.
+
+## License
+
+MIT, see `LICENSE`. The IBM Plex Sans font in `assets/fonts` is under the SIL Open Font License (`assets/fonts/OFL.txt`).

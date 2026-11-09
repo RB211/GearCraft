@@ -3,6 +3,8 @@ name = "gearcraft"
 version = "0.1.0"
 edition = "2024"
 description = "Gear and gear-train designer"
+license = "MIT"
+repository = "https://github.com/RB211/GearCraft"
 
 [dependencies]
 crc32fast = "1.5"
